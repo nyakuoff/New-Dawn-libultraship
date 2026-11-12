@@ -127,6 +127,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     bool PostFxAvailable() override;
     void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) override;
     void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) override;
+    bool SupportsAlphaToCoverage() const override {
+        return true;
+    }
+    void SetAlphaToCoverage(bool enable) override;
     bool SupportsPerPixelLighting() const override {
         return true;
     }
@@ -143,6 +147,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     uint8_t mCurrentTile;
     int8_t mLastActiveTexture = -1;
     int8_t mLastBlendEnabled = -1;
+    int8_t mLastAlphaToCoverage = -1;
     int8_t mLastScissorEnabled = -1;
 
     std::map<std::pair<uint64_t, uint32_t>, ShaderProgram> mShaderProgramPool;

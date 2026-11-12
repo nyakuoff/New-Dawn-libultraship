@@ -2251,8 +2251,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_fog) {
         cc_options |= SHADER_OPT(FOG);
     }
+    // New Dawn: let the MSAA coverage unit resolve the cutout edge instead of discarding. Same 0.19 threshold, but the
+    // alpha ramp across a pixel becomes partial coverage, and blending is off (coverage replaces it).
+    const bool alpha_to_coverage = texture_edge && mAlphaToCoverageEnabled && mMsaaLevel > 1 && mRendersToFb &&
+                                   !mFbActive;
     if (texture_edge) {
         cc_options |= SHADER_OPT(TEXTURE_EDGE);
+    }
+    if (alpha_to_coverage) {
+        cc_options |= SHADER_OPT(ALPHA_TO_COVERAGE);
     }
     if (use_noise) {
         cc_options |= SHADER_OPT(NOISE);
@@ -2453,10 +2460,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->LoadShader(prg);
         mRenderingState.mShaderProgram = prg;
     }
-    if (use_alpha != mRenderingState.alpha_blend) {
+    const bool blend_enable = use_alpha && !alpha_to_coverage;
+    if (blend_enable != mRenderingState.alpha_blend) {
         Flush();
-        mRapi->SetUseAlpha(use_alpha);
-        mRenderingState.alpha_blend = use_alpha;
+        mRapi->SetUseAlpha(blend_enable);
+        mRenderingState.alpha_blend = blend_enable;
+    }
+    if (alpha_to_coverage != mRenderingState.alpha_to_coverage) {
+        Flush();
+        mRapi->SetAlphaToCoverage(alpha_to_coverage);
+        mRenderingState.alpha_to_coverage = alpha_to_coverage;
     }
 
     // Per-pixel lighting reads the lights from uniforms, so a batch can only be drawn while the
@@ -5535,6 +5548,9 @@ void Interpreter::StartFrame() {
     mPerPixelLightingEnabled =
         mRapi->SupportsPerPixelLighting() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.PerPixel", 0) != 0;
+    mAlphaToCoverageEnabled =
+        mRapi->SupportsAlphaToCoverage() &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AlphaToCoverage", 1) != 0;
     mPerPixelPointLightQuality = std::clamp(
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.PointLightQuality", 0.0f),
         0.0f, 1.0f);
@@ -5650,6 +5666,10 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    if (mRenderingState.alpha_to_coverage) {
+        mRapi->SetAlphaToCoverage(false); // never leak into the post passes, the resolve or the UI
+        mRenderingState.alpha_to_coverage = false;
+    }
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
@@ -5884,6 +5904,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_alpha = (shader_id1 & SHADER_OPT(ALPHA)) != 0;
     cc_features->opt_fog = (shader_id1 & SHADER_OPT(FOG)) != 0;
     cc_features->opt_texture_edge = (shader_id1 & SHADER_OPT(TEXTURE_EDGE)) != 0;
+    cc_features->opt_alpha_to_coverage = (shader_id1 & SHADER_OPT(ALPHA_TO_COVERAGE)) != 0;
     cc_features->opt_noise = (shader_id1 & SHADER_OPT(NOISE)) != 0;
     cc_features->opt_2cyc = (shader_id1 & SHADER_OPT(_2CYC)) != 0;
     cc_features->opt_alpha_threshold = (shader_id1 & SHADER_OPT(ALPHA_THRESHOLD)) != 0;

@@ -363,6 +363,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_alpha", cc_features.opt_alpha },
         { "o_fog", cc_features.opt_fog },
         { "o_texture_edge", cc_features.opt_texture_edge },
+        { "o_alpha_to_coverage", cc_features.opt_alpha_to_coverage },
         { "o_noise", cc_features.opt_noise },
         { "o_2cyc", cc_features.opt_2cyc },
         { "o_alpha_threshold", cc_features.opt_alpha_threshold },
@@ -852,6 +853,18 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
             glEnable(GL_BLEND);
         } else {
             glDisable(GL_BLEND);
+        }
+    }
+}
+
+void GfxRenderingAPIOGL::SetAlphaToCoverage(bool enable) {
+    int8_t val = enable ? 1 : 0;
+    if (mLastAlphaToCoverage != val) {
+        mLastAlphaToCoverage = val;
+        if (enable) {
+            glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+        } else {
+            glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
         }
     }
 }
