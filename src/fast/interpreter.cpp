@@ -19,6 +19,7 @@
 #include <vector>
 #include <list>
 #include <stack>
+#include <chrono>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -54,11 +55,11 @@ std::stack<std::string> currentDir;
 #define SUPPORT_CHECK(x) assert(x)
 
 // SCALE_M_N: upscale/downscale M-bit integer to N-bit
-#define SCALE_5_8(VAL_) (((VAL_)*0xFF) / 0x1F)
+#define SCALE_5_8(VAL_) (((VAL_) * 0xFF) / 0x1F)
 #define SCALE_8_5(VAL_) ((((VAL_) + 4) * 0x1F) / 0xFF)
-#define SCALE_4_8(VAL_) ((VAL_)*0x11)
+#define SCALE_4_8(VAL_) ((VAL_) * 0x11)
 #define SCALE_8_4(VAL_) ((VAL_) / 0x11)
-#define SCALE_3_8(VAL_) ((VAL_)*0x24)
+#define SCALE_3_8(VAL_) ((VAL_) * 0x24)
 #define SCALE_8_3(VAL_) ((VAL_) / 0x24)
 
 // Based off the current set native dimensions or active framebuffer
@@ -478,6 +479,98 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* 
         mResolvedResourceCache[path] = res;
     }
     return res;
+}
+
+// New Dawn: alternate (HD) textures are large -- the 4K pack's skyboxes are 64 MiB each -- and
+// reading them from the archive on the render thread is what stalls the first frame of a scene.
+// Start the read on the resource pool and keep drawing the original texture until it arrives:
+// the draw is still correct, just lower detail for a frame or two. The resource manager cache
+// serves the alternate texture from the next frame on.
+std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char* path, bool& usedFallback) {
+    usedFallback = false;
+    if (path == nullptr) {
+        return nullptr;
+    }
+    auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+    if (!mAsyncAltLoadEnabled) {
+        return rm->LoadResourceProcess(path);
+    }
+    std::string_view pathView(path);
+    if (!rm->IsAltAssetsEnabled() || pathView.starts_with(Ship::IResource::gAltAssetPrefix)) {
+        return rm->LoadResourceProcess(path);
+    }
+    // Match LoadResourceProcess: the texture address may carry the "__OTR__" signature prefix.
+    static constexpr std::string_view kOtrSignature = "__OTR__";
+    if (pathView.starts_with(kOtrSignature)) {
+        pathView.remove_prefix(kOtrSignature.size());
+    }
+    if (mResolvedResourceCacheEnabled) {
+        auto memo = mResolvedResourceCache.find(path);
+        if (memo != mResolvedResourceCache.end()) {
+            return memo->second;
+        }
+    }
+
+    std::string altPath = Ship::IResource::gAltAssetPrefix + std::string(pathView);
+
+    auto ready = mReadyAltTextures.find(altPath);
+    if (ready != mReadyAltTextures.end()) {
+        if (mResolvedResourceCacheEnabled) {
+            mResolvedResourceCache[path] = ready->second;
+        }
+        return ready->second;
+    }
+    if (mMissingAltTextures.find(altPath) != mMissingAltTextures.end()) {
+        return rm->LoadResourceProcess(path, true);
+    }
+
+    // Whatever we draw until the alternate texture arrives has to exist: a mod can ship an
+    // alternate texture for a path the base archives never had (3DS Link, new equipment, ...).
+    // There is nothing to fall back to in that case, so take the old synchronous path instead of
+    // returning a null texture. The check is an archive index lookup, not a load.
+    const bool altLoadStarted = mPendingAltTextures.find(altPath) != mPendingAltTextures.end();
+    const bool baseExists = rm->GetArchiveManager()->HasFile(std::string(pathView));
+    if (!altLoadStarted && !baseExists) {
+        return rm->LoadResourceProcess(path);
+    }
+
+    // Background reads are best-effort: keep only a few in flight so they do not starve the render
+    // thread's own work (uploading and converting the textures that are already available).
+    static constexpr size_t kMaxAltLoadsInFlight = 4;
+    if (!altLoadStarted && mPendingAltTextures.size() < kMaxAltLoadsInFlight) {
+        mPendingAltTextures[altPath] = rm->LoadResourceAsync(altPath, true);
+    }
+
+    usedFallback = true;
+    return rm->LoadResourceProcess(path, true);
+}
+
+void Interpreter::PumpAltTextureLoads() {
+    // Escape hatch: the previous synchronous path, with no background reads and no fallback frames.
+    mAsyncAltLoadEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AsyncAltLoad", 1) != 0;
+    if (!mAsyncAltLoadEnabled) {
+        mPendingAltTextures.clear();
+        mReadyAltTextures.clear();
+        mMissingAltTextures.clear();
+        return;
+    }
+    if (mPendingAltTextures.empty()) {
+        return;
+    }
+    for (auto it = mPendingAltTextures.begin(); it != mPendingAltTextures.end();) {
+        if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        auto resource = it->second.get();
+        if (resource != nullptr) {
+            mReadyAltTextures[it->first] = resource;
+        } else {
+            mMissingAltTextures.insert(it->first);
+        }
+        it = mPendingAltTextures.erase(it);
+    }
 }
 
 void Interpreter::TextureCacheClear() {
@@ -1688,7 +1781,7 @@ void Interpreter::UpdatePerPixelLightingState(uint32_t shadeMask) {
     state.ambient[1] = ambient.col[1];
     state.ambient[2] = ambient.col[2];
 
-    const float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+    const float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
     for (int col = 0; col < 3; col++) {
         for (int row = 0; row < 3; row++) {
             state.viewMatrix[col * 3 + row] = mtx[col][row];
@@ -4312,8 +4405,9 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
+            bool usedFallback = false;
             std::shared_ptr<Fast::Texture> tex =
-                std::static_pointer_cast<Fast::Texture>(gfx->ResolveResourceCached(imgData));
+                std::static_pointer_cast<Fast::Texture>(gfx->ResolveTextureResource(imgData, usedFallback));
 
             if (tex == nullptr) {
                 (*cmd0)++;
@@ -4355,9 +4449,10 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         return false;
     }
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(
-            Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
+    Interpreter* gfx = mInstance.lock().get();
+    bool usedFallback = false;
+    std::shared_ptr<Fast::Texture> texture =
+        std::static_pointer_cast<Fast::Texture>(gfx->ResolveTextureResource(fileName, usedFallback));
     if (texture != nullptr) {
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
@@ -4373,7 +4468,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
 
         char* tex = reinterpret_cast<char*>(texture->ImageData);
 
-        if (tex != nullptr) {
+        if (tex != nullptr && !usedFallback) {
             (*cmd0)--;
             uintptr_t oldData = (*cmd0)->words.w1;
             // TODO: wtf??
@@ -4411,10 +4506,11 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+    Interpreter* gfx = mInstance.lock().get();
+    bool usedFallback = false;
+    std::shared_ptr<Fast::Texture> texture =
+        std::static_pointer_cast<Fast::Texture>(gfx->ResolveTextureResource(fileName, usedFallback));
     if (texture != nullptr) {
-        Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
         rawTexMetadata.height = texture->Height;
@@ -5397,6 +5493,7 @@ bool Interpreter::GameFbIsWindowSized() {
 }
 
 void Interpreter::StartFrame() {
+    PumpAltTextureLoads();
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {

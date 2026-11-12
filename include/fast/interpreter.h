@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <future>
 #include <map>
 #include <list>
 #include <cstddef>
@@ -438,6 +440,11 @@ class Interpreter {
     void ShaderCacheClear();
     void TextureCacheClear();
     std::shared_ptr<Ship::IResource> ResolveResourceCached(const char* path);
+    // New Dawn: texture resources, resolved without blocking the render thread on a large
+    // alternate (HD) asset. Returns the original texture until the alternate one has loaded.
+    std::shared_ptr<Ship::IResource> ResolveTextureResource(const char* path, bool& usedFallback);
+    // New Dawn: retire finished alternate texture loads. Called once per frame on the render thread.
+    void PumpAltTextureLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void BeginShadowRecording(bool enabled);
@@ -538,6 +545,13 @@ class Interpreter {
     uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
     bool mTextureCacheDebug = false;
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
+    // In-flight alternate texture loads, keyed by the alt path. Loads run on the resource pool.
+    std::unordered_map<std::string, std::shared_future<std::shared_ptr<Ship::IResource>>> mPendingAltTextures;
+    // Alternate textures that have finished loading, and paths that have no alternate version.
+    std::unordered_map<std::string, std::shared_ptr<Ship::IResource>> mReadyAltTextures;
+    std::unordered_set<std::string> mMissingAltTextures;
+    // gNewDawn.Textures.AsyncAltLoad, sampled once per frame by PumpAltTextureLoads.
+    bool mAsyncAltLoadEnabled = true;
     bool mResolvedResourceCacheEnabled = false;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
