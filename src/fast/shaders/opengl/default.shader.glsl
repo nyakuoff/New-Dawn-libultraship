@@ -5,6 +5,15 @@
 @if(VERTEX_SHADER)
     @{attr} vec4 aVtxPos;
 
+    @if(o_per_pixel_lighting)
+        @{attr} vec3 aNormal;
+        @{attr} vec3 aViewPos;
+        @{out} vec3 vNormal;
+        @{out} vec3 vViewPos;
+        @{update_floats(3)}
+        @{update_floats(3)}
+    @end
+
     @for(i in 0..2)
         @if(o_textures[i])
             @{attr} vec2 aTexCoord@{i};
@@ -73,6 +82,10 @@
         @for(i in 0..o_inputs)
             vInput@{i + 1} = aInput@{i + 1};
         @end
+        @if(o_per_pixel_lighting)
+            vNormal = aNormal;
+            vViewPos = aViewPos;
+        @end
         gl_Position = aVtxPos;
         @if(opengles)
             gl_Position.z *= 0.3f;
@@ -107,6 +120,54 @@
         @else
             @{attr} vec3 vInput@{i + 1};
         @end
+    @end
+
+    @if(o_per_pixel_lighting)
+        @{attr} vec3 vNormal;
+        @{attr} vec3 vViewPos;
+
+        #define NEWDAWN_MAX_LIGHTS 32
+
+        uniform int uLightCount;
+        uniform vec3 uLightAmbient;
+        uniform vec3 uLightDir[NEWDAWN_MAX_LIGHTS];
+        uniform vec3 uLightColor[NEWDAWN_MAX_LIGHTS];
+        uniform vec3 uLightPos[NEWDAWN_MAX_LIGHTS];
+        uniform vec2 uLightAtten[NEWDAWN_MAX_LIGHTS];
+        uniform int uLightPositional[NEWDAWN_MAX_LIGHTS];
+        uniform mat3 uViewMatrix;
+        uniform int uShadeMask;
+        uniform float uPointLightQuality;
+
+        // Same light model as the CPU path in GfxSpVertex: this replaces the per-vertex shade
+        // colour with the same arithmetic evaluated per fragment. Values are kept in the 0..255
+        // range the CPU uses, including its per-light truncation, so parity is exact where the
+        // interpolated normal and position are constant across a triangle.
+        vec3 newDawnShade() {
+            vec3 lit = uLightAmbient;
+            for (int i = 0; i < uLightCount; i++) {
+                float intensity = 0.0;
+                if (uLightPositional[i] != 0) {
+                    vec3 distVec = uLightPos[i] - vViewPos;
+                    // The extra *2 on z comes from the CPU reference (and GLideN64).
+                    float distSq = max(distVec.x * distVec.x + distVec.y * distVec.y + distVec.z * distVec.z * 2.0,
+                                       0.000001);
+                    float dist = sqrt(distSq);
+                    vec3 lightModel = transpose(uViewMatrix) * distVec;
+                    vec3 lightIntensity = clamp(4.0 * lightModel / distSq, -1.0, 1.0);
+                    float total = clamp(dot(vNormal, lightIntensity), -1.0, 1.0);
+                    // uPointLightQuality 0 keeps the CPU's integer distance steps.
+                    float distf = mix(floor(dist), dist, uPointLightQuality);
+                    float attenuation =
+                        (distf * uLightAtten[i].x * 2.0 + distf * distf * uLightAtten[i].y / 8.0) / 65535.0 + 1.0;
+                    intensity = total / attenuation;
+                } else {
+                    intensity = dot(vNormal, uLightDir[i]) / 127.0;
+                }
+                lit += floor(max(intensity, 0.0) * uLightColor[i]);
+            }
+            return clamp(floor(lit), 0.0, 255.0) / 255.0;
+        }
     @end
 
     @if(o_textures[0]) uniform sampler2D uTex0;
@@ -167,6 +228,22 @@
     #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
 
     void main() {
+        @if(o_per_pixel_lighting)
+            vec3 newDawnLit = newDawnShade();
+            @for(i in 0..o_inputs)
+                @if(o_alpha)
+                    vec4 vInputShaded@{i + 1} = vInput@{i + 1};
+                    if ((uShadeMask & (1 << @{i})) != 0) {
+                        vInputShaded@{i + 1}.rgb = newDawnLit;
+                    }
+                @else
+                    vec3 vInputShaded@{i + 1} = vInput@{i + 1};
+                    if ((uShadeMask & (1 << @{i})) != 0) {
+                        vInputShaded@{i + 1} = newDawnLit;
+                    }
+                @end
+            @end
+        @end
         @for(i in 0..2)
             @if(o_textures[i])
                 @{s = o_clamp[i][0]}
@@ -244,14 +321,16 @@
             @if(!o_color_alpha_same[c] && o_alpha)
                 texel = vec4(@{
                 append_formula(o_c[c], o_do_single[c][0],
-                            o_do_multiply[c][0], o_do_mix[c][0], false, false, true, c == 0)
+                            o_do_multiply[c][0], o_do_mix[c][0], false, false, true, c == 0,
+                            o_per_pixel_lighting)
                 }, @{append_formula(o_c[c], o_do_single[c][1],
-                            o_do_multiply[c][1], o_do_mix[c][1], true, true, true, c == 0)
+                            o_do_multiply[c][1], o_do_mix[c][1], true, true, true, c == 0,
+                            o_per_pixel_lighting)
                 });
             @else
                 texel = @{append_formula(o_c[c], o_do_single[c][0],
                             o_do_multiply[c][0], o_do_mix[c][0], o_alpha, false,
-                            o_alpha, c == 0)};
+                            o_alpha, c == 0, o_per_pixel_lighting)};
             @end
         @end
 

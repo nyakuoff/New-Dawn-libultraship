@@ -101,6 +101,10 @@ void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
     glUniform1f(prg->noiseScaleLocation, mCurrentNoiseScale);
 }
 
+void GfxRenderingAPIOGL::SetPerPixelLighting(const GfxPerPixelLightingState& state) {
+    mPerPixelLightState = state;
+}
+
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
 
@@ -113,6 +117,44 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
 
         GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+    }
+
+    // Uniforms are per-program state, so they are re-applied whenever the light state or the
+    // program changes. Locations are -1 for programs that do not use per-pixel lighting.
+    const ShaderProgram* prg = mCurrentShaderProgram;
+    if (mPerPixelUploadedSerial != mPerPixelLightState.serial || mPerPixelUploadedProgram != prg) {
+        mPerPixelUploadedSerial = mPerPixelLightState.serial;
+        mPerPixelUploadedProgram = mCurrentShaderProgram;
+        if (prg->per_pixel_light_count_location < 0) {
+            return;
+        }
+
+        const GfxPerPixelLightingState& state = mPerPixelLightState;
+        float dir[MAX_PER_PIXEL_LIGHTS * 3];
+        float color[MAX_PER_PIXEL_LIGHTS * 3];
+        float pos[MAX_PER_PIXEL_LIGHTS * 3];
+        float atten[MAX_PER_PIXEL_LIGHTS * 2];
+        GLint positional[MAX_PER_PIXEL_LIGHTS];
+        for (int i = 0; i < MAX_PER_PIXEL_LIGHTS; i++) {
+            for (int j = 0; j < 3; j++) {
+                dir[i * 3 + j] = state.lights[i].dir[j];
+                color[i * 3 + j] = state.lights[i].color[j];
+                pos[i * 3 + j] = state.lights[i].pos[j];
+            }
+            atten[i * 2] = state.lights[i].atten[0];
+            atten[i * 2 + 1] = state.lights[i].atten[1];
+            positional[i] = state.lights[i].positional ? 1 : 0;
+        }
+        glUniform1i(prg->per_pixel_light_count_location, state.numLights);
+        glUniform3fv(prg->per_pixel_ambient_location, 1, state.ambient);
+        glUniform3fv(prg->per_pixel_dir_location, MAX_PER_PIXEL_LIGHTS, dir);
+        glUniform3fv(prg->per_pixel_color_location, MAX_PER_PIXEL_LIGHTS, color);
+        glUniform3fv(prg->per_pixel_pos_location, MAX_PER_PIXEL_LIGHTS, pos);
+        glUniform2fv(prg->per_pixel_atten_location, MAX_PER_PIXEL_LIGHTS, atten);
+        glUniform1iv(prg->per_pixel_positional_location, MAX_PER_PIXEL_LIGHTS, positional);
+        glUniformMatrix3fv(prg->per_pixel_view_matrix_location, 1, GL_FALSE, state.viewMatrix);
+        glUniform1i(prg->per_pixel_shade_mask_location, state.shadeMask);
+        glUniform1f(prg->per_pixel_quality_location, state.pointLightQuality);
     }
 }
 
@@ -140,8 +182,33 @@ void GfxRenderingAPIOGL::LoadShader(ShaderProgram* new_prg) {
 
 #define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
 
+// Per-pixel lighting overrides the shade colour per fragment. The formula reads a local copy
+// (vInputShadedN) that main() fills from the vInputN varying, so unlit shaders are unchanged.
+static const char* shader_input_to_str(uint32_t item, bool with_alpha, bool inputs_have_alpha,
+                                       bool per_pixel_lighting) {
+    static const char* const kInput[7] = {
+        "vInput1", "vInput2", "vInput3", "vInput4", "vInput5", "vInput6", "vInput7"
+    };
+    static const char* const kInputRgb[7] = { "vInput1.rgb", "vInput2.rgb", "vInput3.rgb", "vInput4.rgb",
+                                              "vInput5.rgb", "vInput6.rgb", "vInput7.rgb" };
+    static const char* const kShaded[7] = { "vInputShaded1", "vInputShaded2", "vInputShaded3", "vInputShaded4",
+                                            "vInputShaded5", "vInputShaded6", "vInputShaded7" };
+    static const char* const kShadedRgb[7] = { "vInputShaded1.rgb", "vInputShaded2.rgb", "vInputShaded3.rgb",
+                                               "vInputShaded4.rgb", "vInputShaded5.rgb", "vInputShaded6.rgb",
+                                               "vInputShaded7.rgb" };
+    int index = (int)item - SHADER_INPUT_1;
+    if (index < 0 || index > 6) {
+        return "";
+    }
+    bool rgb = !(with_alpha || !inputs_have_alpha);
+    if (per_pixel_lighting) {
+        return rgb ? kShadedRgb[index] : kShaded[index];
+    }
+    return rgb ? kInputRgb[index] : kInput[index];
+}
+
 static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
-                                      bool first_cycle, bool hint_single_element) {
+                                      bool first_cycle, bool hint_single_element, bool per_pixel_lighting) {
     if (!only_alpha) {
         switch (item) {
             case SHADER_0:
@@ -149,13 +216,13 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
             case SHADER_1:
                 return with_alpha ? "vec4(1.0, 1.0, 1.0, 1.0)" : "vec3(1.0, 1.0, 1.0)";
             case SHADER_INPUT_1:
-                return with_alpha || !inputs_have_alpha ? "vInput1" : "vInput1.rgb";
             case SHADER_INPUT_2:
-                return with_alpha || !inputs_have_alpha ? "vInput2" : "vInput2.rgb";
             case SHADER_INPUT_3:
-                return with_alpha || !inputs_have_alpha ? "vInput3" : "vInput3.rgb";
             case SHADER_INPUT_4:
-                return with_alpha || !inputs_have_alpha ? "vInput4" : "vInput4.rgb";
+            case SHADER_INPUT_5:
+            case SHADER_INPUT_6:
+            case SHADER_INPUT_7:
+                return shader_input_to_str(item, with_alpha, inputs_have_alpha, per_pixel_lighting);
             case SHADER_TEXEL0:
                 return first_cycle ? (with_alpha ? "texVal0" : "texVal0.rgb")
                                    : (with_alpha ? "texVal1" : "texVal1.rgb");
@@ -225,7 +292,8 @@ bool get_bool(prism::ContextTypes* value) {
 prism::ContextTypes* append_formula(prism::ContextTypes* _, prism::ContextTypes* a_arg, prism::ContextTypes* a_single,
                                     prism::ContextTypes* a_mult, prism::ContextTypes* a_mix,
                                     prism::ContextTypes* a_with_alpha, prism::ContextTypes* a_only_alpha,
-                                    prism::ContextTypes* a_alpha, prism::ContextTypes* a_first_cycle) {
+                                    prism::ContextTypes* a_alpha, prism::ContextTypes* a_first_cycle,
+                                    prism::ContextTypes* a_per_pixel_lighting) {
     auto c = std::get<prism::MTDArray<int>>(*a_arg);
     bool do_single = get_bool(a_single);
     bool do_multiply = get_bool(a_mult);
@@ -234,30 +302,41 @@ prism::ContextTypes* append_formula(prism::ContextTypes* _, prism::ContextTypes*
     bool only_alpha = get_bool(a_only_alpha);
     bool opt_alpha = get_bool(a_alpha);
     bool first_cycle = get_bool(a_first_cycle);
+    bool per_pixel_lighting = get_bool(a_per_pixel_lighting);
     std::string out = "";
     if (do_single) {
-        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
     } else if (do_multiply) {
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
         out += " * ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true,
+                                  per_pixel_lighting);
     } else if (do_mix) {
         out += "mix(";
-        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
         out += ", ";
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
         out += ", ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true,
+                                  per_pixel_lighting);
         out += ")";
     } else {
         out += "(";
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
         out += " - ";
-        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
         out += ") * ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true,
+                                  per_pixel_lighting);
         out += " + ";
-        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false,
+                                  per_pixel_lighting);
     }
     return new prism::ContextTypes{ out };
 }
@@ -290,6 +369,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_invisible", cc_features.opt_invisible },
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_prim_depth", cc_features.opt_prim_depth },
+        { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -388,6 +468,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
                                      { "o_fog", cc_features.opt_fog },
                                      { "o_grayscale", cc_features.opt_grayscale },
+                                     { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
@@ -492,6 +573,16 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->attribSizes[cnt] = 4;
     ++cnt;
 
+    if (cc_features.opt_per_pixel_lighting) {
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aNormal");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+    }
+
     for (int i = 0; i < 2; i++) {
         if (cc_features.usedTextures[i]) {
             char name[32];
@@ -548,6 +639,16 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
     prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
     prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
+    prg->per_pixel_light_count_location = glGetUniformLocation(shader_program, "uLightCount");
+    prg->per_pixel_ambient_location = glGetUniformLocation(shader_program, "uLightAmbient");
+    prg->per_pixel_dir_location = glGetUniformLocation(shader_program, "uLightDir");
+    prg->per_pixel_color_location = glGetUniformLocation(shader_program, "uLightColor");
+    prg->per_pixel_pos_location = glGetUniformLocation(shader_program, "uLightPos");
+    prg->per_pixel_atten_location = glGetUniformLocation(shader_program, "uLightAtten");
+    prg->per_pixel_positional_location = glGetUniformLocation(shader_program, "uLightPositional");
+    prg->per_pixel_view_matrix_location = glGetUniformLocation(shader_program, "uViewMatrix");
+    prg->per_pixel_shade_mask_location = glGetUniformLocation(shader_program, "uShadeMask");
+    prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
 
     LoadShader(prg);
 

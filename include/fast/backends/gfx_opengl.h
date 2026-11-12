@@ -43,6 +43,17 @@ struct ShaderProgram {
     GLint texture_width_location;
     GLint texture_height_location;
     GLint texture_filtering_location;
+    // New Dawn per-pixel lighting uniforms (-1 when the program does not use them).
+    GLint per_pixel_light_count_location;
+    GLint per_pixel_ambient_location;
+    GLint per_pixel_dir_location;
+    GLint per_pixel_color_location;
+    GLint per_pixel_pos_location;
+    GLint per_pixel_atten_location;
+    GLint per_pixel_positional_location;
+    GLint per_pixel_view_matrix_location;
+    GLint per_pixel_shade_mask_location;
+    GLint per_pixel_quality_location;
 };
 
 struct FramebufferOGL {
@@ -115,6 +126,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     ImTextureID GetTextureById(int id) override;
     bool PostFxAvailable() override;
     void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) override;
+    bool SupportsPerPixelLighting() const override {
+        return true;
+    }
+    void SetPerPixelLighting(const GfxPerPixelLightingState& state) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -139,6 +154,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
 #endif
 
     uint32_t mFrameCount = 0;
+
+    // New Dawn per-pixel lighting: the last state the interpreter handed us, and the program it
+    // was last uploaded for, so a program switch re-applies the uniforms.
+    GfxPerPixelLightingState mPerPixelLightState{};
+    int32_t mPerPixelUploadedSerial = -1;
+    ShaderProgram* mPerPixelUploadedProgram = nullptr;
 
     std::vector<FramebufferOGL> mFrameBuffers;
     size_t mCurrentFrameBuffer = 0;

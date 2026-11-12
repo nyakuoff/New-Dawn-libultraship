@@ -11,6 +11,30 @@ struct NewDawnPostFxParams;
 namespace Fast {
 struct ShaderProgram;
 
+#define MAX_PER_PIXEL_LIGHTS 32
+
+// One light exactly as the interpreter's CPU lighting path uses it: directional lights carry a
+// model-space direction, MM point lights carry a view-space position plus attenuation terms.
+struct GfxPerPixelLight {
+    float dir[3];   // model-space unit direction (directional lights)
+    float color[3]; // 0..255, same range as the light command colours
+    float pos[3];   // view-space position (point lights)
+    float atten[2]; // point light attenuation (unk7, unkE)
+    int32_t positional;
+};
+
+// Everything the fragment shader needs to reproduce the CPU light model. Owned by the
+// interpreter; copied by the backend when it changes.
+struct GfxPerPixelLightingState {
+    int32_t numLights;   // excludes the ambient light
+    float ambient[3];    // 0..255
+    float viewMatrix[9]; // modelview upper 3x3, column-major
+    int32_t shadeMask;   // bit n set: shader input n comes from the shade colour
+    float pointLightQuality;
+    int32_t serial;
+    GfxPerPixelLight lights[MAX_PER_PIXEL_LIGHTS];
+};
+
 struct GfxClipParameters {
     bool z_is_from_0_to_1;
     bool invertY;
@@ -96,6 +120,14 @@ class GfxRenderingAPI {
         return false;
     }
     virtual void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
+    }
+
+    // New Dawn per-pixel lighting. Only implemented for OpenGL; other backends keep the CPU
+    // vertex lighting path. See GfxPerPixelLightingState above.
+    virtual bool SupportsPerPixelLighting() const {
+        return false;
+    }
+    virtual void SetPerPixelLighting(const GfxPerPixelLightingState& state) {
     }
 
   protected:
