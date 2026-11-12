@@ -640,6 +640,41 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     }
 }
 
+void Interpreter::BeginShadowRecording(bool enabled) {
+    mShadowRecording = enabled;
+    mShadowVertices.clear();
+    mShadowOverflowLogged = false;
+    if (enabled && mShadowVertices.capacity() < 3 * 1024 * 1024) {
+        mShadowVertices.reserve(3 * 1024 * 1024);
+    }
+}
+
+void Interpreter::EndShadowRecording() {
+    mShadowRecording = false;
+}
+
+void Interpreter::SubmitShadowCasters() {
+    mRapi->SetShadowCasterGeometry(mShadowVertices.empty() ? nullptr : mShadowVertices.data(),
+                                   (uint32_t)(mShadowVertices.size() / 3));
+}
+
+void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
+    constexpr size_t kMaxShadowVertices = 2 * 1024 * 1024;
+    if (mShadowVertices.size() + 9 > kMaxShadowVertices * 3) {
+        if (!mShadowOverflowLogged) {
+            mShadowOverflowLogged = true;
+            SPDLOG_WARN("NewDawn shadows: caster buffer overflow, truncating this frame");
+        }
+        return;
+    }
+    const LoadedVertex* verts[3] = { v1, v2, v3 };
+    for (const LoadedVertex* v : verts) {
+        mShadowVertices.push_back(v->view_pos[0]);
+        mShadowVertices.push_back(v->view_pos[1]);
+        mShadowVertices.push_back(v->view_pos[2]);
+    }
+}
+
 // Pick the per-line byte width for texture decode. Prefer the DRAM stride from
 // loaded_texture when it looks like real per-line info (differs from total size).
 // Fall back to the TMEM tile stride when loaded sizes match total (LoadBlock with
@@ -1727,10 +1762,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        // Per-pixel lighting needs the view-space position for point lights.
+        // Per-pixel lighting needs the view-space position for point lights; shadows need world positions for
+        // every caster, lit or not.
         const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
-        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting) {
-            float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording) {
+            float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
@@ -1857,6 +1893,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[0] = vn->n[0];
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
+        }
+        if (per_pixel_lighting || mShadowRecording) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -2260,6 +2298,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBatchShadeMask = shade_mask;
             mBatchPointLightQuality = mPerPixelPointLightQuality;
         }
+    }
+
+    // Opaque world/actor casters only: skip rects, decals, alpha-tested/cutout foliage and effects.
+    if (mShadowRecording && !is_rect && !zmode_decal && depth_mask && !alpha_threshold && !texture_edge &&
+        !use_prim_depth && !invisible) {
+        RecordShadowTriangle(v1, v2, v3);
     }
 
     uint8_t numInputs;
@@ -4349,9 +4393,27 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     gfx->Flush();
+    if (cmd->words.w1 == 0) {
+        return false;
+    }
+    const int stage = C0(0, 8);
+    const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
+
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
+        gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0);
+        return false;
+    }
+
+    if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+        gfx->EndShadowRecording();
+    }
+
     // Only ever post-process the game framebuffer itself
-    if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive && cmd->words.w1 != 0) {
-        gfx->mRapi->RunPostFx(C0(0, 8), *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1), gfx->mGameFb);
+    if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive) {
+        if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+            gfx->SubmitShadowCasters();
+        }
+        gfx->mRapi->RunPostFx(stage, params, gfx->mGameFb);
     }
     return false;
 }
@@ -5279,9 +5341,15 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    // Post-processing needs the game rendered offscreen even when the window could be rendered to directly
-    mPostFxActive = mRapi->PostFxAvailable() && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-                                                    "gNewDawn.PostFx.Enabled", 1) != 0;
+    // Post-processing and shadows need the game rendered offscreen even when the window could be rendered to directly
+    const bool postFxEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Enabled", 1) != 0;
+    const bool shadowsEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Enabled", 0) != 0;
+    mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled);
+    mShadowRecording = false;
+    mShadowOverflowLogged = false;
+    mShadowVertices.clear();
     // New Dawn per-pixel lighting; a backend only gets it when it implements the shader side.
     mPerPixelLightingEnabled =
         mRapi->SupportsPerPixelLighting() &&

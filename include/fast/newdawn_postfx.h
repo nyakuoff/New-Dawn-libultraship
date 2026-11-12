@@ -6,8 +6,9 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
-#define NEWDAWN_POSTFX_STAGE_OPAQUE_END 0 /* ambient occlusion on the opaque geometry drawn so far */
-#define NEWDAWN_POSTFX_STAGE_SCENE_END 1  /* bloom, colour grade and dithering of the finished world */
+#define NEWDAWN_POSTFX_STAGE_OPAQUE_END 0   /* ambient occlusion / shadows on the opaque geometry drawn so far */
+#define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */
+#define NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN 2 /* start recording opaque shadow casters */
 
 typedef struct NewDawnPostFxParams {
     float zNear;
@@ -17,4 +18,17 @@ typedef struct NewDawnPostFxParams {
     int32_t fogNear;
     int32_t fogFar;
     uint32_t flags; /* reserved, 0 */
+
+    /* New Dawn real-time shadows. */
+    int32_t shadowEnabled;
+    float shadowStrength;
+    float shadowRadius;
+    int32_t shadowMapSize;
+    float shadowSunDir[3];   /* unit vector pointing towards the sun, world space */
+    float shadowAmbient[3];  /* 0..1 */
+    float shadowDirColor[3]; /* 0..1 */
+    float shadowFocus[3];
+    float shadowCameraEye[3];
+    float shadowCameraAt[3];
+    float shadowCameraUp[3];
 } NewDawnPostFxParams;
