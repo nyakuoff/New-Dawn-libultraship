@@ -782,15 +782,15 @@ static bool Invert4x4(const float m[4][4], float out[16]) {
     return true;
 }
 
-void Interpreter::BeginShadowRecording(bool enabled) {
+void Interpreter::BeginShadowRecording(bool enabled, bool captureCamera) {
     mShadowRecording = enabled;
     mShadowVertices.clear();
     mShadowOverflowLogged = false;
     mShadowExactProj = false;
-    if (!enabled) {
+    if (!enabled && !captureCamera) {
         return;
     }
-    if (mShadowVertices.capacity() < 3 * 1024 * 1024) {
+    if (enabled && mShadowVertices.capacity() < 3 * 1024 * 1024) {
         mShadowVertices.reserve(3 * 1024 * 1024);
     }
 
@@ -4588,7 +4588,9 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
 
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
-        gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0);
+        // Water only needs the camera of this frame, not the casters.
+        gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0,
+                                  gfx->mPostFxActive && params.waterEnabled != 0);
         return false;
     }
 
@@ -4605,6 +4607,14 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
                 effective.shadowEnabled = 0;
             }
             gfx->SubmitShadowCasters();
+        } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && effective.waterEnabled != 0) {
+            // The camera captured at the start of the world; the water time advances with the interpolation fraction
+            // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
+            gfx->FillShadowCameraParams(effective);
+            effective.waterTime += (gfx->mInterpolationT - 1.0f) * (1.0f / 20.0f);
+            if (effective.shadowUseExactProj == 0) {
+                effective.waterEnabled = 0;
+            }
         }
         gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
     }
@@ -5540,7 +5550,9 @@ void Interpreter::StartFrame() {
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Enabled", 1) != 0;
     const bool shadowsEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Enabled", 0) != 0;
-    mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled);
+    const bool waterEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.Enabled", 0) != 0;
+    mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled || waterEnabled);
     mShadowRecording = false;
     mShadowOverflowLogged = false;
     mShadowVertices.clear();

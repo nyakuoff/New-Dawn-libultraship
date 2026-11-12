@@ -673,6 +673,146 @@ void main() {
 }
 )GLSL";
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Water. At the scene-end marker (after the game's own translucent water): for every pixel whose view ray crosses a
+// water plane (from the scene collision) before it reaches the depth-buffer surface, add a Fresnel-weighted sky tint and
+// GGX sun glints from a scrolling procedural normal. Screen-blended, so it can only add light to what the game drew.
+// ---------------------------------------------------------------------------------------------------------------------
+static const char* kWaterShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform mat4 uInvViewProj;
+uniform float uNdcXScale;
+uniform float uFlipY;
+uniform vec3 uEye;
+uniform int uBoxCount;
+uniform vec4 uBoxRect[16]; // minX, minZ, maxX, maxZ
+uniform float uBoxY[16];
+uniform int uDebug;
+uniform float uTime;
+uniform float uStrength;
+uniform float uPixelAngle;
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform vec3 uSky;
+
+vec3 worldPos(ivec2 p, float d) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
+    ndc.y *= uFlipY;
+    ndc.x *= uNdcXScale;
+    vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
+    return w.xyz / w.w;
+}
+
+// Gradient noise with analytic derivatives: (value, d/dx, d/dy).
+vec2 hash2(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+}
+vec3 noised(vec2 x) {
+    vec2 i = floor(x);
+    vec2 f = fract(x);
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    vec2 ga = hash2(i + vec2(0.0, 0.0));
+    vec2 gb = hash2(i + vec2(1.0, 0.0));
+    vec2 gc = hash2(i + vec2(0.0, 1.0));
+    vec2 gd = hash2(i + vec2(1.0, 1.0));
+    float va = dot(ga, f - vec2(0.0, 0.0));
+    float vb = dot(gb, f - vec2(1.0, 0.0));
+    float vc = dot(gc, f - vec2(0.0, 1.0));
+    float vd = dot(gd, f - vec2(1.0, 1.0));
+    return vec3(va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * (va - vb - vc + vd),
+                ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) +
+                    du * (u.yx * (va - vb - vc + vd) + vec2(vb, vc) - va));
+}
+
+// Surface slope: two scrolling octaves, each faded out as the pixel footprint approaches its wavelength so the
+// glints cannot alias.
+vec2 waterSlope(vec2 pos, float footprint) {
+    float wl1 = 110.0;
+    float wl2 = 41.0;
+    float f1 = 1.0 - smoothstep(0.12, 0.5, footprint / wl1);
+    float f2 = 1.0 - smoothstep(0.12, 0.5, footprint / wl2);
+    vec2 s = vec2(0.0);
+    s += 0.9 * f1 * noised(pos / wl1 + vec2(0.071, 0.023) * uTime).yz / wl1 * 14.0;
+    s += 0.55 * f2 * noised(pos / wl2 + vec2(-0.043, 0.081) * uTime + 7.3).yz / wl2 * 9.0;
+    return s;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = fetchDepth(p);
+    bool sky = d >= 0.99999;
+    vec3 P = worldPos(p, sky ? 0.9999 : d);
+    vec3 ray = P - uEye;
+    float bestT = 2.0;
+    int bi = -1;
+    for (int i = 0; i < uBoxCount; i++) {
+        float y = uBoxY[i];
+        if (uEye.y <= y + 0.5 || ray.y >= -1e-4) {
+            continue; // camera under (or at) the surface, or looking away from it
+        }
+        float t = (y - uEye.y) / ray.y;
+        // Some of the game's water writes depth (its own surface is then what the depth buffer holds): a surface within
+        // a couple of units of the plane counts as the water itself, not as something in front of it.
+        if (!sky && abs(P.y - y) < 1.5) {
+            t = 1.0;
+        } else if (t >= 1.0) {
+            continue; // the surface (bed, wall, actor) is nearer than the plane
+        }
+        if (t <= 0.0 || t >= bestT) {
+            continue; // behind the camera
+        }
+        vec2 h = uEye.xz + ray.xz * t;
+        if (h.x < uBoxRect[i].x || h.x > uBoxRect[i].z || h.y < uBoxRect[i].y || h.y > uBoxRect[i].w) {
+            continue;
+        }
+        bestT = t;
+        bi = i;
+    }
+    if (bi < 0) {
+        oColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    if (uDebug == 1) {
+        oColor = vec4(0.45, 0.0, 0.35, 1.0) * (0.55 + 0.45 * float(bi % 2)); // screen-blended magenta, alternating tone per box
+        return;
+    }
+
+    vec3 H = uEye + ray * bestT;
+    float dist = bestT * length(ray);
+    vec3 V = normalize(uEye - H);
+    float footprint = dist * uPixelAngle;
+    // Vertical depth of the water above the bed: the glints fade out over the shallows.
+    float depthY = sky ? 1.0e4 : (abs(P.y - uBoxY[bi]) < 1.5 ? 1.0e4 : max(uBoxY[bi] - P.y, 0.0));
+    float shore = smoothstep(2.0, 40.0, depthY);
+
+    vec2 slope = waterSlope(H.xz, footprint);
+    vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
+    float ndv = max(dot(N, V), 1e-3);
+    float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+    vec3 refl = uSky * fres;
+
+    vec3 L = uLightDir;
+    vec3 Hv = normalize(L + V);
+    float ndh = max(dot(N, Hv), 0.0);
+    float ndl = max(dot(N, L), 0.0);
+    float a = sqrt(0.06 * 0.06 + (footprint * 0.012) * (footprint * 0.012));
+    float a2 = a * a;
+    float den = ndh * ndh * (a2 - 1.0) + 1.0;
+    float D = a2 / (3.14159265 * den * den);
+    float vdh = max(dot(V, Hv), 0.0);
+    float fl = 0.02 + 0.98 * pow(1.0 - vdh, 5.0);
+    float spec = D * fl * ndl * 0.25 / max(ndv, 0.2);
+    spec = min(spec, 12.0);
+
+    vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
+    oColor = vec4(max(add, 0.0), 1.0);
+}
+)GLSL";
+
 // ---------------------------------------------------------------------------------------------------------------------
 // GL helpers
 // ---------------------------------------------------------------------------------------------------------------------
@@ -912,6 +1052,8 @@ bool PostFxGL::BuildPrograms() {
     const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
+    const char* water[] = { kVersion, kDepthLib, kWaterShader };
+    mWater.id = BuildProgram("water shader", water, 3, mWater.uniforms);
     const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
     const char* shaftBlur[] = { kVersion, kShaftBlurShader };
     const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
@@ -928,7 +1070,7 @@ bool PostFxGL::BuildPrograms() {
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     return mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
-           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id;
+           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -1014,7 +1156,8 @@ void PostFxGL::BeginTimer(int stage) {
             const char* label = (stage == 0) ? "opaque end / AO"
                                 : (stage == 1) ? "scene end / bloom+grade"
                                 : (stage == 2) ? "shadows"
-                                               : "sun shafts";
+                                : (stage == 3) ? "sun shafts"
+                                               : "water";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -1047,12 +1190,14 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShadow = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.shadowsOn && params.shadowEnabled != 0 &&
                           shadowPositions != nullptr && shadowVertexCount >= 3;
     const bool doAo = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.postFxOn && s.aoOn;
+    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
+                         params.shadowUseExactProj != 0;
     const bool doShafts = doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn);
-    if (!doShadow && !doAo && !doScene) {
+    if (!doShadow && !doAo && !doScene && !doWater) {
         return;
     }
 
@@ -1073,8 +1218,13 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo) {
+    if (doShadow || doAo || doWater) {
         PrepareDepth(fb);
+    }
+    if (doWater) {
+        BeginTimer(kWaterTimerStage);
+        RunWater(params, fb);
+        EndTimer(kWaterTimerStage);
     }
     if (doShadow) {
         BeginTimer(kShadowTimerStage);
@@ -1358,6 +1508,46 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     Draw(fb.fbo, w, h);
     glBindSampler(kFirstUnit + 3, 0);
     CheckError("shadow apply");
+}
+
+void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const int w = fb.width, h = fb.height;
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    float rect[NEWDAWN_MAX_WATER_BOXES * 4] = {};
+    float surfaceY[NEWDAWN_MAX_WATER_BOXES] = {};
+    for (int i = 0; i < count; i++) {
+        rect[i * 4 + 0] = params.waterBoxes[i][0];
+        rect[i * 4 + 1] = params.waterBoxes[i][1];
+        rect[i * 4 + 2] = params.waterBoxes[i][2];
+        rect[i * 4 + 3] = params.waterBoxes[i][3];
+        surfaceY[i] = params.waterBoxes[i][4];
+    }
+    Bind(1, mDepth.tex);
+    Use(mWater);
+    glUniform1i(Loc("uDepth"), kFirstUnit + 1);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+    glUniform1i(Loc("uBoxCount"), count);
+    glUniform4fv(Loc("uBoxRect"), count, rect);
+    glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    glUniform1i(Loc("uDebug"), params.waterDebug);
+    glUniform1f(Loc("uTime"), params.waterTime);
+    glUniform1f(Loc("uStrength"), params.waterStrength);
+    glUniform1f(Loc("uPixelAngle"), 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h);
+    glUniform3fv(Loc("uLightDir"), 1, params.waterLightDir);
+    glUniform3fv(Loc("uLightColor"), 1, params.waterLightColor);
+    glUniform3fv(Loc("uSky"), 1, params.waterSkyColor);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR); // screen
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    CheckError("water");
 }
 
 void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {

@@ -40,4 +40,17 @@ typedef struct NewDawnPostFxParams {
     int32_t shaftEnabled;
     float shaftStrength;     /* already multiplied by the sun-height and sun-colour fades */
     float shaftFogColor[3];  /* 0..1, the game's fog colour */
+
+    /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
+#define NEWDAWN_MAX_WATER_BOXES 16
+    int32_t waterEnabled;
+    int32_t waterDebug;      /* 1: paint the planes */
+    float waterStrength;     /* already multiplied by the per-scene factor and the light fade */
+    float waterTime;         /* seconds, game time (the renderer adds the interpolation fraction) */
+    int32_t waterBoxCount;
+    float waterBoxes[NEWDAWN_MAX_WATER_BOXES][5]; /* minX, minZ, maxX, maxZ, surface Y */
+    float waterLightDir[3];   /* unit vector towards the sun (or moon at night) */
+    float waterLightColor[3]; /* glint colour, already scaled by the light's fade */
+    float waterSkyColor[3];   /* what the water reflects at grazing angles (the game's fog colour) */
+    float waterCameraEye[3];
 } NewDawnPostFxParams;

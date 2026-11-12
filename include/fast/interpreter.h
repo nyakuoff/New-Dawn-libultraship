@@ -450,7 +450,7 @@ class Interpreter {
     void PumpAltTextureLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
-    void BeginShadowRecording(bool enabled);
+    void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
     void FillShadowCameraParams(NewDawnPostFxParams& params) const;
