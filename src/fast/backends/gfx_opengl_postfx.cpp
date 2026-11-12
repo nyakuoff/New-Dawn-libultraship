@@ -1241,7 +1241,7 @@ GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
     Bind(0, mHdr.tex);
     Use(mHdrTransform);
     glUniform1i(Loc("uScene"), kFirstUnit);
-    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", 0.0f), -8.0f, 8.0f));
+    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", -0.2f), -8.0f, 8.0f));
     Draw(mHdrDisplayFbo, fb.width, fb.height);
     EndTimer(1);
     CheckError("HDR display transform");

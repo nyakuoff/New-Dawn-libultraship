@@ -123,9 +123,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     if (HdrWorldActive() && mCurrentShaderProgram->per_pixel_light_count_location >= 0) {
         auto hdrCvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sun_location,
-                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.SunIntensity", 4.0f), 0.0f, 16.0f));
+                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f));
         glUniform1f(mCurrentShaderProgram->hdr_ambient_location,
-                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.5f), 0.0f, 4.0f));
+                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f));
     }
 
     // Uniforms are per-program state, so they are re-applied whenever the light state or the
