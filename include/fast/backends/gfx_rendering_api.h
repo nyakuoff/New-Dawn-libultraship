@@ -72,6 +72,11 @@ class GfxRenderingAPI {
     // game textures are uploaded; backends without mipmap support may leave this as a no-op.
     virtual void BuildMipmaps() {
     }
+    // Approximate VRAM footprint of a texture, including its mip chain when present. Backends that do
+    // not track texture sizes return 0, which leaves the interpreter's byte budget unenforced.
+    virtual uint64_t GetTextureByteSize(uint32_t textureId) {
+        return 0;
+    }
     virtual void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) = 0;
     virtual void SetDepthTestAndMask(bool depth_test, bool z_upd) = 0;
     virtual void SetZmodeDecal(bool decal) = 0;

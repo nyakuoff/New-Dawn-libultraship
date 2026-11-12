@@ -485,6 +485,8 @@ void Interpreter::TextureCacheClear() {
     }
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
+    mTextureCache.total_bytes = 0;
+    mTextureCache.eviction_count = 0;
     mResolvedResourceCache.clear();
     // Pre-allocate buckets so the map never rehashes during normal operation.
     // Rehashing invalidates all iterators, including those stored in LRU entries.
@@ -509,16 +511,12 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         return true;
     }
 
-    if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
-        // Remove the texture that was least recently used
-        it = mTextureCache.lru.front().it;
-        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
-        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-            if (mRenderingState.mTextures[j] == &*it)
-                mRenderingState.mTextures[j] = nullptr;
+    // Make room for the new entry. The byte budget is enforced after the upload, when the
+    // backend knows the texture's dimensions and mip state.
+    while (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
+        if (!EvictOneTextureCacheEntry(nullptr)) {
+            break;
         }
-        mTextureCache.map.erase(it);
-        mTextureCache.lru.pop_front();
     }
 
     uint32_t texture_id;
@@ -532,12 +530,81 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
     TextureCacheNode* node = &*it;
     node->second.texture_id = texture_id;
+    node->second.byte_size = 0;
     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
 
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
     *n = node;
     return false;
+}
+
+bool Interpreter::TextureCacheNodeInUse(const TextureCacheNode* node) const {
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        if (mRenderingState.mTextures[i] == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Interpreter::EvictOneTextureCacheEntry(const TextureCacheNode* protect) {
+    for (auto lruIt = mTextureCache.lru.begin(); lruIt != mTextureCache.lru.end(); ++lruIt) {
+        TextureCacheNode* node = &*lruIt->it;
+        if (node == protect || TextureCacheNodeInUse(node)) {
+            continue;
+        }
+
+        mTextureCache.total_bytes -= node->second.byte_size;
+        mTextureCache.free_texture_ids.push_back(node->second.texture_id);
+        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+            if (mRenderingState.mTextures[i] == node) {
+                mRenderingState.mTextures[i] = nullptr;
+            }
+        }
+        mTextureCache.map.erase(lruIt->it);
+        mTextureCache.lru.erase(lruIt);
+        mTextureCache.eviction_count++;
+
+        if (mTextureCacheDebug && (mTextureCache.eviction_count == 1 || mTextureCache.eviction_count % 64 == 0)) {
+            SPDLOG_INFO("NewDawn texture cache: evicted {} textures, {} entries, {:.1f}/{:.1f} MiB",
+                        mTextureCache.eviction_count, mTextureCache.map.size(),
+                        (double)mTextureCache.total_bytes / (1024.0 * 1024.0),
+                        (double)mTextureCacheBudgetBytes / (1024.0 * 1024.0));
+        }
+        return true;
+    }
+    return false;
+}
+
+void Interpreter::EnforceTextureCacheBudget(const TextureCacheNode* protect) {
+    while (mTextureCache.map.size() > TEXTURE_CACHE_MAX_SIZE) {
+        if (!EvictOneTextureCacheEntry(protect)) {
+            break;
+        }
+    }
+    if (mTextureCacheBudgetBytes == 0) {
+        return;
+    }
+    while (mTextureCache.total_bytes > mTextureCacheBudgetBytes) {
+        if (!EvictOneTextureCacheEntry(protect)) {
+            break;
+        }
+    }
+}
+
+void Interpreter::UpdateTextureCacheSize(int textureSlot) {
+    TextureCacheNode* node = mRenderingState.mTextures[textureSlot];
+    if (node == nullptr) {
+        return;
+    }
+    uint64_t byteSize = mRapi->GetTextureByteSize(node->second.texture_id);
+    if (byteSize != node->second.byte_size) {
+        mTextureCache.total_bytes -= node->second.byte_size;
+        node->second.byte_size = byteSize;
+        mTextureCache.total_bytes += byteSize;
+    }
+    EnforceTextureCacheBudget(node);
 }
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
@@ -560,6 +627,7 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
                         mRenderingState.mTextures[j] = nullptr;
                 }
                 mTextureCache.lru.erase(it->second.lru_location);
+                mTextureCache.total_bytes -= it->second.byte_size;
                 mTextureCache.free_texture_ids.push_back(it->second.texture_id);
                 mTextureCache.map.erase(it->first);
                 again = true;
@@ -2037,11 +2105,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (mRdp->textures_changed[i]) {
                 Flush();
                 ImportTexture(i, tile, false);
+                UpdateTextureCacheSize(i);
                 if (mRdp->loaded_texture[i].masked) {
                     ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
+                    UpdateTextureCacheSize(SHADER_FIRST_MASK_TEXTURE + i);
                 }
                 if (mRdp->loaded_texture[i].blended) {
                     ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
+                    UpdateTextureCacheSize(SHADER_FIRST_REPLACEMENT_TEXTURE + i);
                 }
                 mRdp->textures_changed[i] = false;
             }
@@ -2142,6 +2213,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mRenderingState.mTextures[i]->second.linear_filter = linear_filter;
                 mRenderingState.mTextures[i]->second.cms = cms;
                 mRenderingState.mTextures[i]->second.cmt = cmt;
+            }
+
+            // Lazy mip generation in SetSamplerParameters may have changed the backend footprint.
+            UpdateTextureCacheSize(i);
+            if (mRdp->loaded_texture[i].masked) {
+                UpdateTextureCacheSize(SHADER_FIRST_MASK_TEXTURE + i);
+            }
+            if (mRdp->loaded_texture[i].blended) {
+                UpdateTextureCacheSize(SHADER_FIRST_REPLACEMENT_TEXTURE + i);
             }
         }
     }
@@ -5228,6 +5308,13 @@ void Interpreter::StartFrame() {
     } else {
         mRendersToFb = false;
     }
+
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    int cacheBudgetMb = cvars->GetInteger("gNewDawn.Textures.CacheBudgetMB", 2048);
+    mTextureCacheBudgetBytes = cacheBudgetMb > 0 ? (uint64_t)cacheBudgetMb * 1024 * 1024 : 0;
+    mTextureCacheDebug = cvars->GetInteger("gNewDawn.Textures.CacheDebug", 0) != 0;
+    // Apply a lowered budget even when no new texture is uploaded this frame.
+    EnforceTextureCacheBudget();
 
     mFbActive = false;
 }
