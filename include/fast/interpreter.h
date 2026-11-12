@@ -202,6 +202,7 @@ struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
+    uint64_t byte_size = 0;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
@@ -338,6 +339,8 @@ struct GfxTextureCache {
     TextureCacheMap map;
     std::list<TextureCacheMapIter> lru;
     std::vector<uint32_t> free_texture_ids;
+    uint64_t total_bytes = 0;
+    uint64_t eviction_count = 0;
 };
 
 struct ColorCombiner {
@@ -427,6 +430,10 @@ class Interpreter {
     std::shared_ptr<Ship::IResource> ResolveResourceCached(const char* path);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void UpdateTextureCacheSize(int textureSlot);
+    bool TextureCacheNodeInUse(const TextureCacheNode* node) const;
+    bool EvictOneTextureCacheEntry(const TextureCacheNode* protect);
+    void EnforceTextureCacheBudget(const TextureCacheNode* protect = nullptr);
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -511,6 +518,8 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
+    uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
+    bool mTextureCacheDebug = false;
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
