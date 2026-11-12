@@ -128,6 +128,13 @@ class GfxRenderingAPI {
 
     // New Dawn per-pixel lighting. Only implemented for OpenGL; other backends keep the CPU
     // vertex lighting path. See GfxPerPixelLightingState above.
+    // New Dawn: alpha-to-coverage for texture-edge draws. A backend that returns true implements the shader side
+    // (o_alpha_to_coverage) and SetAlphaToCoverage.
+    virtual bool SupportsAlphaToCoverage() const {
+        return false;
+    }
+    virtual void SetAlphaToCoverage(bool) {
+    }
     virtual bool SupportsPerPixelLighting() const {
         return false;
     }

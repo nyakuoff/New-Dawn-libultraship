@@ -84,7 +84,8 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     PRIM_DEPTH,
     PER_PIXEL_LIGHTING,
-    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 18
+    ALPHA_TO_COVERAGE,
+    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 19
     MAX
 };
 
@@ -118,6 +119,7 @@ struct CCFeatures {
     bool opt_grayscale;
     bool opt_prim_depth;
     bool opt_per_pixel_lighting;
+    bool opt_alpha_to_coverage;
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -140,7 +142,7 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 18;
+constexpr size_t SHADER_ID_SHIFT = 19;
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -367,6 +369,7 @@ struct RenderingState {
     uint8_t depth_test_and_mask; // 1: depth test, 2: depth mask
     bool decal_mode;
     bool alpha_blend;
+    bool alpha_to_coverage;
     struct XYWidthHeight viewport, scissor;
     struct ShaderProgram* mShaderProgram;
     TextureCacheNode* mTextures[SHADER_MAX_TEXTURES];
@@ -592,6 +595,7 @@ class Interpreter {
     // New Dawn per-pixel lighting (gNewDawn.Lighting.PerPixel). mPerPixelLightState is the state the
     // next batch draws with; the backend re-uploads it when the serial or shader program changes.
     bool mPerPixelLightingEnabled{};
+    bool mAlphaToCoverageEnabled{}; // New Dawn: texture-edge draws use alpha-to-coverage when the game target is MSAA
     float mPerPixelPointLightQuality{};
     float mBatchPointLightQuality{};
     GfxPerPixelLightingState mPerPixelLightState{};

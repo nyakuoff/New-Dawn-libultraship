@@ -346,7 +346,13 @@
         @end
 
         @if(o_texture_edge && o_alpha)
-            if (texel.a > 0.19) texel.a = 1.0; else discard;
+            @if(o_alpha_to_coverage)
+                // Same 0.19 cutout threshold, but the alpha ramp across this pixel becomes MSAA coverage (the draw has
+                // blending off and GL_SAMPLE_ALPHA_TO_COVERAGE on). Exactly half coverage where alpha == 0.19.
+                texel.a = clamp((texel.a - 0.19) / max(fwidth(texel.a), 1.0 / 256.0) + 0.5, 0.0, 1.0);
+            @else
+                if (texel.a > 0.19) texel.a = 1.0; else discard;
+            @end
         @end
 
         @if(o_alpha && o_noise)

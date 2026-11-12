@@ -749,7 +749,7 @@ struct GlStateGuard {
     GLint viewport[4], scissor[4];
     GLint depthFunc, blendSrcRgb, blendDstRgb, blendSrcA, blendDstA, blendEqRgb, blendEqA;
     GLboolean depthMask, colorMask[4];
-    GLboolean blend, depthTest, scissorTest, cullFace, polyOffset, stencilTest, dither, srgb;
+    GLboolean blend, depthTest, scissorTest, cullFace, polyOffset, stencilTest, dither, srgb, alphaToCoverage;
 
     GlStateGuard() {
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
@@ -777,6 +777,7 @@ struct GlStateGuard {
         stencilTest = glIsEnabled(GL_STENCIL_TEST);
         dither = glIsEnabled(GL_DITHER);
         srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+        alphaToCoverage = glIsEnabled(GL_SAMPLE_ALPHA_TO_COVERAGE);
     }
 
     static void Set(GLenum cap, GLboolean on) {
@@ -797,6 +798,7 @@ struct GlStateGuard {
         glDisable(GL_STENCIL_TEST);
         glDisable(GL_DITHER);
         glDisable(GL_FRAMEBUFFER_SRGB);
+        glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
         glDepthMask(GL_FALSE);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     }
@@ -822,6 +824,7 @@ struct GlStateGuard {
         Set(GL_POLYGON_OFFSET_FILL, polyOffset);
         Set(GL_STENCIL_TEST, stencilTest);
         Set(GL_DITHER, dither);
+        Set(GL_SAMPLE_ALPHA_TO_COVERAGE, alphaToCoverage);
         Set(GL_FRAMEBUFFER_SRGB, srgb);
     }
 };
