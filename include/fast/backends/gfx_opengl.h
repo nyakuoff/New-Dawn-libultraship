@@ -58,6 +58,8 @@ struct TextureInfo {
     uint16_t width;
     uint16_t height;
     uint16_t filtering;
+    bool mipmapped;
+    bool mipEligible; // uploaded through the interpreter, not by UI code
 };
 
 class GfxRenderingAPIOGL final : public GfxRenderingAPI {
@@ -76,6 +78,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
+    void BuildMipmaps() override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
@@ -142,6 +145,11 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     GLint mMaxMsaaLevel = 1;
+    float mMaxAnisotropy = 1.0f;
+    // Texture settings are cached once per frame; SetSamplerParameters runs for every texture bind.
+    bool mMipmapsEnabled = true;
+    float mRequestedAnisotropy = 16.0f;
+    float mLodBias = 0.0f;
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;

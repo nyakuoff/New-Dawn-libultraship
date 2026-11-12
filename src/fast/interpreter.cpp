@@ -672,6 +672,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
@@ -739,6 +740,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
         }
     }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
@@ -784,6 +786,7 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
@@ -826,6 +829,7 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
@@ -876,6 +880,7 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
@@ -928,6 +933,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
@@ -968,6 +974,7 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
@@ -1057,6 +1064,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
@@ -1134,6 +1142,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
@@ -1151,6 +1160,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
     mRapi->UploadTexture(addr, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
@@ -1198,6 +1208,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
         mRapi->UploadTexture(addr, width, height);
+        mRapi->BuildMipmaps();
         return;
     }
 
@@ -1246,6 +1257,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         }
     }
     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
@@ -1450,6 +1462,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    mRapi->BuildMipmaps();
 }
 
 void Interpreter::NormalizeVector(float v[3]) {
