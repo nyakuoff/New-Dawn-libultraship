@@ -27,6 +27,7 @@ class PostFxGL {
         bool postFxOn, aoOn, bloomOn, gradeOn;
         bool shadowsOn;
         int shadowDebug;
+        float shadowFloor; // minimum fraction of the lit colour a fully shadowed pixel keeps
         float aoStrength, aoRadius;
         float bloomStrength, bloomThreshold;
         float contrast, saturation;
