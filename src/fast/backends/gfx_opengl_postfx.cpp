@@ -677,11 +677,9 @@ void main() {
 // ---------------------------------------------------------------------------------------------------------------------
 // Water. At the scene-end marker (after the game's own translucent water): for every pixel whose view ray crosses a
 // water plane (from the scene collision) before it reaches the depth-buffer surface, add a Fresnel-weighted sky tint and
-// GGX sun glints from a scrolling procedural normal. Screen-blended, so it can only add light to what the game drew.
+// GGX sun glints from a scrolling procedural normal. Opt-in SSR adds a filtered premultiplied reflection overlay.
 // ---------------------------------------------------------------------------------------------------------------------
-static const char* kWaterShader = R"GLSL(
-in vec2 vUv;
-out vec4 oColor;
+static const char* kWaterPlaneLib = R"GLSL(
 uniform mat4 uInvViewProj;
 uniform float uNdcXScale;
 uniform float uFlipY;
@@ -689,6 +687,48 @@ uniform vec3 uEye;
 uniform int uBoxCount;
 uniform vec4 uBoxRect[16]; // minX, minZ, maxX, maxZ
 uniform float uBoxY[16];
+vec3 worldPos(ivec2 p, float d) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
+    ndc.y *= uFlipY;
+    ndc.x *= uNdcXScale;
+    vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
+    return w.xyz / w.w;
+}
+
+int waterPlane(vec3 P, bool sky, out float bestT) {
+    vec3 ray = P - uEye;
+    bestT = 2.0;
+    int bi = -1;
+    for (int i = 0; i < uBoxCount; i++) {
+        float y = uBoxY[i];
+        if (uEye.y <= y + 0.5 || ray.y >= -1e-4) {
+            continue; // camera under (or at) the surface, or looking away from it
+        }
+        float t = (y - uEye.y) / ray.y;
+        // Some of the game's water writes depth (its own surface is then what the depth buffer holds): a surface within
+        // a couple of units of the plane counts as the water itself, not as something in front of it.
+        if (!sky && abs(P.y - y) < 1.5) {
+            t = 1.0;
+        } else if (t >= 1.0) {
+            continue; // the surface (bed, wall, actor) is nearer than the plane
+        }
+        if (t <= 0.0 || t >= bestT) {
+            continue; // behind the camera
+        }
+        vec2 h = uEye.xz + ray.xz * t;
+        if (h.x < uBoxRect[i].x || h.x > uBoxRect[i].z || h.y < uBoxRect[i].y || h.y > uBoxRect[i].w) {
+            continue;
+        }
+        bestT = t;
+        bi = i;
+    }
+    return bi;
+}
+)GLSL";
+
+static const char* kWaterShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
 uniform int uDebug;
 uniform float uTime;
 uniform float uStrength;
@@ -702,12 +742,12 @@ uniform sampler2D uOpaqueColor;
 uniform sampler2D uOpaqueDepth;
 uniform float uReflectionStrength;
 
-vec3 worldPos(ivec2 p, float d);
-
 // March uniformly in screen space, interpolating reciprocal clip W for perspective-correct axial depth.
 // Stable deterministic steps: no temporal history, random jitter or feedback from the translucent world.
-vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
+vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) {
+    status = 0; // 0: sky/miss, 1: accepted hit, 2: rejected candidate
     if (direction.y <= 0.002) {
+        status = 2;
         return vec4(0.0);
     }
     vec4 c0 = uViewProj * vec4(origin, 1.0);
@@ -733,12 +773,12 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
     if (pixels < 2.0) {
         return vec4(0.0);
     }
-    int steps = int(clamp(ceil(pixels / 6.0), 8.0, 40.0));
+    int steps = int(clamp(ceil(pixels / 3.0), 8.0, 64.0));
     float k0 = 1.0 / c0.w;
     float k1 = 1.0 / c1.w;
     float previous = 0.0;
     bool inFront = false;
-    for (int i = 1; i <= 40; i++) {
+    for (int i = 1; i <= 64; i++) {
         if (i > steps) {
             break;
         }
@@ -748,7 +788,7 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
         float gap = 1.0 / mix(k0, k1, t) - linDepth(d);
         if (d < 0.99999 && gap >= 0.0 && inFront) {
             float lo = previous, hi = t;
-            for (int j = 0; j < 5; j++) {
+            for (int j = 0; j < 7; j++) {
                 float mid = (lo + hi) * 0.5;
                 float md = texture(uOpaqueDepth, uv0 + delta * mid).r;
                 if (1.0 / mix(k0, k1, mid) > linDepth(md)) {
@@ -765,7 +805,10 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
             vec3 hit = worldPos(ivec2(uv * vec2(uSize)), d);
             // Never reflect the bed, or a water mesh that happened to write opaque depth.
             if (d >= 0.99999 || hit.y <= planeY + 2.0 || mismatch > thickness) {
-                return vec4(0.0);
+                status = 2;
+                inFront = false;
+                previous = t;
+                continue;
             }
             vec2 edges = min(uv, 1.0 - uv);
             float confidence = smoothstep(0.0, 0.06, min(edges.x, edges.y));
@@ -783,6 +826,7 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
                 color += texture(uOpaqueColor, tap).rgb * w;
                 weight += w;
             }
+            status = confidence > 0.02 ? 1 : 2;
             return vec4(color / weight, confidence);
         }
         inFront = gap < 0.0;
@@ -791,14 +835,6 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
     return vec4(0.0);
 }
 #endif
-
-vec3 worldPos(ivec2 p, float d) {
-    vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
-    ndc.y *= uFlipY;
-    ndc.x *= uNdcXScale;
-    vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
-    return w.xyz / w.w;
-}
 
 // Gradient noise with analytic derivatives: (value, d/dx, d/dy).
 vec2 hash2(vec2 p) {
@@ -837,38 +873,23 @@ vec2 waterSlope(vec2 pos, float footprint) {
 }
 
 void main() {
+#ifdef WATER_REFLECTIONS
+    ivec2 p = clamp(ivec2(vUv * vec2(uSize)), ivec2(0), uSize - 1);
+#else
     ivec2 p = ivec2(gl_FragCoord.xy);
+#endif
     float d = fetchDepth(p);
     bool sky = d >= 0.99999;
     vec3 P = worldPos(p, sky ? 0.9999 : d);
     vec3 ray = P - uEye;
-    float bestT = 2.0;
-    int bi = -1;
-    for (int i = 0; i < uBoxCount; i++) {
-        float y = uBoxY[i];
-        if (uEye.y <= y + 0.5 || ray.y >= -1e-4) {
-            continue; // camera under (or at) the surface, or looking away from it
-        }
-        float t = (y - uEye.y) / ray.y;
-        // Some of the game's water writes depth (its own surface is then what the depth buffer holds): a surface within
-        // a couple of units of the plane counts as the water itself, not as something in front of it.
-        if (!sky && abs(P.y - y) < 1.5) {
-            t = 1.0;
-        } else if (t >= 1.0) {
-            continue; // the surface (bed, wall, actor) is nearer than the plane
-        }
-        if (t <= 0.0 || t >= bestT) {
-            continue; // behind the camera
-        }
-        vec2 h = uEye.xz + ray.xz * t;
-        if (h.x < uBoxRect[i].x || h.x > uBoxRect[i].z || h.y < uBoxRect[i].y || h.y > uBoxRect[i].w) {
-            continue;
-        }
-        bestT = t;
-        bi = i;
-    }
+    float bestT;
+    int bi = waterPlane(P, sky, bestT);
     if (bi < 0) {
+#ifdef WATER_REFLECTIONS
+        oColor = vec4(0.0); // premultiplied overlay: leave non-water untouched
+#else
         oColor = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
         return;
     }
     if (uDebug == 1) {
@@ -905,13 +926,69 @@ void main() {
 
     vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
 #ifdef WATER_REFLECTIONS
-    // Less slope than the glint normal: a calm, gently distorted reflection rather than a rippling mirror.
+    // A filtered, gently distorted reflection normal; retain the original glint slope separately.
     vec3 reflectionNormal = normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25));
-    vec4 hit = traceReflection(H + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi]);
-    vec3 reflected = mix(uSky, hit.rgb, hit.a);
-    add += reflected * fres * 0.6 * uReflectionStrength * shore;
-#endif
+    int hitStatus;
+    // Use the exact plane even when a water mesh's own depth was accepted within the mask's 1.5-unit tolerance.
+    vec3 reflectionH = uEye + ray * ((uBoxY[bi] - uEye.y) / ray.y);
+    vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], hitStatus);
+    if (uDebug == 2) {
+        oColor = vec4(hitStatus == 1 ? vec3(0.0, 1.0, 0.0) :
+                      (hitStatus == 2 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0)), 1.0);
+        return;
+    }
+    // A premultiplied reflection can darken the painted water as well as brighten it. Screen-only addition
+    // erased dark reflected objects. Lift the Fresnel response perceptually while retaining its view-angle falloff.
+    float reflectionWeight = uReflectionStrength * sqrt(fres) * shore * hit.a;
+    add += uSky * fres * 0.6 * uReflectionStrength * shore * (1.0 - hit.a);
+    oColor = vec4(hit.rgb * reflectionWeight + max(add, 0.0) * (1.0 - reflectionWeight), reflectionWeight);
+#else
     oColor = vec4(max(add, 0.0), 1.0);
+#endif
+}
+)GLSL";
+
+static const char* kWaterReflectionApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uReflection;
+uniform int uDebug;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = fetchDepth(p);
+    bool sky = d >= 0.99999;
+    vec3 P = worldPos(p, sky ? 0.9999 : d);
+    float t;
+    if (waterPlane(P, sky, t) < 0) {
+        oColor = vec4(0.0);
+        return;
+    }
+    ivec2 halfSize = textureSize(uReflection, 0);
+    if (uDebug == 2) {
+        // Classify the same half-resolution rays used by the visible effect, without filtering their labels.
+        ivec2 q = clamp(ivec2(vUv * vec2(halfSize)), ivec2(0), halfSize - 1);
+        vec3 mask = texelFetch(uReflection, q, 0).rgb;
+        oColor = vec4(dot(mask, mask) > 0.5 ? mask : vec3(0.0, 0.0, 1.0), 1.0);
+        return;
+    }
+    vec2 samplePos = vUv * vec2(halfSize) - 0.5;
+    ivec2 base = ivec2(floor(samplePos));
+    float depth = linDepth(d);
+    float depthScale = max(4.0, depth * 0.025);
+    vec4 color = vec4(0.0);
+    float weight = 0.0;
+    for (int y = -1; y <= 2; y++) {
+        for (int x = -1; x <= 2; x++) {
+            ivec2 q = clamp(base + ivec2(x, y), ivec2(0), halfSize - 1);
+            vec2 delta = vec2(q) - samplePos;
+            ivec2 fullQ = clamp(ivec2((vec2(q) + 0.5) / vec2(halfSize) * vec2(uSize)), ivec2(0), uSize - 1);
+            float tapDepth = linDepth(fetchDepth(fullQ));
+            float w = exp(-dot(delta, delta) / 3.0 - abs(tapDepth - depth) / depthScale);
+            color += texelFetch(uReflection, q, 0) * w;
+            weight += w;
+        }
+    }
+    oColor = color / max(weight, 1e-6);
 }
 )GLSL";
 
@@ -1154,10 +1231,12 @@ bool PostFxGL::BuildPrograms() {
     const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
-    const char* water[] = { kVersion, kDepthLib, kWaterShader };
-    mWater.id = BuildProgram("water shader", water, 3, mWater.uniforms);
-    const char* waterReflection[] = { kVersion, "#define WATER_REFLECTIONS\n", kDepthLib, kWaterShader };
-    mWaterReflection.id = BuildProgram("water reflection shader", waterReflection, 4, mWaterReflection.uniforms);
+    const char* water[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterShader };
+    mWater.id = BuildProgram("water shader", water, 4, mWater.uniforms);
+    const char* waterReflection[] = { kVersion, "#define WATER_REFLECTIONS\n", kDepthLib, kWaterPlaneLib, kWaterShader };
+    mWaterReflection.id = BuildProgram("water reflection shader", waterReflection, 5, mWaterReflection.uniforms);
+    const char* waterApply[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterReflectionApplyShader };
+    mWaterReflectionApply.id = BuildProgram("water reflection upsample", waterApply, 4, mWaterReflectionApply.uniforms);
     const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
     const char* shaftBlur[] = { kVersion, kShaftBlurShader };
     const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
@@ -1174,7 +1253,8 @@ bool PostFxGL::BuildPrograms() {
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     return mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
-           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id;
+           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id &&
+           mWaterReflectionApply.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -1648,6 +1728,24 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     }
     const bool reflections = params.waterReflections != 0 && mWaterOpaqueFrame == mSettingsFrame &&
                              mWaterOpaqueColor.w == w && mWaterOpaqueColor.h == h;
+    const bool filter = reflections && params.waterDebug != 1;
+    const int hw = std::max(w / 2, 1), hh = std::max(h / 2, 1);
+    if (filter) {
+        EnsureTarget(mWaterReflectionRaw, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    }
+    const auto setPlaneUniforms = [&]() {
+        glUniform1i(Loc("uDepth"), kFirstUnit + 1);
+        glUniform2i(Loc("uSize"), w, h);
+        glUniform1f(Loc("uNear"), params.zNear);
+        glUniform1f(Loc("uFar"), params.zFar);
+        glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+        glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+        glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+        glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+        glUniform1i(Loc("uBoxCount"), count);
+        glUniform4fv(Loc("uBoxRect"), count, rect);
+        glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    };
     Bind(1, mDepth.tex);
     Use(reflections ? mWaterReflection : mWater);
     if (reflections) {
@@ -1658,27 +1756,31 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
         glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
         glUniform1f(Loc("uReflectionStrength"), params.waterReflectionStrength);
     }
-    glUniform1i(Loc("uDepth"), kFirstUnit + 1);
-    glUniform2i(Loc("uSize"), w, h);
-    glUniform1f(Loc("uNear"), params.zNear);
-    glUniform1f(Loc("uFar"), params.zFar);
-    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
-    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
-    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
-    glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
-    glUniform1i(Loc("uBoxCount"), count);
-    glUniform4fv(Loc("uBoxRect"), count, rect);
-    glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    setPlaneUniforms();
     glUniform1i(Loc("uDebug"), params.waterDebug);
     glUniform1f(Loc("uTime"), params.waterTime);
     glUniform1f(Loc("uStrength"), params.waterStrength);
-    glUniform1f(Loc("uPixelAngle"), 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h);
+    glUniform1f(Loc("uPixelAngle"),
+                2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)(filter ? hh : h));
     glUniform3fv(Loc("uLightDir"), 1, params.waterLightDir);
     glUniform3fv(Loc("uLightColor"), 1, params.waterLightColor);
     glUniform3fv(Loc("uSky"), 1, params.waterSkyColor);
+    if (filter) {
+        glDisable(GL_BLEND);
+        Draw(mWaterReflectionRaw);
+        Bind(0, mWaterReflectionRaw.tex);
+        Bind(1, mDepth.tex);
+        Use(mWaterReflectionApply);
+        setPlaneUniforms();
+        glUniform1i(Loc("uReflection"), kFirstUnit + 0);
+        glUniform1i(Loc("uDebug"), params.waterDebug);
+    }
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR); // screen
+    // Original water remains screen blended. SSR is a premultiplied overlay; its hit mask uses exact colours.
+    glBlendFunc(GL_ONE, reflections && params.waterDebug == 2 ? GL_ZERO
+                                               : (reflections && params.waterDebug != 1 ? GL_ONE_MINUS_SRC_ALPHA
+                                                                                        : GL_ONE_MINUS_SRC_COLOR));
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
     CheckError("water");

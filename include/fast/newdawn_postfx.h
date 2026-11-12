@@ -46,7 +46,7 @@ typedef struct NewDawnPostFxParams {
     int32_t waterEnabled;
     int32_t waterReflections; /* opt-in opaque screen-space reflections */
     float waterReflectionStrength; /* already multiplied by the per-scene factor */
-    int32_t waterDebug;      /* 1: paint the planes */
+    int32_t waterDebug;      /* 1: paint planes, 2: reflection hit mask (green hit, blue miss, red rejected) */
     float waterStrength;     /* already multiplied by the per-scene factor and the light fade */
     float waterTime;         /* seconds, game time (the renderer adds the interpolation fraction) */
     int32_t waterBoxCount;
