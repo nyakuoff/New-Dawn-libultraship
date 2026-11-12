@@ -2034,6 +2034,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // if (rand()%2) return;
 
+    // Opaque world/actor casters only: skip rects, decals, alpha-tested/cutout foliage and effects. This runs before
+    // frustum rejection and culling: a caster outside the view, or facing away from the camera, still shadows the
+    // visible ground. All of these conditions are render-state only.
+    if (mShadowRecording && !is_rect) {
+        const uint32_t om = mRdp->other_mode_l;
+        const bool caster = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC &&
+                            (om & CVG_X_ALPHA) != CVG_X_ALPHA && (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD &&
+                            (om & G_ZS_PRIM) == 0 &&
+                            !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+        if (caster) {
+            RecordShadowTriangle(v1, v2, v3);
+        }
+    }
+
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
         return;
@@ -2369,12 +2383,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBatchShadeMask = shade_mask;
             mBatchPointLightQuality = mPerPixelPointLightQuality;
         }
-    }
-
-    // Opaque world/actor casters only: skip rects, decals, alpha-tested/cutout foliage and effects.
-    if (mShadowRecording && !is_rect && !zmode_decal && depth_mask && !alpha_threshold && !texture_edge &&
-        !use_prim_depth && !invisible) {
-        RecordShadowTriangle(v1, v2, v3);
     }
 
     uint8_t numInputs;

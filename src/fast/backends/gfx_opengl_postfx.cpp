@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -441,6 +442,19 @@ vec3 worldPos(ivec2 p, float d) {
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+    if (uDebug == 3) {
+        vec3 color = texture(uColor, vUv).rgb;
+        const vec2 mapMin = vec2(0.015, 0.68);
+        const vec2 mapSize = vec2(0.30, 0.30);
+        if (all(greaterThanEqual(vUv, mapMin)) && all(lessThan(vUv, mapMin + mapSize))) {
+            vec2 mapUv = (vUv - mapMin) / mapSize;
+            float depth = texture(uShadow, mapUv).r;
+            // Show caster coverage as a high-contrast silhouette; clear texels stay white.
+            color = (depth < 0.999999) ? vec3(0.04, 0.05, 0.06) : vec3(0.96);
+        }
+        oColor = vec4(color, 1.0);
+        return;
+    }
     float d0 = fetchDepth(p);
     if (d0 >= 0.99999) {
         oColor = vec4(texture(uColor, vUv).rgb, 1.0);
@@ -477,8 +491,9 @@ void main() {
     vec3 ndc = lc.xyz / lc.w;
     vec2 suv = ndc.xy * 0.5 + 0.5;
     float ref = ndc.z * 0.5 + 0.5;
-    if (ndl > 0.0 && ref < 1.0 && all(greaterThanEqual(suv, vec2(0.0))) &&
-        all(lessThanEqual(suv, vec2(1.0)))) {
+    bool inMap = ref < 1.0 && all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0)));
+    float sampledLit = 1.0;
+    if (inMap) {
         float bias = 0.003 + 0.010 * (1.0 - ndl);
         float sum = 0.0;
         for (int y = -2; y <= 2; y++) {
@@ -487,7 +502,14 @@ void main() {
                 sum += (ref - bias <= sd) ? 1.0 : 0.0;
             }
         }
-        lit = sum / 25.0;
+        sampledLit = sum / 25.0;
+    }
+    if (uDebug == 4) {
+        oColor = vec4(ndl, 1.0 - sampledLit, inMap ? 1.0 : 0.0, 1.0);
+        return;
+    }
+    if (ndl > 0.0 && inMap) {
+        lit = sampledLit;
     }
     if (uDebug == 2) {
         oColor = vec4(vec3(lit), 1.0);
@@ -997,6 +1019,59 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
         }
     }
 
+    static bool sampleLogsDone = false;
+    if (debug == 4 && !sampleLogsDone) {
+        const int sampleX[] = { (int)(w * 0.29f), (int)(w * 0.78f) };
+        const int sampleYTop[] = { (int)(h * 0.23f), (int)(h * 0.46f) };
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, mDepth.fbo);
+        for (int sample = 0; sample < 2; sample++) {
+            int px = std::clamp(sampleX[sample], 0, w - 1);
+            int py = std::clamp(sampleYTop[sample], 0, h - 1);
+            float depth = 1.0f;
+            glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+            if (depth >= 0.99999f) {
+                SPDLOG_INFO("NewDawn shadows: sample {} at ({},{}) is background", sample, px, py);
+                continue;
+            }
+
+            float ndc[4] = { ((float)px + 0.5f) / w * 2.0f - 1.0f,
+                             ((float)py + 0.5f) / h * 2.0f - 1.0f, depth * 2.0f - 1.0f, 1.0f };
+            ndc[0] *= params.shadowNdcXScale;
+            ndc[1] *= params.shadowFlipY;
+            float world[4] = {};
+            for (int j = 0; j < 4; j++) {
+                for (int i = 0; i < 4; i++) {
+                    world[j] += ndc[i] * params.shadowInvViewProj[i * 4 + j];
+                }
+            }
+            if (std::fabs(world[3]) > 1.0e-8f) {
+                world[0] /= world[3];
+                world[1] /= world[3];
+                world[2] /= world[3];
+            }
+
+            float bestDistSq = std::numeric_limits<float>::max();
+            float bestVertex[3] = {};
+            for (uint32_t i = 0; i < vertexCount; i++) {
+                float dx = positions[i * 3 + 0] - world[0];
+                float dy = positions[i * 3 + 1] - world[1];
+                float dz = positions[i * 3 + 2] - world[2];
+                float distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq < bestDistSq) {
+                    bestDistSq = distSq;
+                    bestVertex[0] = positions[i * 3 + 0];
+                    bestVertex[1] = positions[i * 3 + 1];
+                    bestVertex[2] = positions[i * 3 + 2];
+                }
+            }
+            SPDLOG_INFO("NewDawn shadows: sample {} pixel ({},{}) depth {:.5f} world ({:.1f},{:.1f},{:.1f}); "
+                        "nearest caster vertex ({:.1f},{:.1f},{:.1f}), distance {:.1f}",
+                        sample, px, py, depth, world[0], world[1], world[2], bestVertex[0], bestVertex[1],
+                        bestVertex[2], std::sqrt(bestDistSq));
+        }
+        sampleLogsDone = true;
+    }
+
     // Depth-only render of the recorded world-space triangles from the sun.
     glBindFramebuffer(GL_FRAMEBUFFER, mShadowMap.fbo);
     glViewport(0, 0, size, size);
@@ -1013,6 +1088,59 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertexCount * 3 * sizeof(float), positions, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
     CheckError("shadow map render");
+
+    if (debug == 4) {
+        static bool mapSampleLogsDone = false;
+        if (!mapSampleLogsDone) {
+            const int sampleX[] = { (int)(w * 0.29f), (int)(w * 0.78f) };
+            const int sampleYTop[] = { (int)(h * 0.23f), (int)(h * 0.46f) };
+            float lightViewProj[16];
+            BuildLightViewProj(params, lightViewProj);
+            for (int sample = 0; sample < 2; sample++) {
+                int px = std::clamp(sampleX[sample], 0, w - 1);
+                int py = std::clamp(sampleYTop[sample], 0, h - 1);
+                float depth = 1.0f;
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, mDepth.fbo);
+                glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+                if (depth >= 0.99999f) {
+                    continue;
+                }
+                float ndc[4] = { ((float)px + 0.5f) / w * 2.0f - 1.0f,
+                                 ((float)py + 0.5f) / h * 2.0f - 1.0f, depth * 2.0f - 1.0f, 1.0f };
+                ndc[0] *= params.shadowNdcXScale;
+                ndc[1] *= params.shadowFlipY;
+                float world[4] = {};
+                for (int j = 0; j < 4; j++) {
+                    for (int i = 0; i < 4; i++) {
+                        world[j] += ndc[i] * params.shadowInvViewProj[i * 4 + j];
+                    }
+                }
+                if (std::fabs(world[3]) > 1.0e-8f) {
+                    world[0] /= world[3];
+                    world[1] /= world[3];
+                    world[2] /= world[3];
+                }
+
+                float clip[4] = {};
+                for (int row = 0; row < 4; row++) {
+                    clip[row] = lightViewProj[row] * world[0] + lightViewProj[4 + row] * world[1] +
+                                lightViewProj[8 + row] * world[2] + lightViewProj[12 + row];
+                }
+                float suv[2] = { clip[0] / clip[3] * 0.5f + 0.5f, clip[1] / clip[3] * 0.5f + 0.5f };
+                float receiverRef = clip[2] / clip[3] * 0.5f + 0.5f;
+                int mapX = std::clamp((int)(suv[0] * size), 0, size - 1);
+                int mapY = std::clamp((int)(suv[1] * size), 0, size - 1);
+                float mapDepth = 1.0f;
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, mShadowMap.fbo);
+                glReadPixels(mapX, mapY, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &mapDepth);
+                SPDLOG_INFO("NewDawn shadows: receiver sample {} world ({:.1f},{:.1f},{:.1f}) light ({:.3f},{:.3f}) "
+                            "ref {:.5f}, map depth {:.5f}",
+                            sample, world[0], world[1], world[2], suv[0], suv[1], receiverRef, mapDepth);
+            }
+            mapSampleLogsDone = true;
+        }
+    }
+
     glBindVertexArray(mVao);
     // The shadow map pass enabled depth writes; the full-screen apply must not touch the game depth.
     glDisable(GL_DEPTH_TEST);
@@ -1040,7 +1168,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform1f(Loc("uFlipY"), params.shadowFlipY);
     glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
     glUniform2f(Loc("uShadowTexel"), 1.0f / size, 1.0f / size);
-    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_TRUE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
     glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
     glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
     glUniform3fv(Loc("uAmbient"), 1, params.shadowAmbient);
