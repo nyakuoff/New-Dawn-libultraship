@@ -35,6 +35,7 @@ static PostFxGL::Settings ReadSettings() {
     PostFxGL::Settings s;
     s.postFxOn = CvInt("gNewDawn.PostFx.Enabled", 1) != 0;
     s.shadowsOn = CvInt("gNewDawn.Shadows.Enabled", 0) != 0;
+    s.shadowDebug = CvInt("gNewDawn.Shadows.Debug", 0);
     s.aoOn = CvInt("gNewDawn.PostFx.AO.Enabled", 1) != 0;
     s.aoStrength = std::clamp(CvFloat("gNewDawn.PostFx.AO.Strength", Defaults::kAoStrength), 0.0f, 4.0f);
     s.aoRadius = std::clamp(CvFloat("gNewDawn.PostFx.AO.Radius", Defaults::kAoRadius), 1.0f, 500.0f);
@@ -82,21 +83,32 @@ static void Mat4Multiply(const float a[16], const float b[16], float out[16]) {
 static void BuildLightViewProj(const NewDawnPostFxParams& params, float out[16]) {
     float dir[3] = { params.shadowSunDir[0], params.shadowSunDir[1], params.shadowSunDir[2] };
     float focus[3] = { params.shadowFocus[0], params.shadowFocus[1], params.shadowFocus[2] };
-    float distance = params.shadowRadius + 1000.0f;
-    float eye[3] = { focus[0] + dir[0] * distance, focus[1] + dir[1] * distance, focus[2] + dir[2] * distance };
     float up[3] = { 0.0f, 1.0f, 0.0f };
     if (std::fabs(dir[1]) > 0.98f) {
         up[0] = 0.0f;
         up[1] = 0.0f;
         up[2] = 1.0f;
     }
-    float forward[3] = { focus[0] - eye[0], focus[1] - eye[1], focus[2] - eye[2] };
+    float forward[3] = { -dir[0], -dir[1], -dir[2] };
     Normalize3(forward, forward);
     float right[3];
     Cross3(forward, up, right);
     Normalize3(right, right);
     float realUp[3];
     Cross3(right, forward, realUp);
+
+    // Snap the centre to the shadow-map texel grid so the map does not swim as Link moves.
+    float texel = 2.0f * params.shadowRadius / (float)params.shadowMapSize;
+    float focusRight = focus[0] * right[0] + focus[1] * right[1] + focus[2] * right[2];
+    float focusUp = focus[0] * realUp[0] + focus[1] * realUp[1] + focus[2] * realUp[2];
+    float snapRight = std::round(focusRight / texel) * texel - focusRight;
+    float snapUp = std::round(focusUp / texel) * texel - focusUp;
+    for (int i = 0; i < 3; i++) {
+        focus[i] += right[i] * snapRight + realUp[i] * snapUp;
+    }
+
+    float distance = params.shadowRadius + 1000.0f;
+    float eye[3] = { focus[0] + dir[0] * distance, focus[1] + dir[1] * distance, focus[2] + dir[2] * distance };
 
     float view[16] = {
         right[0], realUp[0], -forward[0], 0.0f, right[1], realUp[1], -forward[1], 0.0f,
@@ -113,25 +125,6 @@ static void BuildLightViewProj(const NewDawnPostFxParams& params, float out[16])
         -2.0f / (farZ - nearZ), 0.0f, 0.0f, 0.0f, -(farZ + nearZ) / (farZ - nearZ), 1.0f,
     };
     Mat4Multiply(ortho, view, out);
-}
-
-// Builds view -> world (column-major for GLSL) from the game camera vectors.
-static void BuildViewToWorld(const NewDawnPostFxParams& params, float out[16]) {
-    float eye[3] = { params.shadowCameraEye[0], params.shadowCameraEye[1], params.shadowCameraEye[2] };
-    float at[3] = { params.shadowCameraAt[0], params.shadowCameraAt[1], params.shadowCameraAt[2] };
-    float up[3] = { params.shadowCameraUp[0], params.shadowCameraUp[1], params.shadowCameraUp[2] };
-    float forward[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
-    Normalize3(forward, forward);
-    float right[3];
-    Cross3(forward, up, right);
-    Normalize3(right, right);
-    float realUp[3];
-    Cross3(right, forward, realUp);
-    float m[16] = {
-        right[0], right[1], right[2], 0.0f, realUp[0], realUp[1], realUp[2], 0.0f,
-        -forward[0], -forward[1], -forward[2], 0.0f, eye[0], eye[1], eye[2], 1.0f,
-    };
-    std::copy(m, m + 16, out);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -425,23 +418,25 @@ out vec4 oColor;
 uniform sampler2D uColor;
 uniform sampler2D uShadow;
 uniform vec2 uShadowTexel;
-uniform mat4 uViewToWorld;
+uniform mat4 uInvViewProj;
 uniform mat4 uLightViewProj;
 uniform vec3 uSunDir;
 uniform vec3 uAmbient;
 uniform vec3 uDirColor;
+uniform vec3 uCameraEye;
 uniform float uStrength;
 uniform float uMinFactor;
 uniform float uNormalBias;
-uniform float uTanX;
-uniform float uTanY;
+uniform float uNdcXScale;
 uniform float uFlipY;
+uniform int uDebug;
 
-vec3 viewPos(ivec2 p, float d) {
+vec3 worldPos(ivec2 p, float d) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
     ndc.y *= uFlipY;
-    float dist = linDepth(d);
-    return vec3(ndc.x * uTanX * dist, ndc.y * uTanY * dist, -dist);
+    ndc.x *= uNdcXScale;
+    vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
+    return w.xyz / w.w;
 }
 
 void main() {
@@ -451,14 +446,22 @@ void main() {
         oColor = vec4(texture(uColor, vUv).rgb, 1.0);
         return;
     }
-    vec3 P = viewPos(p, d0);
+    vec3 P = worldPos(p, d0);
+    if (uDebug == 1) {
+        oColor = vec4(fract(P / 100.0), 1.0);
+        return;
+    }
 
-    vec3 Pl = viewPos(p + ivec2(-1, 0), fetchDepth(p + ivec2(-1, 0)));
-    vec3 Pr = viewPos(p + ivec2(1, 0), fetchDepth(p + ivec2(1, 0)));
-    vec3 Pd = viewPos(p + ivec2(0, -1), fetchDepth(p + ivec2(0, -1)));
-    vec3 Pu = viewPos(p + ivec2(0, 1), fetchDepth(p + ivec2(0, 1)));
-    bool useR = (p.x == 0) || (p.x < uSize.x - 1 && abs(Pr.z - P.z) < abs(P.z - Pl.z));
-    bool useU = (p.y == 0) || (p.y < uSize.y - 1 && abs(Pu.z - P.z) < abs(P.z - Pd.z));
+    float dL = fetchDepth(p + ivec2(-1, 0));
+    float dR = fetchDepth(p + ivec2(1, 0));
+    float dD = fetchDepth(p + ivec2(0, -1));
+    float dU = fetchDepth(p + ivec2(0, 1));
+    vec3 Pl = worldPos(p + ivec2(-1, 0), dL);
+    vec3 Pr = worldPos(p + ivec2(1, 0), dR);
+    vec3 Pd = worldPos(p + ivec2(0, -1), dD);
+    vec3 Pu = worldPos(p + ivec2(0, 1), dU);
+    bool useR = (p.x == 0) || (p.x < uSize.x - 1 && abs(dR - d0) < abs(d0 - dL));
+    bool useU = (p.y == 0) || (p.y < uSize.y - 1 && abs(dU - d0) < abs(d0 - dD));
     vec3 dx = useR ? (Pr - P) : (P - Pl);
     vec3 dy = useU ? (Pu - P) : (P - Pd);
     vec3 n = cross(dx, dy);
@@ -467,17 +470,14 @@ void main() {
         oColor = vec4(texture(uColor, vUv).rgb, 1.0);
         return;
     }
-    vec3 Nv = n / nl;
-    if (dot(Nv, P) > 0.0) {
-        Nv = -Nv;
+    vec3 N = n / nl;
+    if (dot(N, uCameraEye - P) < 0.0) {
+        N = -N;
     }
-
-    vec3 world = (uViewToWorld * vec4(P, 1.0)).xyz;
-    vec3 N = normalize(mat3(uViewToWorld) * Nv);
     float ndl = max(dot(N, uSunDir), 0.0);
 
     float lit = 1.0;
-    vec4 lc = uLightViewProj * vec4(world + N * uNormalBias, 1.0);
+    vec4 lc = uLightViewProj * vec4(P + N * uNormalBias, 1.0);
     vec3 ndc = lc.xyz / lc.w;
     vec2 suv = ndc.xy * 0.5 + 0.5;
     float ref = ndc.z * 0.5 + 0.5;
@@ -485,13 +485,17 @@ void main() {
         all(lessThanEqual(suv, vec2(1.0)))) {
         float bias = 0.003 + 0.010 * (1.0 - ndl);
         float sum = 0.0;
-        for (int y = -1; y <= 1; y++) {
-            for (int x = -1; x <= 1; x++) {
+        for (int y = -2; y <= 2; y++) {
+            for (int x = -2; x <= 2; x++) {
                 float sd = texture(uShadow, suv + vec2(x, y) * uShadowTexel).r;
                 sum += (ref - bias <= sd) ? 1.0 : 0.0;
             }
         }
-        lit = sum / 9.0;
+        lit = sum / 25.0;
+    }
+    if (uDebug == 2) {
+        oColor = vec4(vec3(lit), 1.0);
+        return;
     }
 
     vec3 direct = uDirColor * ndl;
@@ -887,7 +891,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     }
     if (doShadow) {
         BeginTimer(kShadowTimerStage);
-        RunShadows(params, fb, shadowPositions, shadowVertexCount);
+        RunShadows(params, fb, shadowPositions, shadowVertexCount, s.shadowDebug);
         EndTimer(kShadowTimerStage);
     }
     if (doAo) {
@@ -941,17 +945,60 @@ void PostFxGL::EnsureShadowTarget(int size) {
     mShadowMap.h = size;
 }
 
-void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb,
-                          const float* positions, uint32_t vertexCount) {
+void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* positions,
+                          uint32_t vertexCount, int debug) {
     float lightViewProj[16];
-    float viewToWorld[16];
     BuildLightViewProj(params, lightViewProj);
-    BuildViewToWorld(params, viewToWorld);
     const int size = params.shadowMapSize;
     const int w = fb.width, h = fb.height;
     EnsureShadowTarget(size);
     if (!mUsable) {
         return;
+    }
+
+    if (debug != 0) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            const float* P = params.shadowViewProj;
+            const float* invP = params.shadowInvViewProj;
+            float f[4] = { params.shadowFocus[0], params.shadowFocus[1], params.shadowFocus[2], 1.0f };
+            float clip[4];
+            for (int j = 0; j < 4; j++) {
+                clip[j] = f[0] * P[0 * 4 + j] + f[1] * P[1 * 4 + j] + f[2] * P[2 * 4 + j] + P[3 * 4 + j];
+            }
+            float ndcX = clip[0] / clip[3];
+            float ndcY = clip[1] / clip[3] * params.shadowFlipY;
+            int px = std::clamp((int)((ndcX * 0.5f + 0.5f) * w), 0, w - 1);
+            int pyA = std::clamp((int)((ndcY * 0.5f + 0.5f) * h), 0, h - 1);
+            int pyB = std::clamp(h - 1 - pyA, 0, h - 1);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, mDepth.fbo);
+            for (int py : { pyA, pyB }) {
+                float depth = 0.0f;
+                glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+                float ndc[4] = { ndcX * params.shadowNdcXScale, (float)py / (float)h * 2.0f - 1.0f,
+                                  depth * 2.0f - 1.0f, 1.0f };
+                ndc[1] *= params.shadowFlipY;
+                float world[4] = {};
+                for (int j = 0; j < 4; j++) {
+                    for (int i = 0; i < 4; i++) {
+                        world[j] += ndc[i] * invP[i * 4 + j];
+                    }
+                }
+                if (world[3] != 0.0f) {
+                    world[0] /= world[3];
+                    world[1] /= world[3];
+                    world[2] /= world[3];
+                }
+                float dx = world[0] - f[0];
+                float dy = world[1] - f[1];
+                float dz = world[2] - f[2];
+                SPDLOG_INFO("NewDawn shadows: focus ({:.1f},{:.1f},{:.1f}) -> pixel ({},{}), reconstructed "
+                            "({:.1f},{:.1f},{:.1f}), distance {:.1f}",
+                            f[0], f[1], f[2], px, py, world[0], world[1], world[2],
+                            std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+        }
     }
 
     // Depth-only render of the recorded world-space triangles from the sun.
@@ -983,9 +1030,6 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     CheckError("shadow colour blit");
 
-    const float tanY = std::tan(params.fovyDegrees * 3.14159265f / 360.0f);
-    const float tanX = tanY * static_cast<float>(w) / static_cast<float>(h);
-    const float flipY = fb.invertY ? -1.0f : 1.0f;
 
     Bind(0, mScene.tex);
     Bind(1, mDepth.tex);
@@ -997,18 +1041,19 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform2i(Loc("uSize"), w, h);
     glUniform1f(Loc("uNear"), params.zNear);
     glUniform1f(Loc("uFar"), params.zFar);
-    glUniform1f(Loc("uTanX"), tanX);
-    glUniform1f(Loc("uTanY"), tanY);
-    glUniform1f(Loc("uFlipY"), flipY);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
     glUniform2f(Loc("uShadowTexel"), 1.0f / size, 1.0f / size);
-    glUniformMatrix4fv(Loc("uViewToWorld"), 1, GL_FALSE, viewToWorld);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_TRUE, params.shadowInvViewProj);
     glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
     glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
     glUniform3fv(Loc("uAmbient"), 1, params.shadowAmbient);
     glUniform3fv(Loc("uDirColor"), 1, params.shadowDirColor);
+    glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);
     glUniform1f(Loc("uMinFactor"), 0.35f);
     glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)size * 4.0f);
+    glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
     CheckError("shadow apply");
 }

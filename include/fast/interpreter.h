@@ -16,6 +16,7 @@
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
+#include "fast/newdawn_postfx.h"
 #include "fast/debug/GfxDebugger.h"
 
 #include "fast/resource/type/Texture.h"
@@ -442,6 +443,7 @@ class Interpreter {
     void BeginShadowRecording(bool enabled);
     void EndShadowRecording();
     void SubmitShadowCasters();
+    void FillShadowCameraParams(NewDawnPostFxParams& params) const;
     void UpdateTextureCacheSize(int textureSlot);
     bool TextureCacheNodeInUse(const TextureCacheNode* node) const;
     bool EvictOneTextureCacheEntry(const TextureCacheNode* protect);
@@ -567,6 +569,11 @@ class Interpreter {
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
     bool mShadowRecording = false;
     bool mShadowOverflowLogged = false;
+    bool mShadowExactProj = false;
+    float mShadowViewProj[16] = {};
+    float mShadowInvViewProj[16] = {};
+    float mShadowNdcXScale = 1.0f;
+    float mShadowFlipY = 1.0f;
     std::vector<float> mShadowVertices;
     // New Dawn per-pixel lighting (gNewDawn.Lighting.PerPixel). mPerPixelLightState is the state the
     // next batch draws with; the backend re-uploads it when the serial or shader program changes.

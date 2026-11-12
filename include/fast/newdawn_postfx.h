@@ -29,6 +29,10 @@ typedef struct NewDawnPostFxParams {
     float shadowDirColor[3]; /* 0..1 */
     float shadowFocus[3];
     float shadowCameraEye[3];
-    float shadowCameraAt[3];
-    float shadowCameraUp[3];
+    /* Filled by the interpreter at the opaque-end marker: exact P and its inverse (row-major). */
+    int32_t shadowUseExactProj;
+    float shadowNdcXScale;
+    float shadowFlipY;
+    float shadowViewProj[16];
+    float shadowInvViewProj[16];
 } NewDawnPostFxParams;

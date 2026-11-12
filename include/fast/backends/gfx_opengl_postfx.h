@@ -26,6 +26,7 @@ class PostFxGL {
     struct Settings {
         bool postFxOn, aoOn, bloomOn, gradeOn;
         bool shadowsOn;
+        int shadowDebug;
         float aoStrength, aoRadius;
         float bloomStrength, bloomThreshold;
         float contrast, saturation;
@@ -50,7 +51,7 @@ class PostFxGL {
     void PrepareDepth(const FramebufferOGL& fb);
     void EnsureShadowTarget(int size);
     void RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* positions,
-                    uint32_t vertexCount);
+                    uint32_t vertexCount, int debug);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);

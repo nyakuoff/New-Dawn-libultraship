@@ -12,6 +12,7 @@
 #endif
 
 #include <any>
+#include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -640,13 +641,83 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     }
 }
 
+static bool Invert4x4(const float m[4][4], float out[16]) {
+    float a[4][8];
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            a[row][col] = m[row][col];
+            a[row][col + 4] = (row == col) ? 1.0f : 0.0f;
+        }
+    }
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int row = col + 1; row < 4; row++) {
+            if (fabsf(a[row][col]) > fabsf(a[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (fabsf(a[pivot][col]) < 1e-8f) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int k = 0; k < 8; k++) {
+                std::swap(a[pivot][k], a[col][k]);
+            }
+        }
+        const float invPivot = 1.0f / a[col][col];
+        for (int k = 0; k < 8; k++) {
+            a[col][k] *= invPivot;
+        }
+        for (int row = 0; row < 4; row++) {
+            if (row == col) {
+                continue;
+            }
+            const float factor = a[row][col];
+            if (factor == 0.0f) {
+                continue;
+            }
+            for (int k = 0; k < 8; k++) {
+                a[row][k] -= factor * a[col][k];
+            }
+        }
+    }
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            out[row * 4 + col] = a[row][col + 4];
+        }
+    }
+    return true;
+}
+
 void Interpreter::BeginShadowRecording(bool enabled) {
     mShadowRecording = enabled;
     mShadowVertices.clear();
     mShadowOverflowLogged = false;
-    if (enabled && mShadowVertices.capacity() < 3 * 1024 * 1024) {
+    mShadowExactProj = false;
+    if (!enabled) {
+        return;
+    }
+    if (mShadowVertices.capacity() < 3 * 1024 * 1024) {
         mShadowVertices.reserve(3 * 1024 * 1024);
     }
+
+    mShadowExactProj = Invert4x4(mRsp->P_matrix, mShadowInvViewProj);
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            mShadowViewProj[row * 4 + col] = mRsp->P_matrix[row][col];
+        }
+    }
+    const float ndcXScale = AdjXForAspectRatio(1.0f);
+    mShadowNdcXScale = (ndcXScale > 1e-6f) ? (1.0f / ndcXScale) : 1.0f;
+    mShadowFlipY = mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
+}
+
+void Interpreter::FillShadowCameraParams(NewDawnPostFxParams& params) const {
+    params.shadowUseExactProj = mShadowExactProj ? 1 : 0;
+    params.shadowNdcXScale = mShadowNdcXScale;
+    params.shadowFlipY = mShadowFlipY;
+    memcpy(params.shadowViewProj, mShadowViewProj, sizeof(mShadowViewProj));
+    memcpy(params.shadowInvViewProj, mShadowInvViewProj, sizeof(mShadowInvViewProj));
 }
 
 void Interpreter::EndShadowRecording() {
@@ -4410,10 +4481,15 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
 
     // Only ever post-process the game framebuffer itself
     if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive) {
+        NewDawnPostFxParams effective = params;
         if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+            gfx->FillShadowCameraParams(effective);
+            if (effective.shadowUseExactProj == 0) {
+                effective.shadowEnabled = 0;
+            }
             gfx->SubmitShadowCasters();
         }
-        gfx->mRapi->RunPostFx(stage, params, gfx->mGameFb);
+        gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
     }
     return false;
 }
