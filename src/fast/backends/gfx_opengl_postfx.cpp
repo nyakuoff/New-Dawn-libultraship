@@ -696,6 +696,101 @@ uniform float uPixelAngle;
 uniform vec3 uLightDir;
 uniform vec3 uLightColor;
 uniform vec3 uSky;
+#ifdef WATER_REFLECTIONS
+uniform mat4 uViewProj;
+uniform sampler2D uOpaqueColor;
+uniform sampler2D uOpaqueDepth;
+uniform float uReflectionStrength;
+
+vec3 worldPos(ivec2 p, float d);
+
+// March uniformly in screen space, interpolating reciprocal clip W for perspective-correct axial depth.
+// Stable deterministic steps: no temporal history, random jitter or feedback from the translucent world.
+vec4 traceReflection(vec3 origin, vec3 direction, float planeY) {
+    if (direction.y <= 0.002) {
+        return vec4(0.0);
+    }
+    vec4 c0 = uViewProj * vec4(origin, 1.0);
+    vec4 c1 = uViewProj * vec4(origin + direction * min(uFar, 6000.0), 1.0);
+    if (c0.w <= uNear) {
+        return vec4(0.0);
+    }
+    if (c1.w < uNear) {
+        c1 = mix(c0, c1, (c0.w - uNear) / (c0.w - c1.w));
+    }
+    vec2 uv0 = vec2(c0.x / (c0.w * uNdcXScale), c0.y / c0.w * uFlipY) * 0.5 + 0.5;
+    vec2 uv1 = vec2(c1.x / (c1.w * uNdcXScale), c1.y / c1.w * uFlipY) * 0.5 + 0.5;
+    vec2 delta = uv1 - uv0;
+    float end = 1.0;
+    for (int axis = 0; axis < 2; axis++) {
+        if (abs(delta[axis]) > 1e-6) {
+            float edge = delta[axis] > 0.0 ? 0.999 : 0.001;
+            end = min(end, (edge - uv0[axis]) / delta[axis]);
+        }
+    }
+    end = clamp(end, 0.0, 1.0);
+    float pixels = length(delta * end * vec2(uSize));
+    if (pixels < 2.0) {
+        return vec4(0.0);
+    }
+    int steps = int(clamp(ceil(pixels / 6.0), 8.0, 40.0));
+    float k0 = 1.0 / c0.w;
+    float k1 = 1.0 / c1.w;
+    float previous = 0.0;
+    bool inFront = false;
+    for (int i = 1; i <= 40; i++) {
+        if (i > steps) {
+            break;
+        }
+        float t = end * float(i) / float(steps);
+        vec2 uv = uv0 + delta * t;
+        float d = texture(uOpaqueDepth, uv).r;
+        float gap = 1.0 / mix(k0, k1, t) - linDepth(d);
+        if (d < 0.99999 && gap >= 0.0 && inFront) {
+            float lo = previous, hi = t;
+            for (int j = 0; j < 5; j++) {
+                float mid = (lo + hi) * 0.5;
+                float md = texture(uOpaqueDepth, uv0 + delta * mid).r;
+                if (1.0 / mix(k0, k1, mid) > linDepth(md)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            uv = uv0 + delta * hi;
+            d = texture(uOpaqueDepth, uv).r;
+            float depth = linDepth(d);
+            float mismatch = abs(1.0 / mix(k0, k1, hi) - depth);
+            float thickness = max(8.0, depth * 0.015);
+            vec3 hit = worldPos(ivec2(uv * vec2(uSize)), d);
+            // Never reflect the bed, or a water mesh that happened to write opaque depth.
+            if (d >= 0.99999 || hit.y <= planeY + 2.0 || mismatch > thickness) {
+                return vec4(0.0);
+            }
+            vec2 edges = min(uv, 1.0 - uv);
+            float confidence = smoothstep(0.0, 0.06, min(edges.x, edges.y));
+            confidence *= 1.0 - smoothstep(thickness * 0.25, thickness, mismatch);
+            confidence *= smoothstep(0.002, 0.06, direction.y);
+            confidence *= 1.0 - smoothstep(0.75, 1.0, hi);
+            // Small depth-aware cross gather softens the reflection without bleeding across silhouettes.
+            vec3 color = texture(uOpaqueColor, uv).rgb;
+            float weight = 1.0;
+            const vec2 taps[4] = vec2[4](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
+            for (int j = 0; j < 4; j++) {
+                vec2 tap = uv + taps[j] * 2.5 / vec2(uSize);
+                float td = linDepth(texture(uOpaqueDepth, tap).r);
+                float w = exp(-abs(td - depth) / thickness);
+                color += texture(uOpaqueColor, tap).rgb * w;
+                weight += w;
+            }
+            return vec4(color / weight, confidence);
+        }
+        inFront = gap < 0.0;
+        previous = t;
+    }
+    return vec4(0.0);
+}
+#endif
 
 vec3 worldPos(ivec2 p, float d) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
@@ -809,6 +904,13 @@ void main() {
     spec = min(spec, 12.0);
 
     vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
+#ifdef WATER_REFLECTIONS
+    // Less slope than the glint normal: a calm, gently distorted reflection rather than a rippling mirror.
+    vec3 reflectionNormal = normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25));
+    vec4 hit = traceReflection(H + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi]);
+    vec3 reflected = mix(uSky, hit.rgb, hit.a);
+    add += reflected * fres * 0.6 * uReflectionStrength * shore;
+#endif
     oColor = vec4(max(add, 0.0), 1.0);
 }
 )GLSL";
@@ -1054,6 +1156,8 @@ bool PostFxGL::BuildPrograms() {
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
     const char* water[] = { kVersion, kDepthLib, kWaterShader };
     mWater.id = BuildProgram("water shader", water, 3, mWater.uniforms);
+    const char* waterReflection[] = { kVersion, "#define WATER_REFLECTIONS\n", kDepthLib, kWaterShader };
+    mWaterReflection.id = BuildProgram("water reflection shader", waterReflection, 4, mWaterReflection.uniforms);
     const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
     const char* shaftBlur[] = { kVersion, kShaftBlurShader };
     const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
@@ -1070,7 +1174,7 @@ bool PostFxGL::BuildPrograms() {
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     return mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
-           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id;
+           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -1157,7 +1261,8 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 1) ? "scene end / bloom+grade"
                                 : (stage == 2) ? "shadows"
                                 : (stage == 3) ? "sun shafts"
-                                               : "water";
+                                : (stage == 4) ? "water"
+                                               : "water opaque copy";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -1190,6 +1295,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShadow = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.shadowsOn && params.shadowEnabled != 0 &&
                           shadowPositions != nullptr && shadowVertexCount >= 3;
     const bool doAo = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.postFxOn && s.aoOn;
+    const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterReflections != 0 &&
+                              params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
     const bool doShafts = doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
@@ -1197,7 +1304,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn);
-    if (!doShadow && !doAo && !doScene && !doWater) {
+    if (!doShadow && !doAo && !doScene && !doWater && !captureWater) {
         return;
     }
 
@@ -1244,6 +1351,23 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(kShaftTimerStage);
         RunSunShafts(params, fb);
         EndTimer(kShaftTimerStage);
+    }
+
+    if (captureWater) {
+        BeginTimer(kWaterCaptureTimerStage);
+        // AO split view leaves its apply scissor enabled; copies must cover the whole source.
+        glDisable(GL_SCISSOR_TEST);
+        const int w = fb.width, h = fb.height;
+        EnsureTarget(mWaterOpaqueColor, w, h, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, false, true);
+        EnsureTarget(mWaterOpaqueDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mWaterOpaqueColor.fbo);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mWaterOpaqueDepth.fbo);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        mWaterOpaqueFrame = frameIndex;
+        EndTimer(kWaterCaptureTimerStage);
     }
 
     CheckError(doShadow ? "shadow stage" : (stage == 0 ? "opaque end stage" : "scene end stage"));
@@ -1522,8 +1646,18 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
         rect[i * 4 + 3] = params.waterBoxes[i][3];
         surfaceY[i] = params.waterBoxes[i][4];
     }
+    const bool reflections = params.waterReflections != 0 && mWaterOpaqueFrame == mSettingsFrame &&
+                             mWaterOpaqueColor.w == w && mWaterOpaqueColor.h == h;
     Bind(1, mDepth.tex);
-    Use(mWater);
+    Use(reflections ? mWaterReflection : mWater);
+    if (reflections) {
+        Bind(0, mWaterOpaqueColor.tex);
+        Bind(2, mWaterOpaqueDepth.tex);
+        glUniform1i(Loc("uOpaqueColor"), kFirstUnit + 0);
+        glUniform1i(Loc("uOpaqueDepth"), kFirstUnit + 2);
+        glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+        glUniform1f(Loc("uReflectionStrength"), params.waterReflectionStrength);
+    }
     glUniform1i(Loc("uDepth"), kFirstUnit + 1);
     glUniform2i(Loc("uSize"), w, h);
     glUniform1f(Loc("uNear"), params.zNear);
