@@ -629,6 +629,18 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
 }
 
+uint64_t GfxRenderingAPIOGL::GetTextureByteSize(uint32_t textureId) {
+    if (textureId >= textures.size()) {
+        return 0;
+    }
+    const TextureInfo& texture = textures[textureId];
+    uint64_t bytes = (uint64_t)texture.width * texture.height * 4;
+    if (texture.mipmapped) {
+        bytes += bytes / 3; // 4/3 of level 0 approximates the full mip chain
+    }
+    return bytes;
+}
+
 void GfxRenderingAPIOGL::BuildMipmaps() {
     TextureInfo& texture = textures[mCurrentTextureIds[mCurrentTile]];
     texture.mipEligible = true;

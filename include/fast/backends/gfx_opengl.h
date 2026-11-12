@@ -79,6 +79,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
     void BuildMipmaps() override;
+    uint64_t GetTextureByteSize(uint32_t textureId) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
