@@ -14,6 +14,7 @@ add_executable(lus_tests
     crc64_tests.cpp
     stox_tests.cpp
     utils_tests.cpp
+    material_combiner_tests.cpp
     bitconverter_tests.cpp
     event_system_tests.cpp
     sound_matrix_decoder_tests.cpp

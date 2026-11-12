@@ -40,7 +40,12 @@
 namespace Fast {
 // Defined here, where PostFxGL is a complete type
 GfxRenderingAPIOGL::GfxRenderingAPIOGL() = default;
-GfxRenderingAPIOGL::~GfxRenderingAPIOGL() = default;
+GfxRenderingAPIOGL::~GfxRenderingAPIOGL() {
+#ifndef USE_OPENGLES
+    if (mDrawTimers[0])
+        glDeleteQueries(kDrawTimerCount, mDrawTimers);
+#endif
+}
 
 // Texture filtering settings shared with the in-game menu (mm/2s2h/BenGui/BenMenu.cpp).
 static bool AreMipmapsEnabled() {
@@ -119,6 +124,14 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
     }
 
+    if (mCurrentShaderProgram->material_strength_location >= 0) {
+        const auto& materialAlbedo = textures[mCurrentTextureIds[mCurrentShaderProgram->materialTile]];
+        glUniform2f(mCurrentShaderProgram->material_mirror_location, materialAlbedo.mirrorS, materialAlbedo.mirrorT);
+        glUniform1f(mCurrentShaderProgram->material_strength_location,
+                    std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
+                                   "gNewDawn.Materials.Strength", 1.0f),
+                               0.0f, 2.0f));
+    }
     glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
     if (HdrWorldActive()) {
         auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
@@ -398,8 +411,11 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
             hdrDiffuseMask = 0;
         }
     }
+    bool materialAlias = false;
+    const int materialMask = NewDawnMaterialShadeMask(cc_features, materialAlias);
     prism::Processor processor;
     prism::ContextItems mContext = {
+        { "material_diffuse_mask", materialMask },
         { "hdr_diffuse_mask", hdrDiffuseMask },
         { "VERTEX_SHADER", false },
         { "o_c", M_ARRAY(cc_features.c, int, 2, 2, 4) },
@@ -414,6 +430,13 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_prim_depth", cc_features.opt_prim_depth },
         { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
+        { "o_material_maps", cc_features.opt_material_maps },
+        { "material_tile", cc_features.opt_material_tile1 ? 1 : 0 },
+        { "material_blend", cc_features.opt_material_blend && cc_features.c[0][0][2] >= SHADER_INPUT_1 &&
+                                cc_features.c[0][0][2] <= SHADER_INPUT_7 },
+        { "material_weight_index", cc_features.c[0][0][2] },
+        { "material_weight_invert",
+          cc_features.c[0][0][0] == (cc_features.opt_material_tile1 ? SHADER_TEXEL0 : SHADER_TEXEL1) },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -507,30 +530,38 @@ static prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextT
 static std::string BuildVsShader(const CCFeatures& cc_features) {
     numFloats = 4;
     prism::Processor processor;
-    prism::ContextItems mContext = { { "VERTEX_SHADER", true },
-                                     { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
-                                     { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
-                                     { "o_fog", cc_features.opt_fog },
-                                     { "o_grayscale", cc_features.opt_grayscale },
-                                     { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
-                                     { "o_alpha", cc_features.opt_alpha },
-                                     { "o_inputs", cc_features.numInputs },
-                                     { "update_floats", (InvokeFunc)UpdateFloats },
+    prism::ContextItems mContext = {
+        { "VERTEX_SHADER", true },
+        { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
+        { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
+        { "o_fog", cc_features.opt_fog },
+        { "o_grayscale", cc_features.opt_grayscale },
+        { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
+        { "o_material_maps", cc_features.opt_material_maps },
+        { "material_tile", cc_features.opt_material_tile1 ? 1 : 0 },
+        { "material_blend", cc_features.opt_material_blend && cc_features.c[0][0][2] >= SHADER_INPUT_1 &&
+                                cc_features.c[0][0][2] <= SHADER_INPUT_7 },
+        { "material_weight_index", cc_features.c[0][0][2] },
+        { "material_weight_invert",
+          cc_features.c[0][0][0] == (cc_features.opt_material_tile1 ? SHADER_TEXEL0 : SHADER_TEXEL1) },
+        { "o_alpha", cc_features.opt_alpha },
+        { "o_inputs", cc_features.numInputs },
+        { "update_floats", (InvokeFunc)UpdateFloats },
 #ifdef __APPLE__
-                                     { "GLSL_VERSION", "#version 410 core" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", false }
+        { "GLSL_VERSION", "#version 410 core" },
+        { "attr", "in" },
+        { "out", "out" },
+        { "opengles", false }
 #elif defined(USE_OPENGLES)
-                                     { "GLSL_VERSION", "#version 300 es" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", true }
+        { "GLSL_VERSION", "#version 300 es" },
+        { "attr", "in" },
+        { "out", "out" },
+        { "opengles", true }
 #else
-                                     { "GLSL_VERSION", "#version 110" },
-                                     { "attr", "attribute" },
-                                     { "out", "varying" },
-                                     { "opengles", false }
+        { "GLSL_VERSION", "#version 110" },
+        { "attr", "attribute" },
+        { "out", "varying" },
+        { "opengles", false }
 #endif
     };
     processor.populate(mContext);
@@ -667,6 +698,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     }
 
     prg->openglProgramId = shader_program;
+    prg->materialTile = cc_features.opt_material_tile1 ? 1 : 0;
     prg->numInputs = cc_features.numInputs;
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
@@ -697,10 +729,16 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_positional_location = glGetUniformLocation(shader_program, "uLightPositional");
     prg->per_pixel_view_matrix_location = glGetUniformLocation(shader_program, "uViewMatrix");
     prg->per_pixel_shade_mask_location = glGetUniformLocation(shader_program, "uShadeMask");
+    prg->material_mirror_location = glGetUniformLocation(shader_program, "uMaterialMirror");
+    prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
 
     LoadShader(prg);
 
+    if (cc_features.opt_material_maps) {
+        glUniform1i(glGetUniformLocation(shader_program, "uMaterialNormal"), MATERIAL_NORMAL_TEXTURE);
+        glUniform1i(glGetUniformLocation(shader_program, "uMaterialRoughness"), MATERIAL_ROUGHNESS_TEXTURE);
+    }
     if (cc_features.usedTextures[0]) {
         GLint sampler_location = glGetUniformLocation(shader_program, "uTex0");
         glUniform1i(sampler_location, 0);
@@ -764,6 +802,23 @@ void GfxRenderingAPIOGL::SelectTexture(int tile, GLuint texture_id) {
     mCurrentTile = tile;
 }
 
+bool GfxRenderingAPIOGL::SupportsMaterialMaps() {
+    return mMaterialUnitsAvailable;
+}
+
+void GfxRenderingAPIOGL::UploadMaterialTexture(const uint8_t* rg8, uint32_t width, uint32_t height) {
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0, GL_RG, GL_UNSIGNED_BYTE, rg8);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    TextureInfo& texture = textures[mCurrentTextureIds[mCurrentTile]];
+    texture.width = width;
+    texture.height = height;
+    texture.bytesPerPixel = 2;
+    texture.mipmapped = false;
+    texture.mipEligible = false;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+}
+
 void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         return;
@@ -772,6 +827,7 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
     TextureInfo& texture = textures[mCurrentTextureIds[mCurrentTile]];
     texture.width = width;
     texture.height = height;
+    texture.bytesPerPixel = 4;
     texture.mipmapped = false;
     texture.mipEligible = false;
     // A fresh level 0 does not guarantee the rest of an old chain is still valid. Restrict sampling to
@@ -784,7 +840,7 @@ uint64_t GfxRenderingAPIOGL::GetTextureByteSize(uint32_t textureId) {
         return 0;
     }
     const TextureInfo& texture = textures[textureId];
-    uint64_t bytes = (uint64_t)texture.width * texture.height * 4;
+    uint64_t bytes = (uint64_t)texture.width * texture.height * texture.bytesPerPixel;
     if (texture.mipmapped) {
         bytes += bytes / 3; // 4/3 of level 0 approximates the full mip chain
     }
@@ -831,6 +887,8 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     }
 
     TextureInfo& texture = textures[mCurrentTextureIds[tile]];
+    texture.mirrorS = (cms & G_TX_MIRROR) != 0;
+    texture.mirrorT = (cmt & G_TX_MIRROR) != 0;
     const bool mipmapsEnabled = mMipmapsEnabled;
     if (mipmapsEnabled && texture.mipEligible && !texture.mipmapped && texture.width > 0 && texture.height > 0) {
         // The setting may have been switched on after this texture was uploaded; generate lazily.
@@ -845,7 +903,8 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
         // Hardware trilinear sampling replaces the shader's manual three-point path. They produce the
         // same bilinear result at level 0, but only the hardware path can select mip levels and use
         // anisotropic filtering. textureGrad in the shader keeps the LOD correct at clamp edges.
-        const bool hardwareLinear = linear_filter && mCurrentFilterMode != FILTER_NONE;
+        const bool hardwareLinear =
+            linear_filter && (tile >= MATERIAL_NORMAL_TEXTURE || mCurrentFilterMode != FILTER_NONE);
         minFilter = hardwareLinear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
         magFilter = hardwareLinear ? GL_LINEAR : GL_NEAREST;
         texture.filtering = FILTER_LINEAR;
@@ -858,7 +917,9 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, mLodBias);
 #endif
     } else {
-        minFilter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
+        minFilter = linear_filter && (tile >= MATERIAL_NORMAL_TEXTURE || mCurrentFilterMode == FILTER_LINEAR)
+                        ? GL_LINEAR
+                        : GL_NEAREST;
         magFilter = minFilter;
         texture.filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
     }
@@ -971,7 +1032,21 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 
     // printf("flushing %d tris\n", buf_vbo_num_tris);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
+#ifndef USE_OPENGLES
+    const bool timeDraw = mDrawStats && !mDrawTimerPending[mDrawTimerNext];
+    if (timeDraw)
+        glBeginQuery(GL_TIME_ELAPSED, mDrawTimers[mDrawTimerNext]);
+    else if (mDrawStats)
+        ++mDrawTimerDropped;
+#endif
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+#ifndef USE_OPENGLES
+    if (timeDraw) {
+        glEndQuery(GL_TIME_ELAPSED);
+        mDrawTimerPending[mDrawTimerNext] = true;
+        mDrawTimerNext = (mDrawTimerNext + 1) % kDrawTimerCount;
+    }
+#endif
 }
 
 void GfxRenderingAPIOGL::Init() {
@@ -979,6 +1054,9 @@ void GfxRenderingAPIOGL::Init() {
     glewInit();
 #endif
 
+    GLint materialUnits = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &materialUnits);
+    mMaterialUnitsAvailable = materialUnits >= MATERIAL_TEXTURE_SLOTS;
     glGenBuffers(1, &mOpenglVbo);
     glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
 
@@ -1026,6 +1104,33 @@ void GfxRenderingAPIOGL::OnResize() {
 }
 
 void GfxRenderingAPIOGL::StartFrame() {
+#ifndef USE_OPENGLES
+    mDrawStats =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Debug.Stats", 0) != 0;
+    if (mDrawStats) {
+        if (!mDrawTimers[0])
+            glGenQueries(kDrawTimerCount, mDrawTimers);
+        for (int i = 0; i < kDrawTimerCount; ++i) {
+            if (!mDrawTimerPending[i])
+                continue;
+            GLint ready = 0;
+            glGetQueryObjectiv(mDrawTimers[i], GL_QUERY_RESULT_AVAILABLE, &ready);
+            if (!ready)
+                continue;
+            GLuint64 ns = 0;
+            glGetQueryObjectui64v(mDrawTimers[i], GL_QUERY_RESULT, &ns);
+            mDrawTimerMs += ns / 1e6;
+            mDrawTimerPending[i] = false;
+        }
+        if (++mDrawTimerFrames == 300) {
+            SPDLOG_INFO("NewDawn draw batches: {:.3f} ms GPU/frame over 300 frames, {} untimed draws",
+                        mDrawTimerMs / 300.0, mDrawTimerDropped);
+            mDrawTimerFrames = 0;
+            mDrawTimerMs = 0.0;
+            mDrawTimerDropped = 0;
+        }
+    }
+#endif
     FinishWorld();
     mFrameCount++;
 

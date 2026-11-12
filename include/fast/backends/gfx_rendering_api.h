@@ -67,6 +67,11 @@ class GfxRenderingAPI {
     virtual void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) = 0;
     virtual uint32_t NewTexture() = 0;
     virtual void SelectTexture(int tile, uint32_t textureId) = 0;
+    virtual bool SupportsMaterialMaps() {
+        return false;
+    }
+    virtual void UploadMaterialTexture(const uint8_t* rg8, uint32_t width, uint32_t height) {
+    }
     virtual void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) = 0;
     // Generate the mip chain for the most recently uploaded texture. Called by the interpreter after
     // game textures are uploaded; backends without mipmap support may leave this as a no-op.
