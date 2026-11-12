@@ -1344,11 +1344,19 @@ bool GfxRenderingAPIOGL::PostFxAvailable() {
 #endif
 }
 
+void GfxRenderingAPIOGL::SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) {
+    mShadowCasterPositions = positions;
+    mShadowCasterVertexCount = vertexCount;
+}
+
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
     if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
-        mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount);
+        mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
+                     mShadowCasterVertexCount);
     }
+    mShadowCasterPositions = nullptr;
+    mShadowCasterVertexCount = 0;
 #endif
 }
 } // namespace Fast

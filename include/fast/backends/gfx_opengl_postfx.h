@@ -20,10 +20,13 @@ class PostFxGL {
         return mUsable;
     }
     // frameIndex identifies the rendered frame (both stages of a frame share one read of the settings).
-    void Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& gameFb, uint32_t frameIndex);
+    void Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& gameFb, uint32_t frameIndex,
+             const float* shadowPositions, uint32_t shadowVertexCount);
 
     struct Settings {
-        bool aoOn, bloomOn, gradeOn;
+        bool postFxOn, aoOn, bloomOn, gradeOn;
+        bool shadowsOn;
+        int shadowDebug;
         float aoStrength, aoRadius;
         float bloomStrength, bloomThreshold;
         float contrast, saturation;
@@ -45,6 +48,10 @@ class PostFxGL {
     bool BuildPrograms();
     void EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type, bool depthStencil,
                       bool linear);
+    void PrepareDepth(const FramebufferOGL& fb);
+    void EnsureShadowTarget(int size);
+    void RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* positions,
+                    uint32_t vertexCount, int debug);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);
@@ -63,22 +70,27 @@ class PostFxGL {
     uint32_t mStatsW = 0, mStatsH = 0, mStatsMsaa = 0;
 
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
+    Program mShadowDepth, mShadowApply;
     const Program* mCurrentProgram = nullptr;
     GLuint mVao = 0;
+    GLuint mShadowVao = 0, mShadowVbo = 0;
 
     Target mDepth;
     Target mAoRaw, mAoBlur;
     Target mScene;
+    Target mShadowMap;
     static constexpr int kMaxBloomLevels = 6;
     Target mBloom[kMaxBloomLevels];
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    GLuint mQueries[2][kQueryRing] = {};
-    bool mQueryPending[2][kQueryRing] = {};
-    int mQueryNext[2] = {};
-    double mQueryTotalMs[2] = {};
-    int mQueryCount[2] = {};
+    static constexpr int kQueryStages = 3;
+    static constexpr int kShadowTimerStage = 2;
+    GLuint mQueries[kQueryStages][kQueryRing] = {};
+    bool mQueryPending[kQueryStages][kQueryRing] = {};
+    int mQueryNext[kQueryStages] = {};
+    double mQueryTotalMs[kQueryStages] = {};
+    int mQueryCount[kQueryStages] = {};
 };
 
 } // namespace Fast

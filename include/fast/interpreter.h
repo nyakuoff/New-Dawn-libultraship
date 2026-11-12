@@ -18,6 +18,7 @@
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
+#include "fast/newdawn_postfx.h"
 #include "fast/debug/GfxDebugger.h"
 
 #include "fast/resource/type/Texture.h"
@@ -446,6 +447,10 @@ class Interpreter {
     void PumpAltTextureLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void BeginShadowRecording(bool enabled);
+    void EndShadowRecording();
+    void SubmitShadowCasters();
+    void FillShadowCameraParams(NewDawnPostFxParams& params) const;
     void UpdateTextureCacheSize(int textureSlot);
     bool TextureCacheNodeInUse(const TextureCacheNode* node) const;
     bool EvictOneTextureCacheEntry(const TextureCacheNode* protect);
@@ -463,6 +468,7 @@ class Interpreter {
     void ImportTextureImg(int tile, bool importReplacement);
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
+    void RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
@@ -575,6 +581,14 @@ class Interpreter {
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
+    bool mShadowRecording = false;
+    bool mShadowOverflowLogged = false;
+    bool mShadowExactProj = false;
+    float mShadowViewProj[16] = {};
+    float mShadowInvViewProj[16] = {};
+    float mShadowNdcXScale = 1.0f;
+    float mShadowFlipY = 1.0f;
+    std::vector<float> mShadowVertices;
     // New Dawn per-pixel lighting (gNewDawn.Lighting.PerPixel). mPerPixelLightState is the state the
     // next batch draws with; the backend re-uploads it when the serial or shader program changes.
     bool mPerPixelLightingEnabled{};

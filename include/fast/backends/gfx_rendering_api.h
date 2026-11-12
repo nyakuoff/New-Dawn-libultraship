@@ -121,6 +121,10 @@ class GfxRenderingAPI {
     }
     virtual void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
     }
+    // World-space triangle vertices (3 floats per vertex, 3 vertices per triangle) recorded during the
+    // opaque pass. Only OpenGL uses this; other backends ignore it.
+    virtual void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) {
+    }
 
     // New Dawn per-pixel lighting. Only implemented for OpenGL; other backends keep the CPU
     // vertex lighting path. See GfxPerPixelLightingState above.

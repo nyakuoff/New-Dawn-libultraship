@@ -12,6 +12,7 @@
 #endif
 
 #include <any>
+#include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -730,6 +731,111 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
         if (!again) {
             break;
         }
+    }
+}
+
+static bool Invert4x4(const float m[4][4], float out[16]) {
+    float a[4][8];
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            a[row][col] = m[row][col];
+            a[row][col + 4] = (row == col) ? 1.0f : 0.0f;
+        }
+    }
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int row = col + 1; row < 4; row++) {
+            if (fabsf(a[row][col]) > fabsf(a[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (fabsf(a[pivot][col]) < 1e-8f) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int k = 0; k < 8; k++) {
+                std::swap(a[pivot][k], a[col][k]);
+            }
+        }
+        const float invPivot = 1.0f / a[col][col];
+        for (int k = 0; k < 8; k++) {
+            a[col][k] *= invPivot;
+        }
+        for (int row = 0; row < 4; row++) {
+            if (row == col) {
+                continue;
+            }
+            const float factor = a[row][col];
+            if (factor == 0.0f) {
+                continue;
+            }
+            for (int k = 0; k < 8; k++) {
+                a[row][k] -= factor * a[col][k];
+            }
+        }
+    }
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            out[row * 4 + col] = a[row][col + 4];
+        }
+    }
+    return true;
+}
+
+void Interpreter::BeginShadowRecording(bool enabled) {
+    mShadowRecording = enabled;
+    mShadowVertices.clear();
+    mShadowOverflowLogged = false;
+    mShadowExactProj = false;
+    if (!enabled) {
+        return;
+    }
+    if (mShadowVertices.capacity() < 3 * 1024 * 1024) {
+        mShadowVertices.reserve(3 * 1024 * 1024);
+    }
+
+    mShadowExactProj = Invert4x4(mRsp->P_matrix, mShadowInvViewProj);
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            mShadowViewProj[row * 4 + col] = mRsp->P_matrix[row][col];
+        }
+    }
+    const float ndcXScale = AdjXForAspectRatio(1.0f);
+    mShadowNdcXScale = (ndcXScale > 1e-6f) ? (1.0f / ndcXScale) : 1.0f;
+    mShadowFlipY = mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
+}
+
+void Interpreter::FillShadowCameraParams(NewDawnPostFxParams& params) const {
+    params.shadowUseExactProj = mShadowExactProj ? 1 : 0;
+    params.shadowNdcXScale = mShadowNdcXScale;
+    params.shadowFlipY = mShadowFlipY;
+    memcpy(params.shadowViewProj, mShadowViewProj, sizeof(mShadowViewProj));
+    memcpy(params.shadowInvViewProj, mShadowInvViewProj, sizeof(mShadowInvViewProj));
+}
+
+void Interpreter::EndShadowRecording() {
+    mShadowRecording = false;
+}
+
+void Interpreter::SubmitShadowCasters() {
+    mRapi->SetShadowCasterGeometry(mShadowVertices.empty() ? nullptr : mShadowVertices.data(),
+                                   (uint32_t)(mShadowVertices.size() / 3));
+}
+
+void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
+    constexpr size_t kMaxShadowVertices = 2 * 1024 * 1024;
+    if (mShadowVertices.size() + 9 > kMaxShadowVertices * 3) {
+        if (!mShadowOverflowLogged) {
+            mShadowOverflowLogged = true;
+            SPDLOG_WARN("NewDawn shadows: caster buffer overflow, truncating this frame");
+        }
+        return;
+    }
+    const LoadedVertex* verts[3] = { v1, v2, v3 };
+    for (const LoadedVertex* v : verts) {
+        mShadowVertices.push_back(v->view_pos[0]);
+        mShadowVertices.push_back(v->view_pos[1]);
+        mShadowVertices.push_back(v->view_pos[2]);
     }
 }
 
@@ -1820,9 +1926,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        // Per-pixel lighting needs the view-space position for point lights.
+        // Per-pixel lighting needs the view-space position for point lights; shadows need world positions for
+        // every caster, lit or not.
         const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
-        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting) {
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -1950,6 +2057,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[0] = vn->n[0];
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
+        }
+        if (per_pixel_lighting || mShadowRecording) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -2017,6 +2126,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
     // if (rand()%2) return;
+
+    // Opaque world/actor casters only: skip rects, decals, alpha-tested/cutout foliage and effects. This runs before
+    // frustum rejection and culling: a caster outside the view, or facing away from the camera, still shadows the
+    // visible ground. All of these conditions are render-state only.
+    if (mShadowRecording && !is_rect) {
+        const uint32_t om = mRdp->other_mode_l;
+        const bool caster = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC &&
+                            (om & CVG_X_ALPHA) != CVG_X_ALPHA && (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD &&
+                            (om & G_ZS_PRIM) == 0 &&
+                            !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+        if (caster) {
+            RecordShadowTriangle(v1, v2, v3);
+        }
+    }
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
@@ -4445,9 +4568,32 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     gfx->Flush();
+    if (cmd->words.w1 == 0) {
+        return false;
+    }
+    const int stage = C0(0, 8);
+    const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
+
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
+        gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0);
+        return false;
+    }
+
+    if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+        gfx->EndShadowRecording();
+    }
+
     // Only ever post-process the game framebuffer itself
-    if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive && cmd->words.w1 != 0) {
-        gfx->mRapi->RunPostFx(C0(0, 8), *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1), gfx->mGameFb);
+    if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive) {
+        NewDawnPostFxParams effective = params;
+        if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+            gfx->FillShadowCameraParams(effective);
+            if (effective.shadowUseExactProj == 0) {
+                effective.shadowEnabled = 0;
+            }
+            gfx->SubmitShadowCasters();
+        }
+        gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
     }
     return false;
 }
@@ -5376,9 +5522,15 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    // Post-processing needs the game rendered offscreen even when the window could be rendered to directly
-    mPostFxActive = mRapi->PostFxAvailable() && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-                                                    "gNewDawn.PostFx.Enabled", 1) != 0;
+    // Post-processing and shadows need the game rendered offscreen even when the window could be rendered to directly
+    const bool postFxEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Enabled", 1) != 0;
+    const bool shadowsEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Enabled", 0) != 0;
+    mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled);
+    mShadowRecording = false;
+    mShadowOverflowLogged = false;
+    mShadowVertices.clear();
     // New Dawn per-pixel lighting; a backend only gets it when it implements the shader side.
     mPerPixelLightingEnabled =
         mRapi->SupportsPerPixelLighting() &&

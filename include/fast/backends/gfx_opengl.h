@@ -126,6 +126,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     ImTextureID GetTextureById(int id) override;
     bool PostFxAvailable() override;
     void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) override;
+    void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) override;
     bool SupportsPerPixelLighting() const override {
         return true;
     }
@@ -175,6 +176,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+    const float* mShadowCasterPositions = nullptr;
+    uint32_t mShadowCasterVertexCount = 0;
 
 #ifndef USE_OPENGLES
     std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
