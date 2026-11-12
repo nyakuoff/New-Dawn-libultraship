@@ -6,6 +6,8 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_SKY_BEGIN 4 /* explicit skybox colour calibration */
+#define NEWDAWN_POSTFX_STAGE_SKY_END 5
 #define NEWDAWN_POSTFX_STAGE_WORLD_BEGIN 3 /* linear HDR world, before sky */
 #define NEWDAWN_POSTFX_STAGE_OPAQUE_END 0   /* ambient occlusion / shadows on the opaque geometry drawn so far */
 #define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */

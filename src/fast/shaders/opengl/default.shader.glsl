@@ -125,6 +125,8 @@
     uniform bool uHdrWorld;
     uniform float uHdrSun;
     uniform float uHdrAmbient;
+    uniform float uHdrSky;
+    uniform float uHdrFog;
     vec3 hdrDecode(vec3 c) {
         c = max(c, vec3(0.0));
         return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
@@ -368,7 +370,7 @@
         texel = WRAP(texel, -0.51, 1.51);
         texel = clamp(texel, 0.0, 1.0);
         if (uHdrWorld) {
-            texel.rgb = hdrDecode(texel.rgb);
+            texel.rgb = hdrDecode(texel.rgb) * uHdrSky;
             @if(o_per_pixel_lighting)
                 if (hdrDiffuse) texel.rgb *= newDawnIrradiance();
             @end
@@ -376,9 +378,9 @@
         // TODO discard if alpha is 0?
         @if(o_fog)
             @if(o_alpha)
-                texel = vec4(mix(texel.rgb, uHdrWorld ? hdrDecode(vFog.rgb) : vFog.rgb, vFog.a), texel.a);
+                texel = vec4(mix(texel.rgb, uHdrWorld ? hdrDecode(vFog.rgb) * uHdrFog : vFog.rgb, vFog.a), texel.a);
             @else
-                texel = mix(texel, uHdrWorld ? hdrDecode(vFog.rgb) : vFog.rgb, vFog.a);
+                texel = mix(texel, uHdrWorld ? hdrDecode(vFog.rgb) * uHdrFog : vFog.rgb, vFog.a);
             @end
         @end
 

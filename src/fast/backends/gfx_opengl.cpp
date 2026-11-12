@@ -120,6 +120,13 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     }
 
     glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
+    if (HdrWorldActive()) {
+        auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        glUniform1f(mCurrentShaderProgram->hdr_sky_location,
+                    mHdrSky ? std::clamp(cvars->GetFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f) : 1.0f);
+        glUniform1f(mCurrentShaderProgram->hdr_fog_location,
+                    std::clamp(cvars->GetFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f));
+    }
     if (HdrWorldActive() && mCurrentShaderProgram->per_pixel_light_count_location >= 0) {
         auto hdrCvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sun_location,
@@ -673,6 +680,8 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->hdr_location = glGetUniformLocation(shader_program, "uHdrWorld");
     prg->hdr_sun_location = glGetUniformLocation(shader_program, "uHdrSun");
     prg->hdr_ambient_location = glGetUniformLocation(shader_program, "uHdrAmbient");
+    prg->hdr_sky_location = glGetUniformLocation(shader_program, "uHdrSky");
+    prg->hdr_fog_location = glGetUniformLocation(shader_program, "uHdrFog");
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
     prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
@@ -1188,12 +1197,13 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
+    GLuint texId = mFrameBuffers[fb_id].clrbuf;
 #ifndef USE_OPENGLES
     if (fb_id == mHdrGameFb && mPostFx && mPostFx->HdrActive()) {
         mPostFx->HdrSnapshot(mFrameBuffers[fb_id]);
+        texId = mPostFx->HdrDisplayTexture();
     }
 #endif
-    GLuint texId = mFrameBuffers[fb_id].clrbuf;
     // Ensure the textures metadata vector can hold this FB texture handle.
     // FB color buffers are created outside NewTexture(), so the vector may
     // not have been resized for them yet.
@@ -1213,6 +1223,7 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
 #ifndef USE_OPENGLES
     if (fb_src_id == mHdrGameFb && mPostFx && mPostFx->HdrActive()) {
         src.fbo = mPostFx->HdrSnapshot(src);
+        src.msaa_level = 1;
     }
 #endif
     const FramebufferOGL& dst = mFrameBuffers[fb_dst_id];
@@ -1439,16 +1450,43 @@ void GfxRenderingAPIOGL::FinishWorld() {
         mPostFx->EndHdr(mFrameBuffers[mHdrGameFb]);
     }
     mHdrGameFb = -1;
+    mHdrSky = false;
 #endif
 }
 
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
+    if (stage == NEWDAWN_POSTFX_STAGE_SKY_BEGIN || stage == NEWDAWN_POSTFX_STAGE_SKY_END) {
+        mHdrSky = stage == NEWDAWN_POSTFX_STAGE_SKY_BEGIN;
+        return;
+    }
     if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
+        mHdrSky = false;
         if (mPostFx && mPostFx->BeginHdr(mFrameBuffers[gameFbId])) {
             mHdrGameFb = gameFbId;
         }
         return;
+    }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Debug.Inspect", 0) &&
+        mFrameCount % 300 == 0) {
+        // Exercise the same API gameplay uses, including its multisample depth/stencil resolve.
+        // Debug-only synchronous probes; do not enable these during GPU cost measurements.
+        const auto& fb = mFrameBuffers[gameFbId];
+        std::set<std::pair<float, float>> coordinates;
+        for (int y = 1; y <= 3; ++y) {
+            for (int x = 1; x <= 3; ++x) {
+                coordinates.emplace(fb.width * x / 4.0f, fb.height * y / 4.0f);
+            }
+        }
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        GetPixelDepth(gameFbId, { { fb.width / 2.0f, fb.height / 2.0f } });
+        GetPixelDepth(gameFbId, coordinates);
+        if (scissor)
+            glEnable(GL_SCISSOR_TEST);
+        for (GLenum error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
+            SPDLOG_ERROR("NewDawnHDR depth probe: GL error 0x{:X}", error);
+        }
     }
     if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Debug.Inspect", 0) &&
@@ -1482,16 +1520,12 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
             depth[5] >> 8, depth[6] >> 8, depth[7] >> 8, depth[8] >> 8);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
     }
-    if (mHdrGameFb >= 0) {
-        if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
-            FinishWorld();
-        }
-        return; // AO, shadows, shafts, water, bloom and grade are LDR-only in this milestone
-    }
     if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrGameFb >= 0)
+        FinishWorld();
     mShadowCasterPositions = nullptr;
     mShadowCasterVertexCount = 0;
 #endif

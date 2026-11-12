@@ -37,7 +37,7 @@ struct ShaderProgram {
     GLint attribLocations[16];
     uint8_t attribSizes[16];
     uint8_t numAttribs;
-    GLint hdr_location, hdr_sun_location, hdr_ambient_location;
+    GLint hdr_location, hdr_sun_location, hdr_ambient_location, hdr_sky_location, hdr_fog_location;
     GLint frameCountLocation;
     GLint noiseScaleLocation;
     GLint prim_depth_location;
@@ -189,6 +189,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
 
 #ifndef USE_OPENGLES
     int mHdrGameFb = -1;
+    bool mHdrSky = false;
     std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
 #endif
 };
