@@ -37,6 +37,7 @@ static PostFxGL::Settings ReadSettings() {
     s.postFxOn = CvInt("gNewDawn.PostFx.Enabled", 1) != 0;
     s.shadowsOn = CvInt("gNewDawn.Shadows.Enabled", 0) != 0;
     s.shadowDebug = CvInt("gNewDawn.Shadows.Debug", 0);
+    s.shadowFloor = std::clamp(CvFloat("gNewDawn.Shadows.Floor", 0.55f), 0.0f, 1.0f);
     s.aoOn = CvInt("gNewDawn.PostFx.AO.Enabled", 1) != 0;
     s.aoStrength = std::clamp(CvFloat("gNewDawn.PostFx.AO.Strength", Defaults::kAoStrength), 0.0f, 4.0f);
     s.aoRadius = std::clamp(CvFloat("gNewDawn.PostFx.AO.Radius", Defaults::kAoRadius), 1.0f, 500.0f);
@@ -1502,7 +1503,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform3fv(Loc("uDirColor"), 1, params.shadowDirColor);
     glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);
-    glUniform1f(Loc("uMinFactor"), 0.35f);
+    glUniform1f(Loc("uMinFactor"), mSettings.shadowFloor);
     glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)size * 4.0f);
     glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
