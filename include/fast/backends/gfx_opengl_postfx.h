@@ -26,6 +26,9 @@ class PostFxGL {
     bool BeginHdr(const FramebufferOGL& fb);
     void EndHdr(const FramebufferOGL& fb);
     GLuint HdrSnapshot(const FramebufferOGL& fb);
+    GLuint HdrDisplayTexture() const {
+        return mHdrDisplay.tex;
+    }
     bool HdrActive() const {
         return mHdrActive;
     }
@@ -81,10 +84,13 @@ class PostFxGL {
     uint32_t mStatsW = 0, mStatsH = 0, mStatsMsaa = 0;
 
     bool mHdrActive = false;
-    Target mHdr;
-    GLuint mHdrDisplayFbo = 0;
-    Program mHdrTransform;
+    Target mHdr, mHdrDisplay;
+    GLuint mHdrMsaa = 0;
+    int mHdrSamples = 0, mHdrWidth = 0, mHdrHeight = 0;
+    Program mHdrCopy;
+    void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
+    Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
     Program mShadowDepth, mShadowApply;
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)

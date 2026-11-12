@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -43,13 +44,34 @@ static PostFxGL::Settings ReadSettings() {
     s.aoRadius = std::clamp(CvFloat("gNewDawn.PostFx.AO.Radius", Defaults::kAoRadius), 1.0f, 500.0f);
     s.bloomOn = CvInt("gNewDawn.PostFx.Bloom.Enabled", 1) != 0;
     s.bloomStrength = std::clamp(CvFloat("gNewDawn.PostFx.Bloom.Strength", Defaults::kBloomStrength), 0.0f, 2.0f);
-    s.bloomThreshold = std::clamp(CvFloat("gNewDawn.PostFx.Bloom.Threshold", Defaults::kBloomThreshold), 0.0f, 0.99f);
+    s.bloomThreshold = std::clamp(CvFloat("gNewDawn.PostFx.Bloom.Threshold", Defaults::kBloomThreshold), 0.0f, 16.0f);
     s.gradeOn = CvInt("gNewDawn.PostFx.Grade.Enabled", 1) != 0;
     s.contrast = std::clamp(CvFloat("gNewDawn.PostFx.Grade.Contrast", Defaults::kContrast), 0.5f, 1.5f);
     s.saturation = std::clamp(CvFloat("gNewDawn.PostFx.Grade.Saturation", Defaults::kSaturation), 0.0f, 2.0f);
     s.debugView = CvInt("gNewDawn.PostFx.Debug.View", 0);
     s.stats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
     return s;
+}
+
+static float DecodeColor(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static void FogCoefficients(const NewDawnPostFxParams& params, float& fogMul, float& fogOff) {
+    if (params.fogNear >= 1000) {
+        fogMul = 0.0f;
+        fogOff = 0.0f;
+    } else if (params.fogNear >= 997) {
+        fogMul = 32767.0f;
+        fogOff = -32512.0f;
+    } else if (params.fogNear < 0) {
+        fogMul = 0.0f;
+        fogOff = 255.0f;
+    } else {
+        const int range = std::max(params.fogFar - params.fogNear, 1);
+        fogMul = static_cast<float>(static_cast<int16_t>(128000 / range));
+        fogOff = static_cast<float>(static_cast<int16_t>((500 - params.fogNear) * 256 / range));
+    }
 }
 
 static void Normalize3(const float in[3], float out[3]) {
@@ -322,17 +344,22 @@ uniform sampler2D uSrc;
 uniform vec2 uTexel;
 uniform int uPrefilter;
 uniform float uThreshold;
+#ifdef HDR_SCENE
+const int uHdr = 1;
+#else
+const int uHdr = 0;
+#endif
 
 vec3 pre(vec3 c) {
     if (uPrefilter == 0) {
         return c;
     }
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    float k = max(0.25 * (1.0 - uThreshold), 1e-3);
+    float k = uHdr != 0 ? 0.25 * max(uThreshold, 0.01) : max(0.25 * (1.0 - uThreshold), 1e-3);
     float soft = clamp(l - uThreshold + k, 0.0, 2.0 * k);
     soft = soft * soft / (4.0 * k);
     float ex = max(soft, l - uThreshold);
-    return c * (ex / (1.0 - uThreshold)) / max(l, 1e-4);
+    return c * (ex / (uHdr != 0 ? 1.0 : 1.0 - uThreshold)) / max(l, 1e-4);
 }
 
 vec3 tap(vec2 o) {
@@ -377,6 +404,13 @@ uniform float uBloomStrength;
 uniform int uUseGrade;
 uniform float uContrast;
 uniform float uSaturation;
+#ifdef HDR_SCENE
+const int uHdr = 1;
+#else
+const int uHdr = 0;
+#endif
+uniform float uExposure;
+uniform int uDither;
 
 float ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
@@ -385,8 +419,17 @@ float ign(vec2 p) {
 void main() {
     vec3 c = texelFetch(uScene, ivec2(gl_FragCoord.xy), 0).rgb;
     if (uUseBloom != 0) {
-        vec3 b = clamp(texture(uBloom, vUv).rgb * uBloomStrength, 0.0, 1.0);
-        c = 1.0 - (1.0 - c) * (1.0 - b); // screen: glows without ever clipping
+        vec3 b = texture(uBloom, vUv).rgb * uBloomStrength;
+        if (uHdr != 0) c += b; // scene-referred radiance, before the display transform
+        else {
+            b = clamp(b, 0.0, 1.0);
+            c = 1.0 - (1.0 - c) * (1.0 - b);
+        }
+    }
+    if (uHdr != 0) {
+        vec3 x = max(c, vec3(0.0)) * exp2(uExposure);
+        c = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+        c = mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
     }
     if (uUseGrade != 0) {
         // Contrast as a blend towards a smoothstep S-curve (fixes black and white, mid slope equals uContrast).
@@ -396,7 +439,12 @@ void main() {
         c = mix(vec3(l), c, uSaturation);
     }
     // Dither before the 8 bit quantisation. +-half a step leaves unchanged pixels (and pure black) exactly as they were.
-    c += (ign(gl_FragCoord.xy) - 0.5) / 255.0;
+    #ifndef NO_DITHER
+#ifdef HDR_SCENE
+    if (uDither != 0)
+#endif
+        c += (ign(gl_FragCoord.xy) - 0.5) / 255.0;
+#endif
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }
 )GLSL";
@@ -429,6 +477,14 @@ uniform vec3 uDirColor;
 uniform vec3 uCameraEye;
 uniform float uStrength;
 uniform float uMinFactor;
+uniform float uRadius;
+#ifdef HDR_SCENE
+const int uHdr = 1;
+#else
+const int uHdr = 0;
+#endif
+uniform float uFogMul;
+uniform float uFogOff;
 uniform float uNormalBias;
 uniform float uNdcXScale;
 uniform float uFlipY;
@@ -535,10 +591,16 @@ void main() {
     vec3 shade = uAmbient + direct * lit;
     vec3 factor = clamp(shade / total, vec3(uMinFactor), vec3(1.0));
     factor = mix(vec3(1.0), factor, uStrength);
+    if (uHdr != 0) {
+        // Fog has already been composited into scene colour. Do not shadow its in-scatter:
+        // otherwise geometry hidden by full fog becomes a dark silhouette against the sky.
+        float fog = clamp((d0 * 2.0 - 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
+        float coverage = 1.0 - smoothstep(uRadius * 0.8, uRadius, length(P - uCameraEye));
+        factor = mix(vec3(1.0), factor, coverage * (1.0 - fog));
+    }
     oColor = vec4(texture(uColor, vUv).rgb * factor, 1.0);
 }
 )GLSL";
-
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Sun shafts. Half resolution raymarch from the camera to each pixel's world position through the shadow map (the
@@ -1227,24 +1289,20 @@ bool PostFxGL::BuildPrograms() {
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
     const char* down[] = { kVersion, kDownShader };
+    const char* downHdr[] = { kVersion, "#define HDR_SCENE\n", kDownShader };
     const char* up[] = { kVersion, kUpShader };
-    const char* hdr[] = { kVersion, R"GLSL(
+    const char* copy[] = { kVersion, R"GLSL(
 in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uScene;
-uniform float uExposure;
-void main() {
-    vec3 x = max(texture(uScene, vUv).rgb, vec3(0.0)) * exp2(uExposure);
-    // Narkowicz ACES-like rational fit: scene linear 0.18 maps to ~0.55 display at EV 0.
-    vec3 y = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
-    y = mix(1.055 * pow(y, vec3(1.0 / 2.4)) - 0.055, 12.92 * y, lessThanEqual(y, vec3(0.0031308)));
-    float noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
-    fragColor = vec4(clamp(y + noise / 255.0, 0.0, 1.0), 1.0);
-}
+void main() { fragColor = texture(uScene, vUv); }
 )GLSL" };
-    mHdrTransform.id = BuildProgram("HDR display shader", hdr, 2, mHdrTransform.uniforms);
+    mHdrCopy.id = BuildProgram("HDR presentation copy", copy, 2, mHdrCopy.uniforms);
     const char* comp[] = { kVersion, kCompositeShader };
+    const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
+    const char* compNoDither[] = { kVersion, "#define NO_DITHER\n", kCompositeShader };
     const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
+    const char* shadowApplyHdr[] = { kVersion, "#define HDR_SCENE\n", kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
     const char* water[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterShader };
@@ -1262,15 +1320,19 @@ void main() {
     mAo.id = BuildProgram("AO shader", ao, 3, mAo.uniforms);
     mBlur.id = BuildProgram("AO blur shader", blur, 4, mBlur.uniforms);
     mApply.id = BuildProgram("AO apply shader", apply, 4, mApply.uniforms);
+    mDownHdr.id = BuildProgram("HDR bloom downsample", downHdr, 3, mDownHdr.uniforms);
+    mCompositeHdr.id = BuildProgram("HDR bloom/display/grade", compHdr, 3, mCompositeHdr.uniforms);
+    mCompositeNoDither.id = BuildProgram("LDR composite without dither", compNoDither, 3, mCompositeNoDither.uniforms);
+    mShadowApplyHdr.id = BuildProgram("HDR shadow apply", shadowApplyHdr, 4, mShadowApplyHdr.uniforms);
     mDown.id = BuildProgram("bloom downsample shader", down, 2, mDown.uniforms);
     mUp.id = BuildProgram("bloom upsample shader", up, 2, mUp.uniforms);
     mComposite.id = BuildProgram("composite shader", comp, 2, mComposite.uniforms);
     mShadowApply.id = BuildProgram("shadow apply shader", shadowApply, 3, mShadowApply.uniforms);
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
-    return mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
-           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id &&
-           mWaterReflectionApply.id;
+    return mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id && mAo.id && mBlur.id &&
+           mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id && mShadowDepth.id && mShaftMarch.id &&
+           mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id && mWaterReflectionApply.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -1378,42 +1440,67 @@ void PostFxGL::EndTimer(int stage) {
     mQueryNext[stage] = (mQueryNext[stage] + 1) % kQueryRing;
 }
 
+void PostFxGL::RestoreColor(const FramebufferOGL& fb) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    if (fb.msaa_level > 1)
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
+    else
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+}
+
 bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
-    if (!mUsable || !mHdrTransform.id || !CvInt("gNewDawn.HDR.Enabled", 0))
+    if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
-    if (fb.msaa_level > 1) {
-        static bool logged = false;
-        if (!logged)
-            SPDLOG_WARN("NewDawnHDR: disabled: MSAA > 1 is unsupported by this experiment");
-        logged = true;
-        return false;
-    }
     GlStateGuard guard;
     guard.Neutralise();
     EnsureTarget(mHdr, fb.width, fb.height, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mHdrDisplay, fb.width, fb.height, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, false, true);
     if (!mUsable)
         return false;
-    if (!mHdrDisplayFbo)
-        glGenFramebuffers(1, &mHdrDisplayFbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, mHdrDisplayFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        return false;
+    if (fb.msaa_level > 1) {
+        // Query the format-specific support when available (GL 4.2 / ARB_internalformat_query).
+        // On GL 3.3 framebuffer completeness below remains the authoritative fallback.
+        GLint major = 0, minor = 0;
+        glGetIntegerv(GL_MAJOR_VERSION, &major);
+        glGetIntegerv(GL_MINOR_VERSION, &minor);
+        if (major > 4 || (major == 4 && minor >= 2)) {
+            GLint count = 0;
+            glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA16F, GL_NUM_SAMPLE_COUNTS, 1, &count);
+            std::vector<GLint> samples(count);
+            if (count > 0)
+                glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA16F, GL_SAMPLES, count, samples.data());
+            if (std::find(samples.begin(), samples.end(), fb.msaa_level) == samples.end()) {
+                SPDLOG_WARN("NewDawnHDR: RGBA16F does not support {} samples; using LDR", fb.msaa_level);
+                return false;
+            }
+        }
+        if (!mHdrMsaa)
+            glGenRenderbuffers(1, &mHdrMsaa);
+        if (mHdrSamples != (int)fb.msaa_level || mHdrWidth != (int)fb.width || mHdrHeight != (int)fb.height) {
+            GLint previous;
+            glGetIntegerv(GL_RENDERBUFFER_BINDING, &previous);
+            glBindRenderbuffer(GL_RENDERBUFFER, mHdrMsaa);
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, fb.msaa_level, GL_RGBA16F, fb.width, fb.height);
+            glBindRenderbuffer(GL_RENDERBUFFER, previous);
+            mHdrSamples = fb.msaa_level;
+            mHdrWidth = fb.width;
+            mHdrHeight = fb.height;
+        }
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mHdr.tex, 0);
+    if (fb.msaa_level > 1)
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, mHdrMsaa);
+    else
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mHdr.tex, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+        RestoreColor(fb);
         SPDLOG_ERROR("NewDawnHDR: shared-depth framebuffer incomplete; using LDR");
         return false;
     }
-    // World begins on the cleared framebuffer. Never clear or replace the shared game depth.
+    // Only swap colour; game depth, stencil, coverage and query scheduling stay intact.
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     mHdrActive = true;
-    static bool logged = false;
-    if (!logged)
-        SPDLOG_INFO("NewDawnHDR: RGBA16F world; LDR AO/shadows/shafts/water/bloom/grade gated off");
-    logged = true;
     return true;
 }
 
@@ -1422,22 +1509,28 @@ GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
     guard.Neutralise();
     glBindVertexArray(mVao);
     mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    Settings s = ReadSettings();
+    if (!s.postFxOn)
+        s.bloomOn = s.gradeOn = false;
     BeginTimer(1);
-    Bind(0, mHdr.tex);
-    Use(mHdrTransform);
-    glUniform1i(Loc("uScene"), kFirstUnit);
-    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", -0.2f), -8.0f, 8.0f));
-    Draw(mHdrDisplayFbo, fb.width, fb.height);
+    RunSceneEnd(fb, s); // resolves RGBA16F before bloom, then tonemaps once into display colour
     EndTimer(1);
     CheckError("HDR display transform");
-    return mHdrDisplayFbo;
+    return mHdrDisplay.fbo;
 }
 
 void PostFxGL::EndHdr(const FramebufferOGL& fb) {
     HdrSnapshot(fb);
     GlStateGuard guard;
-    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+    guard.Neutralise();
+    glBindVertexArray(mVao);
+    RestoreColor(fb);
+    // A shader copy supports both single-sample and multisample compatibility attachments.
+    Bind(0, mHdrDisplay.tex);
+    Use(mHdrCopy);
+    glUniform1i(Loc("uScene"), kFirstUnit);
+    Draw(fb.fbo, fb.width, fb.height);
+    CheckError("HDR presentation copy");
     mHdrActive = false;
 }
 
@@ -1462,7 +1555,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShafts = doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
-    const bool doScene = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
+    const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater) {
         return;
@@ -1518,7 +1611,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         // AO split view leaves its apply scissor enabled; copies must cover the whole source.
         glDisable(GL_SCISSOR_TEST);
         const int w = fb.width, h = fb.height;
-        EnsureTarget(mWaterOpaqueColor, w, h, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, false, true);
+        EnsureTarget(mWaterOpaqueColor, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA,
+                     mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE, false, true);
         EnsureTarget(mWaterOpaqueDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -1755,7 +1849,8 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glDepthMask(GL_FALSE);
 
     // Screen-space shadow apply. Work on a copy of the colour so the game framebuffer is never sampled while bound.
-    EnsureTarget(mScene, w, h, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, false, true);
+    EnsureTarget(mScene, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA, mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE,
+                 false, true);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mScene.fbo);
@@ -1768,7 +1863,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     Bind(2, mShadowMap.tex);
     Bind(3, mShadowMap.tex);
     glBindSampler(kFirstUnit + 3, mCmpSampler);
-    Use(mShadowApply);
+    Use(mHdrActive ? mShadowApplyHdr : mShadowApply);
     glUniform1i(Loc("uColor"), kFirstUnit + 0);
     glUniform1i(Loc("uDepth"), kFirstUnit + 1);
     glUniform1i(Loc("uShadow"), kFirstUnit + 2);
@@ -1782,11 +1877,24 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
     glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
     glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
-    glUniform3fv(Loc("uAmbient"), 1, params.shadowAmbient);
-    glUniform3fv(Loc("uDirColor"), 1, params.shadowDirColor);
+    float ambient[3], direct[3];
+    for (int i = 0; i < 3; ++i) {
+        ambient[i] = params.shadowAmbient[i] *
+                     (mHdrActive ? std::clamp(CvFloat("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f) : 1.0f);
+        direct[i] = params.shadowDirColor[i] *
+                    (mHdrActive ? std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) : 1.0f);
+    }
+    glUniform3fv(Loc("uAmbient"), 1, ambient);
+    glUniform3fv(Loc("uDirColor"), 1, direct);
     glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);
     glUniform1f(Loc("uMinFactor"), mSettings.shadowFloor);
+    glUniform1f(Loc("uRadius"), params.shadowRadius);
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
+    glUniform1i(Loc("uHdr"), mHdrActive);
+    glUniform1f(Loc("uFogMul"), fogMul);
+    glUniform1f(Loc("uFogOff"), fogOff);
     glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)size * 4.0f);
     glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
@@ -1843,8 +1951,17 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     glUniform1f(Loc("uPixelAngle"),
                 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)(filter ? hh : h));
     glUniform3fv(Loc("uLightDir"), 1, params.waterLightDir);
-    glUniform3fv(Loc("uLightColor"), 1, params.waterLightColor);
-    glUniform3fv(Loc("uSky"), 1, params.waterSkyColor);
+    float light[3], sky[3];
+    for (int i = 0; i < 3; ++i) {
+        light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) *
+                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                              : params.waterLightColor[i];
+        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                            : params.waterSkyColor[i];
+    }
+    glUniform3fv(Loc("uLightColor"), 1, light);
+    glUniform3fv(Loc("uSky"), 1, sky);
     if (filter) {
         glDisable(GL_BLEND);
         Draw(mWaterReflectionRaw);
@@ -1858,9 +1975,11 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
     // Original water remains screen blended. SSR is a premultiplied overlay; its hit mask uses exact colours.
-    glBlendFunc(GL_ONE, reflections && params.waterDebug == 2 ? GL_ZERO
-                                               : (reflections && params.waterDebug != 1 ? GL_ONE_MINUS_SRC_ALPHA
-                                                                                        : GL_ONE_MINUS_SRC_COLOR));
+    glBlendFunc(GL_ONE, reflections && params.waterDebug == 2
+                            ? GL_ZERO
+                            : (reflections && params.waterDebug != 1
+                                   ? GL_ONE_MINUS_SRC_ALPHA
+                                   : (mHdrActive && params.waterDebug == 0 ? GL_ONE : GL_ONE_MINUS_SRC_COLOR)));
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
     CheckError("water");
@@ -1928,13 +2047,16 @@ void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const Framebuffer
     // existing atmosphere rather than as a separate overlay.
     float color[3];
     for (int i = 0; i < 3; i++) {
-        color[i] = 0.6f * params.shaftFogColor[i] + 0.4f * params.shadowDirColor[i];
+        color[i] = mHdrActive ? 0.6f * DecodeColor(params.shaftFogColor[i]) *
+                                        std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f) +
+                                    0.4f * DecodeColor(params.shadowDirColor[i])
+                              : 0.6f * params.shaftFogColor[i] + 0.4f * params.shadowDirColor[i];
     }
     glUniform3fv(Loc("uColor"), 1, color);
     glUniform1f(Loc("uStrength"), params.shaftStrength);
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
+    glBlendFunc(GL_ONE, mHdrActive ? GL_ONE : GL_ONE_MINUS_SRC_COLOR);
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
     CheckError("sun shaft apply");
@@ -1958,20 +2080,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     // Fog as the interpreter computes it: factor = clamp(ndcZ * mul + offset, 0, 255) / 255. The special cases are
     // those of Gfx_SetFog in the game.
     float fogMul, fogOff;
-    if (params.fogNear >= 1000) {
-        fogMul = 0.0f;
-        fogOff = 0.0f;
-    } else if (params.fogNear >= 997) {
-        fogMul = 32767.0f;
-        fogOff = -32512.0f;
-    } else if (params.fogNear < 0) {
-        fogMul = 0.0f;
-        fogOff = 255.0f;
-    } else {
-        const int range = std::max(params.fogFar - params.fogNear, 1);
-        fogMul = static_cast<float>(static_cast<int16_t>(128000 / range));
-        fogOff = static_cast<float>(static_cast<int16_t>((500 - params.fogNear) * 256 / range));
-    }
+    FogCoefficients(params, fogMul, fogOff);
 
     Bind(0, mDepth.tex);
 
@@ -2034,7 +2143,8 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
 void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     const int w = fb.width, h = fb.height;
     // Linear: the first bloom downsample is a 13-tap kernel that relies on bilinear taps
-    EnsureTarget(mScene, w, h, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE, false, true);
+    EnsureTarget(mScene, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA, mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE,
+                 false, true);
 
     int levels = 0;
     if (s.bloomOn) {
@@ -2060,9 +2170,11 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     const bool useBloom = s.bloomOn && levels > 0;
     if (useBloom) {
         Bind(0, mScene.tex);
-        Use(mDown);
+        Use(mHdrActive ? mDownHdr : mDown);
         glUniform1i(Loc("uSrc"), kFirstUnit + 0);
-        glUniform1f(Loc("uThreshold"), s.bloomThreshold);
+        glUniform1f(Loc("uThreshold"),
+                    mHdrActive ? std::max(s.bloomThreshold, 1.0f) : std::min(s.bloomThreshold, 0.99f));
+        glUniform1i(Loc("uHdr"), mHdrActive);
         for (int l = 0; l < levels; l++) {
             const Target& src = (l == 0) ? mScene : mBloom[l - 1];
             Bind(0, src.tex);
@@ -2089,19 +2201,22 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
 
     Bind(0, mScene.tex);
     Bind(1, useBloom ? mBloom[0].tex : mScene.tex);
-    Use(mComposite);
+    Use(mHdrActive ? mCompositeHdr : (CvInt("gNewDawn.PostFx.Dither.Enabled", 1) ? mComposite : mCompositeNoDither));
     glUniform1i(Loc("uScene"), kFirstUnit + 0);
     glUniform1i(Loc("uBloom"), kFirstUnit + 1);
     glUniform1i(Loc("uUseBloom"), useBloom ? 1 : 0);
     glUniform1f(Loc("uBloomStrength"), s.bloomStrength);
+    glUniform1i(Loc("uHdr"), mHdrActive);
+    glUniform1i(Loc("uDither"), CvInt("gNewDawn.PostFx.Dither.Enabled", 1) != 0);
+    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", -0.2f), -8.0f, 8.0f));
     glUniform1i(Loc("uUseGrade"), s.gradeOn ? 1 : 0);
     glUniform1f(Loc("uContrast"), s.contrast);
     glUniform1f(Loc("uSaturation"), s.saturation);
-    if (s.debugView == 1) {
+    if (s.debugView == 1 && !mHdrActive) {
         glEnable(GL_SCISSOR_TEST);
         glScissor(w / 2, 0, w - w / 2, h);
     }
-    Draw(fb.fbo, w, h);
+    Draw(mHdrActive ? mHdrDisplay.fbo : fb.fbo, w, h);
     CheckError("composite pass");
 }
 
