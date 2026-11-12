@@ -45,7 +45,9 @@ typedef struct NewDawnPostFxParams {
     /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
 #define NEWDAWN_MAX_WATER_BOXES 16
     int32_t waterEnabled;
-    int32_t waterDebug;      /* 1: paint the planes */
+    int32_t waterReflections; /* opt-in opaque screen-space reflections */
+    float waterReflectionStrength; /* already multiplied by the per-scene factor */
+    int32_t waterDebug;      /* 1: paint planes, 2: reflection hit mask (green hit, blue miss, red rejected) */
     float waterStrength;     /* already multiplied by the per-scene factor and the light fade */
     float waterTime;         /* seconds, game time (the renderer adds the interpolation fraction) */
     int32_t waterBoxCount;

@@ -86,7 +86,7 @@ class PostFxGL {
     Program mHdrTransform;
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mShadowDepth, mShadowApply;
-    Program mShaftMarch, mShaftBlur, mShaftApply, mWater;
+    Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
     GLuint mVao = 0;
@@ -95,6 +95,9 @@ class PostFxGL {
     Target mDepth;
     Target mAoRaw, mAoBlur;
     Target mScene;
+    Target mWaterOpaqueColor, mWaterOpaqueDepth; // captured before XLU, only when reflections are enabled
+    Target mWaterReflectionRaw; // half-resolution premultiplied colour and reflection coverage
+    uint32_t mWaterOpaqueFrame = UINT32_MAX;
     Target mShadowMap;
     Target mShaftA, mShaftB; // half resolution
     static constexpr int kMaxBloomLevels = 6;
@@ -102,10 +105,11 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 5;
+    static constexpr int kQueryStages = 6;
     static constexpr int kShadowTimerStage = 2;
     static constexpr int kShaftTimerStage = 3;
     static constexpr int kWaterTimerStage = 4;
+    static constexpr int kWaterCaptureTimerStage = 5;
     GLuint mQueries[kQueryStages][kQueryRing] = {};
     bool mQueryPending[kQueryStages][kQueryRing] = {};
     int mQueryNext[kQueryStages] = {};
