@@ -30,10 +30,43 @@
 #include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
 namespace Fast {
 // Defined here, where PostFxGL is a complete type
 GfxRenderingAPIOGL::GfxRenderingAPIOGL() = default;
 GfxRenderingAPIOGL::~GfxRenderingAPIOGL() = default;
+
+// Texture filtering settings shared with the in-game menu (mm/2s2h/BenGui/BenMenu.cpp).
+static bool AreMipmapsEnabled() {
+    return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.Mipmaps", 1) != 0;
+}
+
+static float GetRequestedAnisotropy() {
+    int requested =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.Anisotropy", 16);
+    requested = std::clamp(requested, 0, 16);
+    return requested <= 1 ? 1.0f : static_cast<float>(requested);
+}
+
+static float GetLodBias() {
+    return std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Textures.LodBias", 0.0f), -4.0f,
+        4.0f);
+}
+
+static GLint MipLevelCount(uint32_t width, uint32_t height) {
+    GLint levels = 1;
+    for (uint32_t size = std::max(width, height); size > 1; size >>= 1) {
+        levels++;
+    }
+    return levels;
+}
 
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
@@ -586,8 +619,29 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
         return;
     }
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
-    textures[mCurrentTextureIds[mCurrentTile]].width = width;
-    textures[mCurrentTextureIds[mCurrentTile]].height = height;
+    TextureInfo& texture = textures[mCurrentTextureIds[mCurrentTile]];
+    texture.width = width;
+    texture.height = height;
+    texture.mipmapped = false;
+    texture.mipEligible = false;
+    // A fresh level 0 does not guarantee the rest of an old chain is still valid. Restrict sampling to
+    // level 0 until BuildMipmaps replaces the chain; harmless when mipmapping is off.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+}
+
+void GfxRenderingAPIOGL::BuildMipmaps() {
+    TextureInfo& texture = textures[mCurrentTextureIds[mCurrentTile]];
+    texture.mipEligible = true;
+    if (!mMipmapsEnabled) {
+        return;
+    }
+    if (texture.mipmapped || texture.width == 0 || texture.height == 0) {
+        return;
+    }
+    // Raise the level range before generating: glGenerateMipmap only fills levels up to MAX_LEVEL.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, MipLevelCount(texture.width, texture.height) - 1);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    texture.mipmapped = true;
 }
 
 #ifdef USE_OPENGLES
@@ -613,10 +667,42 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
         mLastActiveTexture = tile;
         glActiveTexture(GL_TEXTURE0 + tile);
     }
-    const GLint filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
+
+    TextureInfo& texture = textures[mCurrentTextureIds[tile]];
+    const bool mipmapsEnabled = mMipmapsEnabled;
+    if (mipmapsEnabled && texture.mipEligible && !texture.mipmapped && texture.width > 0 && texture.height > 0) {
+        // The setting may have been switched on after this texture was uploaded; generate lazily.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, MipLevelCount(texture.width, texture.height) - 1);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        texture.mipmapped = true;
+    }
+
+    GLint minFilter;
+    GLint magFilter;
+    if (mipmapsEnabled && texture.mipmapped) {
+        // Hardware trilinear sampling replaces the shader's manual three-point path. They produce the
+        // same bilinear result at level 0, but only the hardware path can select mip levels and use
+        // anisotropic filtering. textureGrad in the shader keeps the LOD correct at clamp edges.
+        const bool hardwareLinear = linear_filter && mCurrentFilterMode != FILTER_NONE;
+        minFilter = hardwareLinear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
+        magFilter = hardwareLinear ? GL_LINEAR : GL_NEAREST;
+        texture.filtering = FILTER_LINEAR;
+
+        if (mMaxAnisotropy > 1.0f) {
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+                            std::min(mRequestedAnisotropy, mMaxAnisotropy));
+        }
+#ifndef USE_OPENGLES
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, mLodBias);
+#endif
+    } else {
+        minFilter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
+        magFilter = minFilter;
+        texture.filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
+    }
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl(cmt));
 }
@@ -749,6 +835,13 @@ void GfxRenderingAPIOGL::Init() {
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
 
+    // Extension query; an unsupported enum leaves the value untouched (and raises GL_INVALID_ENUM once).
+    mMaxAnisotropy = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &mMaxAnisotropy);
+    if (!(mMaxAnisotropy >= 1.0f)) {
+        mMaxAnisotropy = 1.0f;
+    }
+
 #ifndef USE_OPENGLES
     mPostFx = std::make_unique<PostFxGL>();
     mPostFx->Init();
@@ -760,6 +853,10 @@ void GfxRenderingAPIOGL::OnResize() {
 
 void GfxRenderingAPIOGL::StartFrame() {
     mFrameCount++;
+
+    mMipmapsEnabled = AreMipmapsEnabled();
+    mRequestedAnisotropy = GetRequestedAnisotropy();
+    mLodBias = GetLodBias();
 }
 
 void GfxRenderingAPIOGL::EndFrame() {

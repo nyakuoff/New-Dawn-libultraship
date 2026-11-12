@@ -129,7 +129,9 @@
     uniform int texture_height[2];
     uniform int texture_filtering[2];
 
-    #define TEX_OFFSET(off) @{texture}(tex, texCoord - off / texSize)
+    // Explicit gradients keep mip selection correct: TEX_OFFSET's fract() makes automatic
+    // derivatives useless, and clamped UVs lose their gradient at the texture edge.
+    #define TEX_OFFSET(off) textureGrad(tex, texCoord - off / texSize, ddx, ddy)
     #define WRAP(x, low, high) mod((x)-(low), (high)-(low)) + (low)
 
     float random(in vec3 value) {
@@ -144,7 +146,7 @@
         return vec4(mix(higher, lower, cutoff), linearRGB.a);
     }
 
-    vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {
+    vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize, in vec2 ddx, in vec2 ddy) {
         vec2 offset = fract(texCoord*texSize - vec2(0.5));
         offset -= step(1.0, offset.x + offset.y);
         vec4 c0 = TEX_OFFSET(offset);
@@ -153,13 +155,13 @@
         return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
     }
 
-    vec4 hookTexture2D(in int id, sampler2D tex, in vec2 uv, in vec2 texSize) {
+    vec4 hookTexture2D(in int id, sampler2D tex, in vec2 uv, in vec2 texSize, in vec2 ddx, in vec2 ddy) {
     @if(o_three_point_filtering)
         if(texture_filtering[id] == @{FILTER_THREE_POINT}) {
-            return filter3point(tex, uv, texSize);
+            return filter3point(tex, uv, texSize, ddx, ddy);
         }
     @end
-        return @{texture}(tex, uv);
+        return textureGrad(tex, uv, ddx, ddy);
     }
 
     #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
@@ -171,6 +173,8 @@
                 @{t = o_clamp[i][1]}
 
                 vec2 texSize@{i} = TEX_SIZE(@{i});
+                vec2 ddx@{i} = dFdx(vTexCoord@{i});
+                vec2 ddy@{i} = dFdy(vTexCoord@{i});
 
                 @if(!s && !t)
                     vec2 vTexCoordAdj@{i} = vTexCoord@{i};
@@ -184,7 +188,7 @@
                     @end
                 @end
 
-                vec4 texVal@{i} = hookTexture2D(@{i}, uTex@{i}, vTexCoordAdj@{i}, texSize@{i});
+                vec4 texVal@{i} = hookTexture2D(@{i}, uTex@{i}, vTexCoordAdj@{i}, texSize@{i}, ddx@{i}, ddy@{i});
 
                 @if(o_masks[i])
                     @if(opengles) 
@@ -193,10 +197,12 @@
                         vec2 maskSize@{i} = textureSize(uTexMask@{i}, 0);
                     @end
 
-                    vec4 maskVal@{i} = hookTexture2D(@{i}, uTexMask@{i}, vTexCoordAdj@{i}, maskSize@{i});
+                    vec4 maskVal@{i} =
+                        hookTexture2D(@{i}, uTexMask@{i}, vTexCoordAdj@{i}, maskSize@{i}, ddx@{i}, ddy@{i});
 
                     @if(o_blend[i])
-                        vec4 blendVal@{i} = hookTexture2D(@{i}, uTexBlend@{i}, vTexCoordAdj@{i}, texSize@{i});
+                        vec4 blendVal@{i} =
+                            hookTexture2D(@{i}, uTexBlend@{i}, vTexCoordAdj@{i}, texSize@{i}, ddx@{i}, ddy@{i});
                     @else
                         vec4 blendVal@{i} = vec4(0, 0, 0, 0);
                     @end
