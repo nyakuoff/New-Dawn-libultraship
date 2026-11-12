@@ -52,6 +52,7 @@ class PostFxGL {
     void EnsureShadowTarget(int size);
     void RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* positions,
                     uint32_t vertexCount, int debug);
+    void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);
@@ -71,6 +72,8 @@ class PostFxGL {
 
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mShadowDepth, mShadowApply;
+    Program mShaftMarch, mShaftBlur, mShaftApply;
+    GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
     GLuint mVao = 0;
     GLuint mShadowVao = 0, mShadowVbo = 0;
@@ -79,13 +82,15 @@ class PostFxGL {
     Target mAoRaw, mAoBlur;
     Target mScene;
     Target mShadowMap;
+    Target mShaftA, mShaftB; // half resolution
     static constexpr int kMaxBloomLevels = 6;
     Target mBloom[kMaxBloomLevels];
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 3;
+    static constexpr int kQueryStages = 4;
     static constexpr int kShadowTimerStage = 2;
+    static constexpr int kShaftTimerStage = 3;
     GLuint mQueries[kQueryStages][kQueryRing] = {};
     bool mQueryPending[kQueryStages][kQueryRing] = {};
     int mQueryNext[kQueryStages] = {};

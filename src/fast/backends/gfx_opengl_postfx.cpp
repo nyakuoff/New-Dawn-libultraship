@@ -417,7 +417,8 @@ static const char* kShadowApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
 uniform sampler2D uColor;
-uniform sampler2D uShadow;
+uniform sampler2D uShadow;       // raw depth, for the debug views
+uniform sampler2DShadow uShadowCmp; // same texture, bilinear-filtered depth compare
 uniform vec2 uShadowTexel;
 uniform mat4 uInvViewProj;
 uniform mat4 uLightViewProj;
@@ -439,6 +440,15 @@ vec3 worldPos(ivec2 p, float d) {
     vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
     return w.xyz / w.w;
 }
+
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+const vec2 kPoisson[12] = vec2[12](
+    vec2(-0.326212, -0.405810), vec2(-0.840144, -0.073580), vec2(-0.695914, 0.457137), vec2(-0.203345, 0.620716),
+    vec2(0.962340, -0.194983), vec2(0.473434, -0.480026), vec2(0.519456, 0.767022), vec2(0.185461, -0.893124),
+    vec2(0.507431, 0.064425), vec2(0.896420, 0.412458), vec2(-0.321940, -0.932615), vec2(-0.791559, -0.597710));
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -495,14 +505,17 @@ void main() {
     float sampledLit = 1.0;
     if (inMap) {
         float bias = 0.003 + 0.010 * (1.0 - ndl);
+        // Rotated Poisson disk (angle from interleaved gradient noise, fixed per screen pixel so it never crawls);
+        // every tap is itself a bilinear 2x2 compare, which removes the stair steps of the map texels.
+        float a = ign(gl_FragCoord.xy) * 6.2831853;
+        vec2 rot = vec2(cos(a), sin(a));
         float sum = 0.0;
-        for (int y = -2; y <= 2; y++) {
-            for (int x = -2; x <= 2; x++) {
-                float sd = texture(uShadow, suv + vec2(x, y) * uShadowTexel).r;
-                sum += (ref - bias <= sd) ? 1.0 : 0.0;
-            }
+        for (int i = 0; i < 12; i++) {
+            vec2 o = kPoisson[i];
+            o = vec2(o.x * rot.x - o.y * rot.y, o.x * rot.y + o.y * rot.x) * 2.2;
+            sum += texture(uShadowCmp, vec3(suv + o * uShadowTexel, ref - bias));
         }
-        sampledLit = sum / 25.0;
+        sampledLit = sum / 12.0;
     }
     if (uDebug == 4) {
         oColor = vec4(ndl, 1.0 - sampledLit, inMap ? 1.0 : 0.0, 1.0);
@@ -522,6 +535,141 @@ void main() {
     vec3 factor = clamp(shade / total, vec3(uMinFactor), vec3(1.0));
     factor = mix(vec3(1.0), factor, uStrength);
     oColor = vec4(texture(uColor, vUv).rgb * factor, 1.0);
+}
+)GLSL";
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sun shafts. Half resolution raymarch from the camera to each pixel's world position through the shadow map (the
+// sample count is fixed, the start of every ray is jittered with interleaved gradient noise), blurred depth-aware and
+// applied with a screen blend. R = in-scatter amount (phase included), G = linear depth of the pixel it was taken at.
+// ---------------------------------------------------------------------------------------------------------------------
+static const char* kShaftMarchShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2DShadow uShadowCmp;
+uniform mat4 uInvViewProj;
+uniform mat4 uLightViewProj;
+uniform vec3 uSunDir;
+uniform vec3 uCameraEye;
+uniform float uNdcXScale;
+uniform float uFlipY;
+uniform float uMaxDist;
+uniform float uDensity;
+uniform float uAnisotropy;
+
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+vec3 worldPos(ivec2 p, float d) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
+    ndc.y *= uFlipY;
+    ndc.x *= uNdcXScale;
+    vec4 w = uInvViewProj * vec4(ndc.x, ndc.y, d * 2.0 - 1.0, 1.0);
+    return w.xyz / w.w;
+}
+
+const int kSteps = 20;
+
+void main() {
+    ivec2 hp = ivec2(gl_FragCoord.xy);
+    ivec2 fp = min(hp * 2, uSize - 1);
+    float d = fetchDepth(fp);
+    bool sky = d >= 0.99999;
+    vec3 P = worldPos(fp, sky ? 0.9999 : d);
+    vec3 ray = P - uCameraEye;
+    float len = length(ray);
+    vec3 dir = ray / max(len, 1e-3);
+    float L = sky ? uMaxDist : min(len, uMaxDist);
+
+    // Henyey-Greenstein, normalised so that looking straight at the sun gives 1; a little isotropic floor so the
+    // shafts do not vanish completely when the sun is to the side.
+    float g = uAnisotropy;
+    float cosT = dot(dir, uSunDir);
+    float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosT, 1.5);
+    float hgMax = (1.0 - g * g) / pow((1.0 - g) * (1.0 - g), 1.5);
+    float phase = 0.04 + 0.96 * (hg / hgMax);
+
+    float jitter = ign(gl_FragCoord.xy);
+    float stepLen = L / float(kSteps);
+    float acc = 0.0;
+    float wsum = 0.0;
+    for (int i = 0; i < kSteps; i++) {
+        float t = (float(i) + jitter) * stepLen;
+        vec3 pos = uCameraEye + dir * t;
+        vec4 lc = uLightViewProj * vec4(pos, 1.0);
+        vec3 ndc = lc.xyz / lc.w;
+        vec2 suv = ndc.xy * 0.5 + 0.5;
+        float ref = ndc.z * 0.5 + 0.5;
+        float lit = 1.0;
+        if (ref < 1.0 && all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0)))) {
+            lit = texture(uShadowCmp, vec3(suv, ref - 0.004));
+        }
+        float w = exp(-uDensity * t);
+        acc += lit * w;
+        wsum += w;
+    }
+    float opacity = 1.0 - exp(-uDensity * L);
+    // Only the well-lit part of the ray counts: partly shadowed rays fall off quickly, which is what gives the shafts shape.
+    float lit = clamp((acc / max(wsum, 1e-4) - 0.3) / 0.7, 0.0, 1.0);
+    float v = lit * opacity * phase;
+    oColor = vec4(v, sky ? uFar : linDepth(d), 0.0, 1.0);
+}
+)GLSL";
+
+// Depth-aware separable blur at half resolution; the jitter noise averages away.
+static const char* kShaftBlurShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uSrc;
+uniform ivec2 uDir;
+uniform ivec2 uHalfSize;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec2 c = texelFetch(uSrc, p, 0).rg;
+    float sigma = max(0.06 * c.y, 20.0);
+    float sum = 0.0, wsum = 0.0;
+    for (int i = -3; i <= 3; i++) {
+        vec2 s = texelFetch(uSrc, clamp(p + uDir * i, ivec2(0), uHalfSize - 1), 0).rg;
+        float dz = (s.y - c.y) / sigma;
+        float w = exp(-dz * dz) * exp(-0.08 * float(i * i));
+        sum += s.x * w;
+        wsum += w;
+    }
+    oColor = vec4(sum / wsum, c.y, 0.0, 1.0);
+}
+)GLSL";
+
+// Depth-aware bilinear upsample straight into the game framebuffer. Screen blend: 1 - (1 - c)(1 - s).
+static const char* kShaftApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uSrc;
+uniform ivec2 uHalfSize;
+uniform vec3 uColor;
+uniform float uStrength;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = fetchDepth(p);
+    float lz = (d >= 0.99999) ? uFar : linDepth(d);
+    vec2 hp = (vec2(p) + 0.5) * 0.5 - 0.5;
+    ivec2 b = ivec2(floor(hp));
+    vec2 f = hp - vec2(b);
+    float sum = 0.0, wsum = 0.0;
+    float sigma = max(0.06 * lz, 20.0);
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            ivec2 q = clamp(b + ivec2(i, j), ivec2(0), uHalfSize - 1);
+            vec2 s = texelFetch(uSrc, q, 0).rg;
+            float dz = (s.y - lz) / sigma;
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) * (exp(-dz * dz) + 1e-3);
+            sum += s.x * w;
+            wsum += w;
+        }
+    }
+    float v = sum / wsum;
+    oColor = vec4(uColor * (v * uStrength * 4.0), 1.0); // 4.0: so that a strength of 0.5 is "subtle but visible" 
 }
 )GLSL";
 
@@ -736,6 +884,15 @@ void PostFxGL::Init() {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
     glBindVertexArray(0);
+    glGenSamplers(1, &mCmpSampler);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    const GLfloat cmpBorder[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    glSamplerParameterfv(mCmpSampler, GL_TEXTURE_BORDER_COLOR, cmpBorder);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    glSamplerParameteri(mCmpSampler, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
     glGenQueries(kQueryStages * kQueryRing, &mQueries[0][0]);
     mUsable = true;
     SPDLOG_INFO("NewDawnPostFx: enabled (OpenGL {}.{}, {})", major, minor,
@@ -752,6 +909,12 @@ bool PostFxGL::BuildPrograms() {
     const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
+    const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
+    const char* shaftBlur[] = { kVersion, kShaftBlurShader };
+    const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
+    mShaftMarch.id = BuildProgram("sun shaft march shader", shaftMarch, 3, mShaftMarch.uniforms);
+    mShaftBlur.id = BuildProgram("sun shaft blur shader", shaftBlur, 2, mShaftBlur.uniforms);
+    mShaftApply.id = BuildProgram("sun shaft apply shader", shaftApply, 3, mShaftApply.uniforms);
     mAo.id = BuildProgram("AO shader", ao, 3, mAo.uniforms);
     mBlur.id = BuildProgram("AO blur shader", blur, 4, mBlur.uniforms);
     mApply.id = BuildProgram("AO apply shader", apply, 4, mApply.uniforms);
@@ -762,7 +925,7 @@ bool PostFxGL::BuildPrograms() {
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     return mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
-           mShadowDepth.id;
+           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -847,7 +1010,8 @@ void PostFxGL::BeginTimer(int stage) {
         if (++mQueryCount[stage] == 300) {
             const char* label = (stage == 0) ? "opaque end / AO"
                                 : (stage == 1) ? "scene end / bloom+grade"
-                                               : "shadows";
+                                : (stage == 2) ? "shadows"
+                                               : "sun shafts";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -880,6 +1044,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShadow = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.shadowsOn && params.shadowEnabled != 0 &&
                           shadowPositions != nullptr && shadowVertexCount >= 3;
     const bool doAo = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.postFxOn && s.aoOn;
+    const bool doShafts = doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
+                          s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn);
@@ -920,6 +1086,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(1);
         RunSceneEnd(fb, s);
         EndTimer(1);
+    }
+    if (doShafts) {
+        BeginTimer(kShaftTimerStage);
+        RunSunShafts(params, fb);
+        EndTimer(kShaftTimerStage);
     }
 
     CheckError(doShadow ? "shadow stage" : (stage == 0 ? "opaque end stage" : "scene end stage"));
@@ -1158,10 +1329,13 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     Bind(0, mScene.tex);
     Bind(1, mDepth.tex);
     Bind(2, mShadowMap.tex);
+    Bind(3, mShadowMap.tex);
+    glBindSampler(kFirstUnit + 3, mCmpSampler);
     Use(mShadowApply);
     glUniform1i(Loc("uColor"), kFirstUnit + 0);
     glUniform1i(Loc("uDepth"), kFirstUnit + 1);
     glUniform1i(Loc("uShadow"), kFirstUnit + 2);
+    glUniform1i(Loc("uShadowCmp"), kFirstUnit + 3);
     glUniform2i(Loc("uSize"), w, h);
     glUniform1f(Loc("uNear"), params.zNear);
     glUniform1f(Loc("uFar"), params.zFar);
@@ -1179,7 +1353,82 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)size * 4.0f);
     glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
+    glBindSampler(kFirstUnit + 3, 0);
     CheckError("shadow apply");
+}
+
+void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const int w = fb.width, h = fb.height;
+    const int hw = std::max(w / 2, 1), hh = std::max(h / 2, 1);
+    EnsureTarget(mShaftA, hw, hh, GL_RG16F, GL_RG, GL_FLOAT, false, false);
+    EnsureTarget(mShaftB, hw, hh, GL_RG16F, GL_RG, GL_FLOAT, false, false);
+    if (!mUsable) {
+        return;
+    }
+    float lightViewProj[16];
+    BuildLightViewProj(params, lightViewProj);
+    // The AO apply pass leaves multiplicative blending (and possibly a scissor) enabled.
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+
+    // 1. March: how much of the ray towards each pixel is lit, weighted by the phase function.
+    Bind(1, mDepth.tex);
+    Bind(3, mShadowMap.tex);
+    glBindSampler(kFirstUnit + 3, mCmpSampler);
+    Use(mShaftMarch);
+    glUniform1i(Loc("uDepth"), kFirstUnit + 1);
+    glUniform1i(Loc("uShadowCmp"), kFirstUnit + 3);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+    glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
+    glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
+    glUniform1f(Loc("uMaxDist"), 2.0f * params.shadowRadius);
+    glUniform1f(Loc("uDensity"), 0.6f / params.shadowRadius);
+    glUniform1f(Loc("uAnisotropy"), 0.65f);
+    Draw(mShaftA);
+    glBindSampler(kFirstUnit + 3, 0);
+    CheckError("sun shaft march");
+
+    // 2. Blur, horizontal then vertical.
+    Use(mShaftBlur);
+    glUniform1i(Loc("uSrc"), kFirstUnit + 0);
+    glUniform2i(Loc("uHalfSize"), hw, hh);
+    Bind(0, mShaftA.tex);
+    glUniform2i(Loc("uDir"), 1, 0);
+    Draw(mShaftB);
+    Bind(0, mShaftB.tex);
+    glUniform2i(Loc("uDir"), 0, 1);
+    Draw(mShaftA);
+    CheckError("sun shaft blur");
+
+    // 3. Upsample into the game framebuffer with a screen blend.
+    Bind(0, mShaftA.tex);
+    Use(mShaftApply);
+    glUniform1i(Loc("uSrc"), kFirstUnit + 0);
+    glUniform1i(Loc("uDepth"), kFirstUnit + 1);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform2i(Loc("uHalfSize"), hw, hh);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    // The in-scatter colour: the game's fog colour pulled towards the sun's light, so the shafts read as part of the
+    // existing atmosphere rather than as a separate overlay.
+    float color[3];
+    for (int i = 0; i < 3; i++) {
+        color[i] = 0.6f * params.shaftFogColor[i] + 0.4f * params.shadowDirColor[i];
+    }
+    glUniform3fv(Loc("uColor"), 1, color);
+    glUniform1f(Loc("uStrength"), params.shaftStrength);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    CheckError("sun shaft apply");
 }
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
