@@ -23,6 +23,13 @@ class PostFxGL {
     void Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& gameFb, uint32_t frameIndex,
              const float* shadowPositions, uint32_t shadowVertexCount);
 
+    bool BeginHdr(const FramebufferOGL& fb);
+    void EndHdr(const FramebufferOGL& fb);
+    GLuint HdrSnapshot(const FramebufferOGL& fb);
+    bool HdrActive() const {
+        return mHdrActive;
+    }
+
     struct Settings {
         bool postFxOn, aoOn, bloomOn, gradeOn;
         bool shadowsOn;
@@ -41,6 +48,7 @@ class PostFxGL {
         GLuint fbo = 0;
         int w = 0;
         int h = 0;
+        GLint format = 0;
     };
     struct Program {
         GLuint id = 0;
@@ -72,6 +80,10 @@ class PostFxGL {
     Settings mSettings{};
     uint32_t mStatsW = 0, mStatsH = 0, mStatsMsaa = 0;
 
+    bool mHdrActive = false;
+    Target mHdr;
+    GLuint mHdrDisplayFbo = 0;
+    Program mHdrTransform;
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mShadowDepth, mShadowApply;
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply;

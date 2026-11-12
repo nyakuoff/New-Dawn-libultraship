@@ -37,6 +37,7 @@ struct ShaderProgram {
     GLint attribLocations[16];
     uint8_t attribSizes[16];
     uint8_t numAttribs;
+    GLint hdr_location, hdr_sun_location, hdr_ambient_location;
     GLint frameCountLocation;
     GLint noiseScaleLocation;
     GLint prim_depth_location;
@@ -101,6 +102,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) override;
     void Init() override;
     void OnResize() override;
+    bool HdrWorldActive() const override;
+    void FinishWorld() override;
     void StartFrame() override;
     void EndFrame() override;
     void FinishRender() override;
@@ -185,6 +188,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     uint32_t mShadowCasterVertexCount = 0;
 
 #ifndef USE_OPENGLES
+    int mHdrGameFb = -1;
     std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
 #endif
 };

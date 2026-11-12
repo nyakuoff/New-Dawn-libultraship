@@ -116,6 +116,12 @@ class GfxRenderingAPI {
     virtual void SetCurrentPrimDepth(float depth) = 0;
 
     // New Dawn scene post-processing (see fast/newdawn_postfx.h). Only implemented for OpenGL.
+    virtual bool HdrWorldActive() const {
+        return false;
+    }
+    virtual void FinishWorld() {
+    }
+
     virtual bool PostFxAvailable() {
         return false;
     }

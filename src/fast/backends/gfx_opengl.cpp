@@ -119,6 +119,15 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
     }
 
+    glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
+    if (HdrWorldActive() && mCurrentShaderProgram->per_pixel_light_count_location >= 0) {
+        auto hdrCvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        glUniform1f(mCurrentShaderProgram->hdr_sun_location,
+                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f));
+        glUniform1f(mCurrentShaderProgram->hdr_ambient_location,
+                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f));
+    }
+
     // Uniforms are per-program state, so they are re-applied whenever the light state or the
     // program changes. Locations are -1 for programs that do not use per-pixel lighting.
     const ShaderProgram* prg = mCurrentShaderProgram;
@@ -356,8 +365,35 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
 }
 
 std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
+    // Diffuse family: TEXEL0 * SHADE, optionally multiplied by an artistic primitive/environment tint.
+    // Input slots are shared across cycles. Only a factor occurring exactly once may be SHADE.
+    const auto inputBit = [](int input) -> int {
+        return input >= SHADER_INPUT_1 && input <= SHADER_INPUT_7 ? 1 << (input - SHADER_INPUT_1) : 0;
+    };
+    const auto& c = cc_features.c[0][0];
+    int hdrDiffuseMask = 0;
+    if (cc_features.opt_per_pixel_lighting && cc_features.do_multiply[0][0]) {
+        if (c[0] == SHADER_TEXEL0) {
+            hdrDiffuseMask = inputBit(c[2]);
+        } else if (c[2] == SHADER_TEXEL0) {
+            hdrDiffuseMask = inputBit(c[0]);
+        }
+    }
+    if (cc_features.opt_2cyc) {
+        const auto& d = cc_features.c[1][0];
+        if (cc_features.do_single[1][0] && d[3] == SHADER_COMBINED) {
+            // Passthrough of the first cycle.
+        } else if (cc_features.do_multiply[1][0] && (d[0] == SHADER_COMBINED || d[2] == SHADER_COMBINED)) {
+            const int tint = d[d[0] == SHADER_COMBINED ? 2 : 0];
+            const int second = inputBit(tint);
+            hdrDiffuseMask = hdrDiffuseMask && second ? (hdrDiffuseMask ^ second) : 0;
+        } else {
+            hdrDiffuseMask = 0;
+        }
+    }
     prism::Processor processor;
     prism::ContextItems mContext = {
+        { "hdr_diffuse_mask", hdrDiffuseMask },
         { "VERTEX_SHADER", false },
         { "o_c", M_ARRAY(cc_features.c, int, 2, 2, 4) },
         { "o_alpha", cc_features.opt_alpha },
@@ -634,6 +670,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->numFloats = numFloats;
     prg->numAttribs = cnt;
 
+    prg->hdr_location = glGetUniformLocation(shader_program, "uHdrWorld");
+    prg->hdr_sun_location = glGetUniformLocation(shader_program, "uHdrSun");
+    prg->hdr_ambient_location = glGetUniformLocation(shader_program, "uHdrAmbient");
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
     prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
@@ -978,6 +1017,7 @@ void GfxRenderingAPIOGL::OnResize() {
 }
 
 void GfxRenderingAPIOGL::StartFrame() {
+    FinishWorld();
     mFrameCount++;
 
     mMipmapsEnabled = AreMipmapsEnabled();
@@ -1148,6 +1188,11 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
+#ifndef USE_OPENGLES
+    if (fb_id == mHdrGameFb && mPostFx && mPostFx->HdrActive()) {
+        mPostFx->HdrSnapshot(mFrameBuffers[fb_id]);
+    }
+#endif
     GLuint texId = mFrameBuffers[fb_id].clrbuf;
     // Ensure the textures metadata vector can hold this FB texture handle.
     // FB color buffers are created outside NewTexture(), so the vector may
@@ -1165,6 +1210,11 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
     }
 
     FramebufferOGL src = mFrameBuffers[fb_src_id];
+#ifndef USE_OPENGLES
+    if (fb_src_id == mHdrGameFb && mPostFx && mPostFx->HdrActive()) {
+        src.fbo = mPostFx->HdrSnapshot(src);
+    }
+#endif
     const FramebufferOGL& dst = mFrameBuffers[fb_dst_id];
 
     // Adjust y values for non-inverted source frame buffers because opengl uses bottom left for origin
@@ -1222,7 +1272,8 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
-    glReadBuffer(GL_BACK);
+    // GL_BACK is invalid on an offscreen FBO (notably the pause capture path).
+    glReadBuffer(mCurrentFrameBuffer == 0 ? GL_BACK : GL_COLOR_ATTACHMENT0);
 
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -1239,7 +1290,13 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
     // GL_RGBA + GL_UNSIGNED_SHORT_5_5_5_1 writes 4 separate u16 components per pixel
     // (8 bytes) on some drivers (NVIDIA), not the packed 2 bytes the spec implies.
     // Reading as RGBA8 and converting matches the DX11 path's approach.
-    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[fb_id].fbo);
+    GLuint readFbo = mFrameBuffers[fb_id].fbo;
+#ifndef USE_OPENGLES
+    if (fb_id == mHdrGameFb && mPostFx && mPostFx->HdrActive()) {
+        readFbo = mPostFx->HdrSnapshot(mFrameBuffers[fb_id]);
+    }
+#endif
+    glBindFramebuffer(GL_FRAMEBUFFER, readFbo);
 
     std::vector<uint8_t> rgba8(width * height * 4);
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
@@ -1329,6 +1386,12 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Debug.Inspect", 0) &&
+        mFrameCount % 300 == 0) {
+        for (const auto& entry : res) {
+            SPDLOG_INFO("NewDawnHDR GetPixelDepth: ({},{})={}", entry.first.first, entry.first.second, entry.second);
+        }
+    }
     return res;
 }
 
@@ -1362,8 +1425,69 @@ void GfxRenderingAPIOGL::SetShadowCasterGeometry(const float* positions, uint32_
     mShadowCasterVertexCount = vertexCount;
 }
 
+bool GfxRenderingAPIOGL::HdrWorldActive() const {
+#ifndef USE_OPENGLES
+    return mPostFx && mPostFx->HdrActive() && mCurrentFrameBuffer == mHdrGameFb;
+#else
+    return false;
+#endif
+}
+
+void GfxRenderingAPIOGL::FinishWorld() {
+#ifndef USE_OPENGLES
+    if (mHdrGameFb >= 0 && mPostFx && mPostFx->HdrActive()) {
+        mPostFx->EndHdr(mFrameBuffers[mHdrGameFb]);
+    }
+    mHdrGameFb = -1;
+#endif
+}
+
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
+    if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
+        if (mPostFx && mPostFx->BeginHdr(mFrameBuffers[gameFbId])) {
+            mHdrGameFb = gameFbId;
+        }
+        return;
+    }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Debug.Inspect", 0) &&
+        mFrameCount % 300 == 0 && mFrameBuffers[gameFbId].msaa_level <= 1) {
+        // Explicit opt-in synchronous inspection; keep this out of performance captures.
+        const auto& fb = mFrameBuffers[gameFbId];
+        std::vector<float> colour(fb.width * fb.height * 4);
+        GLint previousRead;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousRead);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+        glReadPixels(0, 0, fb.width, fb.height, GL_RGBA, GL_FLOAT, colour.data());
+        float peak = 0.0f;
+        size_t overOne = 0;
+        for (size_t i = 0; i < colour.size(); i += 4) {
+            float value = std::max({ colour[i], colour[i + 1], colour[i + 2] });
+            peak = std::max(peak, value);
+            overOne += value > 1.0f;
+        }
+        uint32_t depth[9];
+        // Static scene samples away from the animated player, at the original depth precision.
+        int sample = 0;
+        for (int y = 1; y <= 3; ++y) {
+            for (int x = 1; x <= 3; ++x) {
+                glReadPixels(fb.width * x / 4, fb.height * y / 4, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8,
+                             &depth[sample++]);
+            }
+        }
+        SPDLOG_INFO(
+            "NewDawnHDR inspect: active={} peak={} pixels>1={} depth24={:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x},{:x}",
+            HdrWorldActive(), peak, overOne, depth[0] >> 8, depth[1] >> 8, depth[2] >> 8, depth[3] >> 8, depth[4] >> 8,
+            depth[5] >> 8, depth[6] >> 8, depth[7] >> 8, depth[8] >> 8);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
+    }
+    if (mHdrGameFb >= 0) {
+        if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+            FinishWorld();
+        }
+        return; // AO, shadows, shafts, water, bloom and grade are LDR-only in this milestone
+    }
     if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);

@@ -1228,6 +1228,21 @@ bool PostFxGL::BuildPrograms() {
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
     const char* down[] = { kVersion, kDownShader };
     const char* up[] = { kVersion, kUpShader };
+    const char* hdr[] = { kVersion, R"GLSL(
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uScene;
+uniform float uExposure;
+void main() {
+    vec3 x = max(texture(uScene, vUv).rgb, vec3(0.0)) * exp2(uExposure);
+    // Narkowicz ACES-like rational fit: scene linear 0.18 maps to ~0.55 display at EV 0.
+    vec3 y = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    y = mix(1.055 * pow(y, vec3(1.0 / 2.4)) - 0.055, 12.92 * y, lessThanEqual(y, vec3(0.0031308)));
+    float noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
+    fragColor = vec4(clamp(y + noise / 255.0, 0.0, 1.0), 1.0);
+}
+)GLSL" };
+    mHdrTransform.id = BuildProgram("HDR display shader", hdr, 2, mHdrTransform.uniforms);
     const char* comp[] = { kVersion, kCompositeShader };
     const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
@@ -1260,7 +1275,7 @@ bool PostFxGL::BuildPrograms() {
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
                                bool depthStencil, bool linear) {
-    if (t.tex != 0 && t.w == w && t.h == h) {
+    if (t.tex != 0 && t.w == w && t.h == h && t.format == internalFormat) {
         return;
     }
     const bool first = t.tex == 0;
@@ -1289,6 +1304,7 @@ void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenu
         SPDLOG_ERROR("NewDawnPostFx: incomplete {}x{} framebuffer (format 0x{:X}), disabling", w, h, internalFormat);
         mUsable = false;
     }
+    t.format = internalFormat;
     t.w = w;
     t.h = h;
 }
@@ -1360,6 +1376,69 @@ void PostFxGL::EndTimer(int stage) {
     glEndQuery(GL_TIME_ELAPSED);
     mQueryPending[stage][mQueryNext[stage]] = true;
     mQueryNext[stage] = (mQueryNext[stage] + 1) % kQueryRing;
+}
+
+bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
+    if (!mUsable || !mHdrTransform.id || !CvInt("gNewDawn.HDR.Enabled", 0))
+        return false;
+    if (fb.msaa_level > 1) {
+        static bool logged = false;
+        if (!logged)
+            SPDLOG_WARN("NewDawnHDR: disabled: MSAA > 1 is unsupported by this experiment");
+        logged = true;
+        return false;
+    }
+    GlStateGuard guard;
+    guard.Neutralise();
+    EnsureTarget(mHdr, fb.width, fb.height, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    if (!mUsable)
+        return false;
+    if (!mHdrDisplayFbo)
+        glGenFramebuffers(1, &mHdrDisplayFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, mHdrDisplayFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        return false;
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mHdr.tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+        SPDLOG_ERROR("NewDawnHDR: shared-depth framebuffer incomplete; using LDR");
+        return false;
+    }
+    // World begins on the cleared framebuffer. Never clear or replace the shared game depth.
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    mHdrActive = true;
+    static bool logged = false;
+    if (!logged)
+        SPDLOG_INFO("NewDawnHDR: RGBA16F world; LDR AO/shadows/shafts/water/bloom/grade gated off");
+    logged = true;
+    return true;
+}
+
+GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
+    GlStateGuard guard;
+    guard.Neutralise();
+    glBindVertexArray(mVao);
+    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    BeginTimer(1);
+    Bind(0, mHdr.tex);
+    Use(mHdrTransform);
+    glUniform1i(Loc("uScene"), kFirstUnit);
+    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", -0.2f), -8.0f, 8.0f));
+    Draw(mHdrDisplayFbo, fb.width, fb.height);
+    EndTimer(1);
+    CheckError("HDR display transform");
+    return mHdrDisplayFbo;
+}
+
+void PostFxGL::EndHdr(const FramebufferOGL& fb) {
+    HdrSnapshot(fb);
+    GlStateGuard guard;
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+    mHdrActive = false;
 }
 
 void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
