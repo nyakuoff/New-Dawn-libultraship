@@ -55,6 +55,9 @@ struct ShaderProgram {
     GLint per_pixel_view_matrix_location;
     GLint per_pixel_shade_mask_location;
     GLint per_pixel_quality_location;
+    int materialTile = 0;
+    GLint material_strength_location;
+    GLint material_mirror_location;
 };
 
 struct FramebufferOGL {
@@ -71,6 +74,8 @@ struct TextureInfo {
     uint16_t height;
     uint16_t filtering;
     bool mipmapped;
+    uint8_t bytesPerPixel = 4;
+    bool mirrorS = false, mirrorT = false;
     bool mipEligible; // uploaded through the interpreter, not by UI code
 };
 
@@ -89,6 +94,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void ClearShaderCache() override;
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
+    bool SupportsMaterialMaps() override;
+    void UploadMaterialTexture(const uint8_t* rg8, uint32_t width, uint32_t height) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
     void BuildMipmaps() override;
     uint64_t GetTextureByteSize(uint32_t textureId) override;
@@ -145,8 +152,18 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetPerDrawUniforms();
 
     std::vector<TextureInfo> textures;
-    GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
-    GLuint mLastBoundTextures[SHADER_MAX_TEXTURES] = {};
+    // Optional nonblocking timers measure all world draw batches equally with materials on/off.
+    static constexpr int kDrawTimerCount = 512;
+    GLuint mDrawTimers[kDrawTimerCount] = {};
+    bool mDrawTimerPending[kDrawTimerCount] = {};
+    int mDrawTimerNext = 0;
+    int mDrawTimerFrames = 0;
+    int mDrawTimerDropped = 0;
+    double mDrawTimerMs = 0.0;
+    bool mDrawStats = false;
+    bool mMaterialUnitsAvailable = false;
+    GLuint mCurrentTextureIds[MATERIAL_TEXTURE_SLOTS] = {};
+    GLuint mLastBoundTextures[MATERIAL_TEXTURE_SLOTS] = {};
     uint8_t mCurrentTile;
     int8_t mLastActiveTexture = -1;
     int8_t mLastBlendEnabled = -1;

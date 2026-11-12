@@ -85,12 +85,18 @@ enum class ShaderOpts {
     PRIM_DEPTH,
     PER_PIXEL_LIGHTING,
     ALPHA_TO_COVERAGE,
-    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 19
+    MATERIAL_MAPS,
+    MATERIAL_MAPS_TILE1,
+    MATERIAL_MAPS_BLEND,
+    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 22
     MAX
 };
 
 #define SHADER_OPT(opt) ((uint64_t)(1 << static_cast<int>(ShaderOpts::opt)))
 #endif
+
+struct CCFeatures;
+uint32_t NewDawnMaterialShadeMask(const CCFeatures& features, bool& twoAlbedoBlend);
 
 struct ColorCombinerKey {
     uint64_t combine_mode;
@@ -103,6 +109,9 @@ struct ColorCombinerKey {
 };
 
 #define SHADER_MAX_TEXTURES 6
+#define MATERIAL_NORMAL_TEXTURE 6
+#define MATERIAL_ROUGHNESS_TEXTURE 7
+#define MATERIAL_TEXTURE_SLOTS 8
 #define SHADER_FIRST_TEXTURE 0
 #define SHADER_FIRST_MASK_TEXTURE 2
 #define SHADER_FIRST_REPLACEMENT_TEXTURE 4
@@ -120,6 +129,9 @@ struct CCFeatures {
     bool opt_prim_depth;
     bool opt_per_pixel_lighting;
     bool opt_alpha_to_coverage;
+    bool opt_material_maps;
+    bool opt_material_tile1;
+    bool opt_material_blend;
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -142,7 +154,7 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 19;
+constexpr size_t SHADER_ID_SHIFT = 22;
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -363,6 +375,8 @@ struct ColorCombiner {
     bool usedTextures[2];
     struct ShaderProgram* prg[16];
     uint8_t shader_input_mapping[2][7];
+    uint32_t materialShadeMask = 0;
+    bool materialBlend = false;
 };
 
 struct RenderingState {
@@ -372,7 +386,7 @@ struct RenderingState {
     bool alpha_to_coverage;
     struct XYWidthHeight viewport, scissor;
     struct ShaderProgram* mShaderProgram;
-    TextureCacheNode* mTextures[SHADER_MAX_TEXTURES];
+    TextureCacheNode* mTextures[MATERIAL_TEXTURE_SLOTS];
 };
 
 struct FBInfo {
@@ -448,6 +462,8 @@ class Interpreter {
     std::shared_ptr<Ship::IResource> ResolveTextureResource(const char* path, bool& usedFallback);
     // New Dawn: retire finished alternate texture loads. Called once per frame on the render thread.
     void PumpAltTextureLoads();
+    bool BindMaterialMaps(int tile, int albedoSlot);
+    void PumpMaterialLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
@@ -547,6 +563,13 @@ class Interpreter {
     GfxTextureCache mTextureCache{};
     uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
     bool mTextureCacheDebug = false;
+    bool mMaterialsEnabled = false;
+    struct MaterialMaps {
+        std::shared_ptr<Fast::Texture> albedo, normal, roughness;
+    };
+    // Pointer identity follows the winning albedo resource, including mod reloads. Empty pairs cache misses.
+    std::unordered_map<const Fast::Texture*, MaterialMaps> mMaterials;
+    std::unordered_map<const Fast::Texture*, std::future<MaterialMaps>> mPendingMaterials;
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     // In-flight alternate texture loads, keyed by the alt path. Loads run on the resource pool.
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<Ship::IResource>>> mPendingAltTextures;

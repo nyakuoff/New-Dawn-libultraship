@@ -153,8 +153,8 @@
         // colour with the same arithmetic evaluated per fragment. Values are kept in the 0..255
         // range the CPU uses, including its per-light truncation, so parity is exact where the
         // interpolated normal and position are constant across a triangle.
-        vec3 newDawnIrradiance() {
-            vec3 n = vNormal / max(length(vNormal), 0.0001);
+        vec3 newDawnIrradiance(vec3 shadeNormal) {
+            vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
             vec3 lit = (uLightAmbient / 255.0) * uHdrAmbient;
             for (int i = 0; i < uLightCount; ++i) {
                 float intensity;
@@ -174,7 +174,7 @@
             return max(lit, vec3(0.0));
         }
 
-        vec3 newDawnShade() {
+        vec3 newDawnShade(vec3 shadeNormal) {
             vec3 lit = uLightAmbient;
             for (int i = 0; i < uLightCount; i++) {
                 float intensity = 0.0;
@@ -186,18 +186,97 @@
                     float dist = sqrt(distSq);
                     vec3 lightModel = transpose(uViewMatrix) * distVec;
                     vec3 lightIntensity = clamp(4.0 * lightModel / distSq, -1.0, 1.0);
-                    float total = clamp(dot(vNormal, lightIntensity), -1.0, 1.0);
+                    float total = clamp(dot(shadeNormal, lightIntensity), -1.0, 1.0);
                     // uPointLightQuality 0 keeps the CPU's integer distance steps.
                     float distf = mix(floor(dist), dist, uPointLightQuality);
                     float attenuation =
                         (distf * uLightAtten[i].x * 2.0 + distf * distf * uLightAtten[i].y / 8.0) / 65535.0 + 1.0;
                     intensity = total / attenuation;
                 } else {
-                    intensity = dot(vNormal, uLightDir[i]) / 127.0;
+                    intensity = dot(shadeNormal, uLightDir[i]) / 127.0;
                 }
                 lit += floor(max(intensity, 0.0) * uLightColor[i]);
             }
             return clamp(floor(lit), 0.0, 255.0) / 255.0;
+        }
+    @end
+
+    @if(o_material_maps)
+        uniform sampler2D uMaterialNormal;
+        uniform sampler2D uMaterialRoughness;
+        uniform float uMaterialStrength;
+        uniform vec2 uMaterialMirror;
+
+        // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
+        // +Y-up normals (texture rows increase down). Keeping the signed determinant handles
+        // mirrored islands; repeat/mirror sampling and tile clamp match the albedo sampler.
+        vec3 materialNormal(vec2 uv, vec2 dx, vec2 dy, float weight, out float variance) {
+            // Cofactor inverse-transpose also works on this backend's GLSL 1.30 path.
+            mat3 cofactor = mat3(cross(uViewMatrix[1], uViewMatrix[2]),
+                                 cross(uViewMatrix[2], uViewMatrix[0]),
+                                 cross(uViewMatrix[0], uViewMatrix[1]));
+            float determinant = dot(uViewMatrix[0], cofactor[0]);
+            vec3 transformed = cofactor * vNormal * (determinant < 0.0 ? -1.0 : 1.0);
+            vec3 px = dFdx(vViewPos), py = dFdy(vViewPos);
+            vec3 n = transformed / max(length(transformed), 0.0001);
+            float det = dx.x * dy.y - dx.y * dy.x;
+            vec3 t = px * dy.y - py * dx.y;
+            vec3 b = py * dx.x - px * dy.x;
+            float handedness = det < 0.0 ? -1.0 : 1.0;
+            t = (t - n * dot(n, t)) * handedness;
+            b = (b - n * dot(n, b)) * handedness;
+            float t2 = dot(t, t), b2 = dot(b, b);
+            vec2 xy = textureGrad(uMaterialNormal, uv, dx, dy).rg * 2.0 - 1.0;
+            // Remove the half-quantum offset of the RG8 flat normal (128,128).
+            xy = (xy - vec2(1.0 / 255.0)) * uMaterialStrength * weight;
+            xy *= mix(vec2(1.0), 1.0 - 2.0 * mod(floor(uv), 2.0), uMaterialMirror);
+            vec3 mapped = normalize(vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.001))));
+            // Derivatives are evaluated before any branch or alpha test. Broaden the GGX lobe
+            // as subpixel normal variation grows; mipmapped RG8 vectors are renormalized above.
+            variance = max(dot(dFdx(mapped), dFdx(mapped)), dot(dFdy(mapped), dFdy(mapped)));
+            if (abs(det) < 1e-12 || min(t2, b2) < 1e-16) return n;
+            return normalize(t * inversesqrt(t2) * mapped.x - b * inversesqrt(b2) * mapped.y + n * mapped.z);
+        }
+
+        // Specular only: the diffuse term reuses the game's own per-pixel light model (see shadeNormal),
+        // so material surfaces keep the scene's tone and only gain relief and highlights.
+        vec3 materialSpecular(vec3 n, float roughness, float weight, bool hdrLit) {
+            vec3 v = -vViewPos / max(length(vViewPos), 0.0001);
+            float nv = max(dot(n, v), 0.001);
+            float a2 = pow(roughness, 4.0);
+            float sun = hdrLit ? uHdrSun : 1.0;
+            vec3 result = vec3(0.0);
+            for (int i = 0; i < uLightCount; ++i) {
+                vec3 l;
+                float attenuation = sun;
+                if (uLightPositional[i] != 0) {
+                    vec3 delta = uLightPos[i] - vViewPos;
+                    float dist = length(delta);
+                    l = delta / max(dist, 0.0001);
+                    // Retain the game's animated light set and attenuation coefficients.
+                    float d2 = max(dot(delta.xy, delta.xy) + 2.0 * delta.z * delta.z, 0.000001);
+                    float distf = mix(floor(sqrt(d2)), sqrt(d2), uPointLightQuality);
+                    attenuation = 1.0 / (1.0 + (distf * uLightAtten[i].x * 2.0 +
+                        distf * distf * uLightAtten[i].y / 8.0) / 65535.0);
+                } else {
+                    l = normalize(uViewMatrix * uLightDir[i]);
+                }
+                float nl = max(dot(n, l), 0.0);
+                vec3 h = (v + l) / max(length(v + l), 0.0001);
+                float nh = max(dot(n, h), 0.0);
+                float vh = max(dot(v, h), 0.0);
+                float denom = nh * nh * (a2 - 1.0) + 1.0;
+                // GGX/Smith/Schlick dielectric. The game's irradiance is Lambert without 1/pi, so the
+                // specular is pi-scaled to stay in the same radiometric convention.
+                float d = a2 / max(denom * denom, 0.00001);
+                float gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);
+                float gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);
+                float visibility = 0.5 / max(gv + gl, 0.00001);
+                float fresnel = 0.04 + 0.96 * pow(1.0 - vh, 5.0);
+                float f = fresnel * min(uMaterialStrength, 1.0) * weight;
+                result += vec3(f * d * visibility) * (uLightColor[i] / 255.0) * nl * attenuation;
+            }
+            return max(result, vec3(0.0));
         }
     @end
 
@@ -259,24 +338,6 @@
     #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
 
     void main() {
-        @if(o_per_pixel_lighting)
-            vec3 newDawnLit = newDawnShade();
-            bool hdrDiffuse = uHdrWorld && ((uShadeMask & @{hdr_diffuse_mask}) != 0);
-            if (hdrDiffuse) newDawnLit = vec3(1.0);
-            @for(i in 0..o_inputs)
-                @if(o_alpha)
-                    vec4 vInputShaded@{i + 1} = vInput@{i + 1};
-                    if ((uShadeMask & (1 << @{i})) != 0) {
-                        vInputShaded@{i + 1}.rgb = newDawnLit;
-                    }
-                @else
-                    vec3 vInputShaded@{i + 1} = vInput@{i + 1};
-                    if ((uShadeMask & (1 << @{i})) != 0) {
-                        vInputShaded@{i + 1} = newDawnLit;
-                    }
-                @end
-            @end
-        @end
         @for(i in 0..2)
             @if(o_textures[i])
                 @{s = o_clamp[i][0]}
@@ -322,7 +383,47 @@
             @end
         @end
 
-        @if(o_alpha) 
+        @if(o_material_maps)
+            float materialWeight = 1.0;
+            @if(material_blend)
+                materialWeight = clamp(vInput@{material_weight_index}.r, 0.0, 1.0);
+                @if(material_weight_invert)
+                    materialWeight = 1.0 - materialWeight;
+                @end
+            @end
+            float materialVariance;
+            vec3 materialN = materialNormal(vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}, materialWeight, materialVariance);
+            float materialRoughness = textureGrad(uMaterialRoughness, vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}).r;
+            materialRoughness = clamp(sqrt(materialRoughness * materialRoughness + min(materialVariance, 0.5)), 0.3, 1.0);
+            bool materialDiffuse = ((uShadeMask & @{material_diffuse_mask}) != 0) && materialWeight > 0.0;
+        @end
+
+        @if(o_per_pixel_lighting)
+            // Material surfaces light the perturbed normal (back in model space) with the game's own
+            // per-pixel model; everything else keeps the interpolated vertex normal.
+            vec3 shadeNormal = vNormal;
+            @if(o_material_maps)
+                if (materialDiffuse) shadeNormal = normalize(transpose(uViewMatrix) * materialN) * length(vNormal);
+            @end
+            vec3 newDawnLit = newDawnShade(shadeNormal);
+            bool hdrDiffuse = uHdrWorld && ((uShadeMask & @{hdr_diffuse_mask}) != 0);
+            if (hdrDiffuse) newDawnLit = vec3(1.0);
+            @for(i in 0..o_inputs)
+                @if(o_alpha)
+                    vec4 vInputShaded@{i + 1} = vInput@{i + 1};
+                    if ((uShadeMask & (1 << @{i})) != 0) {
+                        vInputShaded@{i + 1}.rgb = newDawnLit;
+                    }
+                @else
+                    vec3 vInputShaded@{i + 1} = vInput@{i + 1};
+                    if ((uShadeMask & (1 << @{i})) != 0) {
+                        vInputShaded@{i + 1} = newDawnLit;
+                    }
+                @end
+            @end
+        @end
+
+        @if(o_alpha)
             vec4 texel;
         @else 
             vec3 texel;
@@ -372,9 +473,16 @@
         if (uHdrWorld) {
             texel.rgb = hdrDecode(texel.rgb) * uHdrSky;
             @if(o_per_pixel_lighting)
-                if (hdrDiffuse) texel.rgb *= newDawnIrradiance();
+                if (hdrDiffuse) texel.rgb *= newDawnIrradiance(shadeNormal);
             @end
         }
+        @if(o_material_maps)
+            if (materialDiffuse) {
+                vec3 specular = materialSpecular(materialN, materialRoughness, materialWeight, hdrDiffuse);
+                if (uHdrWorld) texel.rgb += specular;
+                else texel.rgb = fromLinear(vec4(hdrDecode(texel.rgb) + specular, 1.0)).rgb;
+            }
+        @end
         // TODO discard if alpha is 0?
         @if(o_fog)
             @if(o_alpha)

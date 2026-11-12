@@ -38,6 +38,8 @@
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/Utils.h"
+#include "ship/resource/archive/Archive.h"
+#include <nlohmann/json.hpp>
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 
@@ -435,6 +437,15 @@ void Interpreter::GenerateCC(ColorCombiner* comb, const ColorCombinerKey& key) {
     comb->usedTextures[1] = usedTextures[1];
     // comb->prg = gfx_lookup_or_create_mShaderProgram(shader_id0, shader_id1);
     memcpy(comb->shader_input_mapping, shaderInputMapping, sizeof(shaderInputMapping));
+    CCFeatures features{};
+    gfx_cc_get_features(shaderId0, shaderId1, &features);
+    comb->materialShadeMask = NewDawnMaterialShadeMask(features, comb->materialBlend);
+    uint32_t shadeMask = 0;
+    for (int j = 0; j < 7; ++j) {
+        if (shaderInputMapping[0][j] == G_CCMUX_SHADE)
+            shadeMask |= 1u << j;
+    }
+    comb->materialShadeMask &= shadeMask;
 }
 
 ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& key) {
@@ -573,6 +584,123 @@ void Interpreter::PumpAltTextureLoads() {
     }
 }
 
+// Companions are optional: flat shading is valid while reads/validation are pending. Albedo
+// resolution still uses ResolveTextureResource, including its synchronous mod-only rule.
+void Interpreter::PumpMaterialLoads() {
+    for (auto it = mPendingMaterials.begin(); it != mPendingMaterials.end();) {
+        if (it->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        mMaterials[it->first] = it->second.get();
+        it = mPendingMaterials.erase(it);
+    }
+}
+
+bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
+    const auto& loaded = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+    auto albedo = loaded.raw_tex_metadata.resource;
+    // Full-image companions cannot describe a cropped/subloaded tile or a framebuffer mirror.
+    if (!albedo || mFbTextures.contains((uintptr_t)loaded.addr) || loaded.addr != albedo->ImageData ||
+        !(albedo->Flags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) ||
+        loaded.raw_tex_metadata.h_byte_scale != albedo->HByteScale ||
+        loaded.raw_tex_metadata.v_pixel_scale != albedo->VPixelScale) {
+        return false;
+    }
+    const auto& path = albedo->GetInitData()->Path;
+    if (!path.starts_with("alt/scenes/"))
+        return false;
+    auto found = mMaterials.find(albedo.get());
+    if (found == mMaterials.end()) {
+        if (mPendingMaterials.contains(albedo.get()) || mPendingMaterials.size() >= 4)
+            return false;
+        auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+        if (!rm->GetArchiveManager()->HasFile(path + "_n") || !rm->GetArchiveManager()->HasFile(path + "_r")) {
+            mMaterials.emplace(albedo.get(), MaterialMaps{ albedo, nullptr, nullptr });
+            return false;
+        }
+        auto archive = rm->GetArchiveManager()->GetArchiveFromFile(path + "_n");
+        if (!archive || archive != rm->GetArchiveManager()->GetArchiveFromFile(path + "_r")) {
+            mMaterials.emplace(albedo.get(), MaterialMaps{ albedo, nullptr, nullptr });
+            return false;
+        }
+        auto normal = rm->LoadResourceAsync(path + "_n", true);
+        auto roughness = rm->LoadResourceAsync(path + "_r", true);
+        // Hashing a large albedo and reading the small recipe must never block a draw. Resource
+        // reads themselves share the existing resource pool used by asynchronous alt textures.
+        mPendingMaterials.emplace(
+            albedo.get(), std::async(std::launch::async, [albedo, normal, roughness, path, archive]() {
+                MaterialMaps result{ albedo, nullptr, nullptr };
+                try {
+                    auto n = std::dynamic_pointer_cast<Fast::Texture>(normal.get());
+                    auto r = std::dynamic_pointer_cast<Fast::Texture>(roughness.get());
+                    auto valid = [](const std::shared_ptr<Fast::Texture>& t) {
+                        return t && t->Type == Fast::TextureType::GrayscaleAlpha16bpp && t->Flags == 0 &&
+                               t->Width > 0 && t->Height > 0 && t->ImageDataSize == uint64_t(t->Width) * t->Height * 2;
+                    };
+                    if (!valid(n) || !valid(r) || n->Width != r->Width || n->Height != r->Height)
+                        return result;
+                    auto file = archive->LoadFile("newdawn-materials.json");
+                    if (!file || !file->Buffer)
+                        return result;
+                    auto metadata = nlohmann::json::parse(file->Buffer->begin(), file->Buffer->end());
+                    for (const auto& entry : metadata.at("materials")) {
+                        if ("alt/" + entry.at("resource").get<std::string>() != path)
+                            continue;
+                        // FNV-1a of decoded RGBA8 plus dimensions/scales ties maps to the winning
+                        // albedo without another archive read. SHA-256 of the original stays in the recipe.
+                        if (albedo->ImageDataSize != uint64_t(albedo->Width) * albedo->Height * 4 ||
+                            entry.at("source_size") != nlohmann::json::array({ albedo->Width, albedo->Height }) ||
+                            entry.at("output_size") != nlohmann::json::array({ n->Width, n->Height }) ||
+                            entry.at("source_h_byte_scale").get<float>() != albedo->HByteScale ||
+                            entry.at("source_v_pixel_scale").get<float>() != albedo->VPixelScale)
+                            return result;
+                        uint64_t hash = 14695981039346656037ULL;
+                        for (uint32_t i = 0; i < albedo->ImageDataSize; ++i)
+                            hash = (hash ^ albedo->ImageData[i]) * 1099511628211ULL;
+                        if (std::stoull(entry.at("source_pixels_fnv1a64").get<std::string>(), nullptr, 16) != hash)
+                            return result;
+                        result.normal = n;
+                        result.roughness = r;
+                        SPDLOG_INFO("NewDawn material ready: {}", path);
+                        break;
+                    }
+                } catch (const std::exception& e) { SPDLOG_WARN("NewDawn material skipped {}: {}", path, e.what()); }
+                return result;
+            }));
+        return false;
+    }
+    const MaterialMaps& maps = found->second;
+    if (!maps.normal || !maps.roughness)
+        return false;
+    const TextureCacheNode* base = mRenderingState.mTextures[albedoSlot];
+    if (!base)
+        return false;
+    const uint8_t cms = base->second.cms, cmt = base->second.cmt;
+    // These slots go idle immediately when a draw is ineligible; they still participate in LRU accounting.
+    for (int slot = MATERIAL_NORMAL_TEXTURE; slot <= MATERIAL_ROUGHNESS_TEXTURE; ++slot) {
+        const auto& texture = slot == MATERIAL_NORMAL_TEXTURE ? maps.normal : maps.roughness;
+        TextureCacheKey key{ texture->ImageData, {}, 0, 0, 0, texture->ImageDataSize };
+        if (!mRenderingState.mTextures[slot] || mRenderingState.mTextures[slot]->first != key) {
+            Flush();
+            if (!TextureCacheLookup(slot, key)) {
+                mRapi->UploadMaterialTexture(texture->ImageData, texture->Width, texture->Height);
+                mRapi->BuildMipmaps();
+            }
+        }
+        auto& state = mRenderingState.mTextures[slot]->second;
+        if (!state.linear_filter || state.cms != cms || state.cmt != cmt) {
+            Flush();
+            mRapi->SetSamplerParameters(slot, true, cms, cmt);
+            state.linear_filter = true;
+            state.cms = cms;
+            state.cmt = cmt;
+        }
+        UpdateTextureCacheSize(slot);
+    }
+    return true;
+}
+
 void Interpreter::TextureCacheClear() {
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
@@ -582,6 +710,8 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.total_bytes = 0;
     mTextureCache.eviction_count = 0;
     mResolvedResourceCache.clear();
+    mPendingMaterials.clear();
+    mMaterials.clear();
     // Pre-allocate buckets so the map never rehashes during normal operation.
     // Rehashing invalidates all iterators, including those stored in LRU entries.
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
@@ -634,7 +764,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
 }
 
 bool Interpreter::TextureCacheNodeInUse(const TextureCacheNode* node) const {
-    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+    for (int i = 0; i < MATERIAL_TEXTURE_SLOTS; i++) {
         if (mRenderingState.mTextures[i] == node) {
             return true;
         }
@@ -651,7 +781,7 @@ bool Interpreter::EvictOneTextureCacheEntry(const TextureCacheNode* protect) {
 
         mTextureCache.total_bytes -= node->second.byte_size;
         mTextureCache.free_texture_ids.push_back(node->second.texture_id);
-        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        for (int i = 0; i < MATERIAL_TEXTURE_SLOTS; i++) {
             if (mRenderingState.mTextures[i] == node) {
                 mRenderingState.mTextures[i] = nullptr;
             }
@@ -716,7 +846,7 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
         bool again = false;
         for (auto it = mTextureCache.map.begin(bucket); it != mTextureCache.map.end(bucket); ++it) {
             if (it->first.texture_addr == origAddr) {
-                for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+                for (int j = 0; j < MATERIAL_TEXTURE_SLOTS; j++) {
                     if (mRenderingState.mTextures[j] == &*it)
                         mRenderingState.mTextures[j] = nullptr;
                 }
@@ -2313,6 +2443,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
+    const bool materialCandidate =
+        mMaterialsEnabled && per_pixel_lighting && !is_rect && !use_alpha && !texture_edge && !zmode_decal &&
+        !use_grayscale && !use_prim_depth && (mRsp->geometry_mode & G_TEXTURE_GEN) == 0 && mRendersToFb && !mFbActive &&
+        comb->usedTextures[0] && !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[1].masked &&
+        !mRdp->loaded_texture[0].blended && !mRdp->loaded_texture[1].blended && mShaderStack.empty();
+
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
     uint32_t effective_tile[2];
@@ -2449,6 +2585,39 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 UpdateTextureCacheSize(SHADER_FIRST_REPLACEMENT_TEXTURE + i);
             }
         }
+    }
+
+    bool materialReady = false;
+    int materialTile = 0;
+    bool materialBlend = false;
+    if (materialCandidate) {
+        auto a = mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].raw_tex_metadata.resource;
+        auto b = mRdp->loaded_texture[mRdp->texture_tile[effective_tile[1]].tmem_index].raw_tex_metadata.resource;
+        if (comb->materialShadeMask) {
+            materialBlend = comb->materialBlend && a != b;
+            // For a real two-albedo blend use that tile's UV and blend weight. LOD aliases
+            // share the primary map; unrelated tiles never borrow one another's coordinates.
+            materialReady = BindMaterialMaps(effective_tile[0], 0);
+            if (!materialReady && comb->usedTextures[1] && a != b) {
+                materialTile = 1;
+                materialReady = BindMaterialMaps(effective_tile[1], 1);
+            }
+        }
+    }
+    if (materialReady) {
+        key.options |= SHADER_OPT(MATERIAL_MAPS);
+        if (materialTile == 1)
+            key.options |= SHADER_OPT(MATERIAL_MAPS_TILE1);
+        if (materialBlend)
+            key.options |= SHADER_OPT(MATERIAL_MAPS_BLEND);
+        // Variants have the same input/UV layout as their base. Do not move mPrevCombiner
+        // away from that base: bouncing between the two would flush every material triangle.
+        auto variant = mColorCombinerPool.find(key);
+        if (variant == mColorCombinerPool.end()) {
+            variant = mColorCombinerPool.emplace(key, ColorCombiner{}).first;
+            GenerateCC(&variant->second, key);
+        }
+        comb = &variant->second;
     }
 
     struct ShaderProgram* prg = comb->prg[tm];
@@ -5566,6 +5735,11 @@ void Interpreter::StartFrame() {
     mPerPixelLightingEnabled =
         mRapi->SupportsPerPixelLighting() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.PerPixel", 0) != 0;
+    mMaterialsEnabled =
+        mPerPixelLightingEnabled && mRapi->SupportsMaterialMaps() &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Enabled", 0) != 0 &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.Strength", 1.0f) > 0.0f;
+    PumpMaterialLoads();
     mAlphaToCoverageEnabled =
         mRapi->SupportsAlphaToCoverage() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AlphaToCoverage", 1) != 0;
@@ -5911,6 +6085,38 @@ void Interpreter::GetCurDimensions(uint32_t* width, uint32_t* height) {
 
 } // namespace Fast
 
+// Only diffuse combiners with a separable shade input are material-compatible. The two-tile
+// cases are an albedo blend (including LOD aliases), or albedo multiplied by a detail texture.
+uint32_t NewDawnMaterialShadeMask(const CCFeatures& f, bool& twoAlbedoBlend) {
+    twoAlbedoBlend = false;
+    auto inputBit = [](int x) -> uint32_t { return x >= SHADER_INPUT_1 && x <= SHADER_INPUT_7 ? 1u << (x - 1) : 0; };
+    const auto& a = f.c[0][0];
+    uint32_t first = 0;
+    if (f.do_multiply[0][0]) {
+        if (a[0] == SHADER_TEXEL0)
+            first = inputBit(a[2]);
+        else if (a[2] == SHADER_TEXEL0)
+            first = inputBit(a[0]);
+    }
+    if (!f.opt_2cyc)
+        return first;
+    const auto& b = f.c[1][0];
+    if (f.do_single[1][0] && b[3] == SHADER_COMBINED)
+        return first;
+    if (!f.do_multiply[1][0])
+        return 0;
+    uint32_t second = b[0] == SHADER_COMBINED ? inputBit(b[2]) : b[2] == SHADER_COMBINED ? inputBit(b[0]) : 0;
+    if (first && second)
+        return first ^ second;
+    bool twoTextures =
+        (a[0] == SHADER_TEXEL0 && a[2] == SHADER_TEXEL1) || (a[0] == SHADER_TEXEL1 && a[2] == SHADER_TEXEL0);
+    if (f.do_multiply[0][0] && twoTextures)
+        return second;
+    twoAlbedoBlend = f.do_mix[0][0] && ((a[0] == SHADER_TEXEL1 && a[1] == SHADER_TEXEL0) ||
+                                        (a[0] == SHADER_TEXEL0 && a[1] == SHADER_TEXEL1));
+    return twoAlbedoBlend ? second : 0;
+}
+
 void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeatures* cc_features) {
     for (int i = 0; i < 2; i++) {
         for (int j = 0; j < 2; j++) {
@@ -5931,6 +6137,9 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_prim_depth = (shader_id1 & SHADER_OPT(PRIM_DEPTH)) != 0;
     cc_features->opt_per_pixel_lighting = (shader_id1 & SHADER_OPT(PER_PIXEL_LIGHTING)) != 0;
+    cc_features->opt_material_maps = (shader_id1 & SHADER_OPT(MATERIAL_MAPS)) != 0;
+    cc_features->opt_material_tile1 = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_TILE1)) != 0;
+    cc_features->opt_material_blend = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_BLEND)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
