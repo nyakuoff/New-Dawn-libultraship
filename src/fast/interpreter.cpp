@@ -1928,7 +1928,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         float world_pos[3] = { 0.0 };
         // Per-pixel lighting needs the view-space position for point lights; shadows need world positions for
         // every caster, lit or not.
-        const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
+        const bool per_pixel_lighting =
+            (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
@@ -2281,7 +2282,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     // New Dawn: replace the CPU vertex-shaded colour with a per-fragment light calculation.
-    const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
+    const bool per_pixel_lighting =
+        (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
     if (per_pixel_lighting) {
         cc_options |= SHADER_OPT(PER_PIXEL_LIGHTING);
     }
@@ -5552,7 +5554,10 @@ void Interpreter::StartFrame() {
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Enabled", 0) != 0;
     const bool waterEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.Enabled", 0) != 0;
-    mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled || waterEnabled);
+    mPostFxActive =
+        mRapi->PostFxAvailable() &&
+        (postFxEnabled || shadowsEnabled || waterEnabled ||
+         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Enabled", 0) != 0);
     mShadowRecording = false;
     mShadowOverflowLogged = false;
     mShadowVertices.clear();
@@ -5678,6 +5683,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    mRapi->FinishWorld(); // also closes a partial/debugger display-list walk
     if (mRenderingState.alpha_to_coverage) {
         mRapi->SetAlphaToCoverage(false); // never leak into the post passes, the resolve or the UI
         mRenderingState.alpha_to_coverage = false;

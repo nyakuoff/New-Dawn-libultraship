@@ -122,6 +122,14 @@
         @end
     @end
 
+    uniform bool uHdrWorld;
+    uniform float uHdrSun;
+    uniform float uHdrAmbient;
+    vec3 hdrDecode(vec3 c) {
+        c = max(c, vec3(0.0));
+        return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+    }
+
     @if(o_per_pixel_lighting)
         @{attr} vec3 vNormal;
         @{attr} vec3 vViewPos;
@@ -143,6 +151,27 @@
         // colour with the same arithmetic evaluated per fragment. Values are kept in the 0..255
         // range the CPU uses, including its per-light truncation, so parity is exact where the
         // interpolated normal and position are constant across a triangle.
+        vec3 newDawnIrradiance() {
+            vec3 n = vNormal / max(length(vNormal), 0.0001);
+            vec3 lit = (uLightAmbient / 255.0) * uHdrAmbient;
+            for (int i = 0; i < uLightCount; ++i) {
+                float intensity;
+                if (uLightPositional[i] != 0) {
+                    vec3 d = uLightPos[i] - vViewPos;
+                    float d2 = max(dot(d.xy, d.xy) + 2.0 * d.z * d.z, 0.000001);
+                    float dist = sqrt(d2);
+                    vec3 lm = transpose(uViewMatrix) * d;
+                    float attenuation = 1.0 +
+                        (dist * uLightAtten[i].x * 2.0 + d2 * uLightAtten[i].y / 8.0) / 65535.0;
+                    intensity = clamp(dot(n, clamp(508.0 * lm / d2, -127.0, 127.0)), 0.0, 1.0) / attenuation;
+                } else {
+                    intensity = max(dot(n, uLightDir[i]), 0.0) * uHdrSun;
+                }
+                lit += intensity * uLightColor[i] / 255.0;
+            }
+            return max(lit, vec3(0.0));
+        }
+
         vec3 newDawnShade() {
             vec3 lit = uLightAmbient;
             for (int i = 0; i < uLightCount; i++) {
@@ -230,6 +259,8 @@
     void main() {
         @if(o_per_pixel_lighting)
             vec3 newDawnLit = newDawnShade();
+            bool hdrDiffuse = uHdrWorld && ((uShadeMask & @{hdr_diffuse_mask}) != 0);
+            if (hdrDiffuse) newDawnLit = vec3(1.0);
             @for(i in 0..o_inputs)
                 @if(o_alpha)
                     vec4 vInputShaded@{i + 1} = vInput@{i + 1};
@@ -336,12 +367,18 @@
 
         texel = WRAP(texel, -0.51, 1.51);
         texel = clamp(texel, 0.0, 1.0);
+        if (uHdrWorld) {
+            texel.rgb = hdrDecode(texel.rgb);
+            @if(o_per_pixel_lighting)
+                if (hdrDiffuse) texel.rgb *= newDawnIrradiance();
+            @end
+        }
         // TODO discard if alpha is 0?
         @if(o_fog)
             @if(o_alpha)
-                texel = vec4(mix(texel.rgb, vFog.rgb, vFog.a), texel.a);
+                texel = vec4(mix(texel.rgb, uHdrWorld ? hdrDecode(vFog.rgb) : vFog.rgb, vFog.a), texel.a);
             @else
-                texel = mix(texel, vFog.rgb, vFog.a);
+                texel = mix(texel, uHdrWorld ? hdrDecode(vFog.rgb) : vFog.rgb, vFog.a);
             @end
         @end
 
@@ -361,7 +398,7 @@
 
         @if(o_grayscale)
             float intensity = (texel.r + texel.g + texel.b) / 3.0;
-            vec3 new_texel = vGrayscaleColor.rgb * intensity;
+            vec3 new_texel = (uHdrWorld ? hdrDecode(vGrayscaleColor.rgb) : vGrayscaleColor.rgb) * intensity;
             texel.rgb = mix(texel.rgb, new_texel, vGrayscaleColor.a);
         @end
 
@@ -378,7 +415,7 @@
         @end
 
         @if(srgb_mode)
-            @{vOutColor} = fromLinear(@{vOutColor});
+            if (!uHdrWorld) @{vOutColor} = fromLinear(@{vOutColor});
         @end
 
         @if(o_prim_depth)
