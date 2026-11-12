@@ -5551,7 +5551,8 @@ void Interpreter::StartFrame() {
     const bool shadowsEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Enabled", 0) != 0;
     const bool waterEnabled =
-        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.Enabled", 0) != 0;
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.Enabled", 0) != 0 ||
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.Reflections", 0) != 0;
     mPostFxActive = mRapi->PostFxAvailable() && (postFxEnabled || shadowsEnabled || waterEnabled);
     mShadowRecording = false;
     mShadowOverflowLogged = false;
