@@ -54,11 +54,11 @@ std::stack<std::string> currentDir;
 #define SUPPORT_CHECK(x) assert(x)
 
 // SCALE_M_N: upscale/downscale M-bit integer to N-bit
-#define SCALE_5_8(VAL_) (((VAL_)*0xFF) / 0x1F)
+#define SCALE_5_8(VAL_) (((VAL_) * 0xFF) / 0x1F)
 #define SCALE_8_5(VAL_) ((((VAL_) + 4) * 0x1F) / 0xFF)
-#define SCALE_4_8(VAL_) ((VAL_)*0x11)
+#define SCALE_4_8(VAL_) ((VAL_) * 0x11)
 #define SCALE_8_4(VAL_) ((VAL_) / 0x11)
-#define SCALE_3_8(VAL_) ((VAL_)*0x24)
+#define SCALE_3_8(VAL_) ((VAL_) * 0x24)
 #define SCALE_8_3(VAL_) ((VAL_) / 0x24)
 
 // Based off the current set native dimensions or active framebuffer
@@ -523,11 +523,20 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char*
         return rm->LoadResourceProcess(path, true);
     }
 
+    // Whatever we draw until the alternate texture arrives has to exist: a mod can ship an
+    // alternate texture for a path the base archives never had (3DS Link, new equipment, ...).
+    // There is nothing to fall back to in that case, so take the old synchronous path instead of
+    // returning a null texture. The check is an archive index lookup, not a load.
+    const bool altLoadStarted = mPendingAltTextures.find(altPath) != mPendingAltTextures.end();
+    const bool baseExists = rm->GetArchiveManager()->HasFile(std::string(pathView));
+    if (!altLoadStarted && !baseExists) {
+        return rm->LoadResourceProcess(path);
+    }
+
     // Background reads are best-effort: keep only a few in flight so they do not starve the render
     // thread's own work (uploading and converting the textures that are already available).
     static constexpr size_t kMaxAltLoadsInFlight = 4;
-    if (mPendingAltTextures.find(altPath) == mPendingAltTextures.end() &&
-        mPendingAltTextures.size() < kMaxAltLoadsInFlight) {
+    if (!altLoadStarted && mPendingAltTextures.size() < kMaxAltLoadsInFlight) {
         mPendingAltTextures[altPath] = rm->LoadResourceAsync(altPath, true);
     }
 
