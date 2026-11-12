@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <unordered_map>
 
@@ -19,6 +21,7 @@
 #endif
 
 #include "fast/backends/gfx_opengl.h"
+#include "fast/backends/gfx_opengl_postfx.h"
 #include "ship/window/gui/Gui.h"
 #include <prism/processor.h>
 #include <fstream>
@@ -28,6 +31,10 @@
 #include "ship/config/ConsoleVariable.h"
 
 namespace Fast {
+// Defined here, where PostFxGL is a complete type
+GfxRenderingAPIOGL::GfxRenderingAPIOGL() = default;
+GfxRenderingAPIOGL::~GfxRenderingAPIOGL() = default;
+
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
@@ -741,6 +748,11 @@ void GfxRenderingAPIOGL::Init() {
     mPixelDepthRbSize = 1;
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+
+#ifndef USE_OPENGLES
+    mPostFx = std::make_unique<PostFxGL>();
+    mPostFx->Init();
+#endif
 }
 
 void GfxRenderingAPIOGL::OnResize() {
@@ -1026,16 +1038,27 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
 
     FramebufferOGL& fb = mFrameBuffers[fb_id];
 
+    // Pixel (x, y) of the image with a bottom-left origin, as a position in this framebuffer. The framebuffers the
+    // game renders to are stored vertically flipped, so row y of the image lives at row height - 1 - y. Clamped,
+    // since the flipped lookup would otherwise read outside the framebuffer.
+    auto pixelPos = [&fb](float fx, float fy, int& x, int& y) {
+        x = (int)fx;
+        y = (int)fy;
+        if (fb.invertY) {
+            x = std::clamp((int)floorf(fx), 0, (int)fb.width - 1);
+            y = (int)fb.height - 1 - std::clamp((int)floorf(fy), 0, (int)fb.height - 1);
+        }
+    };
+
     // When looking up one value and the framebuffer is single-sampled, we can read pixels directly
     // Otherwise we need to blit first to a new buffer then read it
     if (coordinates.size() == 1 && fb.msaa_level <= 1) {
-        uint32_t depth_stencil_value;
+        uint32_t depth_stencil_value = 0;
         glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
-        int x = coordinates.begin()->first;
-        int y = coordinates.begin()->second;
+        int x, y;
+        pixelPos(coordinates.begin()->first, coordinates.begin()->second, x, y);
 #ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
-        glReadPixels(x, fb.invertY ? fb.height - y : y, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8,
-                     &depth_stencil_value);
+        glReadPixels(x, y, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, &depth_stencil_value);
 #endif
         res.emplace(*coordinates.begin(), (depth_stencil_value >> 18) << 2);
     } else {
@@ -1060,11 +1083,8 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         {
             size_t i = 0;
             for (const auto& coord : coordinates) {
-                int x = coord.first;
-                int y = coord.second;
-                if (fb.invertY) {
-                    y = fb.height - y;
-                }
+                int x, y;
+                pixelPos(coord.first, coord.second, x, y);
                 glBlitFramebuffer(x, y, x + 1, y + 1, i, 0, i + 1, 1, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
                                   GL_NEAREST);
                 ++i;
@@ -1072,7 +1092,7 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         }
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, mPixelDepthFb);
-        std::vector<uint32_t> depth_stencil_values(coordinates.size());
+        std::vector<uint32_t> depth_stencil_values(coordinates.size(), 0);
 #ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
         glReadPixels(0, 0, coordinates.size(), 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, depth_stencil_values.data());
 #endif
@@ -1084,7 +1104,7 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         }
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
     return res;
 }
@@ -1104,6 +1124,22 @@ void GfxRenderingAPIOGL::SetSrgbMode() {
 
 ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
     return reinterpret_cast<ImTextureID>(id);
+}
+
+bool GfxRenderingAPIOGL::PostFxAvailable() {
+#ifndef USE_OPENGLES
+    return mPostFx != nullptr && mPostFx->Usable();
+#else
+    return false;
+#endif
+}
+
+void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
+#ifndef USE_OPENGLES
+    if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
+        mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount);
+    }
+#endif
 }
 } // namespace Fast
 #endif

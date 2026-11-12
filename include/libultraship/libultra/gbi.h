@@ -197,6 +197,7 @@
 #define G_SETTILESIZE_INTERP 0x45
 #define G_SETTARGETINTERPINDEX 0x46
 #define G_SETTILESIZE_LERP 0x4a
+#define G_NEWDAWN_POSTFX 0x4b
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2853,6 +2854,14 @@ typedef union Gfx {
         Gfx* _g0 = (Gfx*)(pkt);                       \
                                                       \
         _g0->words.w0 = _SHIFTL(G_POP_SHADER, 24, 8); \
+    }
+
+#define gSPNewDawnPostFx(pkt, stage, params)                                         \
+    {                                                                            \
+        Gfx* _g0 = (Gfx*)(pkt);                                                  \
+                                                                                 \
+        _g0->words.w0 = _SHIFTL(G_NEWDAWN_POSTFX, 24, 8) | _SHIFTL((stage), 0, 8);   \
+        _g0->words.w1 = (uintptr_t)(params);                                     \
     }
 
 #define gSPExtraGeometryMode(pkt, c, s)                                                 \

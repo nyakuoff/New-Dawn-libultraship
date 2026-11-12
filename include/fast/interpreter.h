@@ -389,6 +389,10 @@ class Interpreter {
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();
+    // True when the game framebuffer is window sized (MSAA with a viewport matching the render resolution), as
+    // opposed to being sized to the render resolution. Forcing the offscreen path for post-processing selects the
+    // latter.
+    bool GameFbIsWindowSized();
     int GetTargetFps();
     void SetTargetFps(int fps);
     void SetMaxFrameLatency(int latency);
@@ -536,6 +540,7 @@ class Interpreter {
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
+    bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 
