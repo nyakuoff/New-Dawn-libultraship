@@ -35,4 +35,9 @@ typedef struct NewDawnPostFxParams {
     float shadowFlipY;
     float shadowViewProj[16];
     float shadowInvViewProj[16];
+
+    /* New Dawn sun shafts: raymarched in-scattering through the shadow map. Only used when shadowEnabled is set. */
+    int32_t shaftEnabled;
+    float shaftStrength;     /* already multiplied by the sun-height and sun-colour fades */
+    float shaftFogColor[3];  /* 0..1, the game's fog colour */
 } NewDawnPostFxParams;
