@@ -466,11 +466,7 @@ void main() {
     vec3 dy = useU ? (Pu - P) : (P - Pd);
     vec3 n = cross(dx, dy);
     float nl = length(n);
-    if (nl < 1e-8) {
-        oColor = vec4(texture(uColor, vUv).rgb, 1.0);
-        return;
-    }
-    vec3 N = n / nl;
+    vec3 N = (nl > 1e-8) ? (n / nl) : vec3(0.0, 1.0, 0.0);
     if (dot(N, uCameraEye - P) < 0.0) {
         N = -N;
     }
