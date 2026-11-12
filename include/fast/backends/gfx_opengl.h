@@ -24,7 +24,11 @@
 #define GL_GLEXT_PROTOTYPES 1
 #include <SDL2/SDL_opengl.h>
 #endif
+#include <memory>
+
 namespace Fast {
+class PostFxGL;
+
 struct ShaderProgram {
     GLuint openglProgramId;
     uint8_t numInputs;
@@ -58,7 +62,8 @@ struct TextureInfo {
 
 class GfxRenderingAPIOGL final : public GfxRenderingAPI {
   public:
-    ~GfxRenderingAPIOGL() override = default;
+    GfxRenderingAPIOGL();
+    ~GfxRenderingAPIOGL() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
@@ -104,6 +109,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool PostFxAvailable() override;
+    void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -138,6 +145,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+#ifndef USE_OPENGLES
+    std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
+#endif
 };
 
 } // namespace Fast

@@ -29,6 +29,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/lus_gbi.h"
+#include "fast/newdawn_postfx.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
@@ -2301,8 +2302,7 @@ void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
         area->x *= RATIO_X(mActiveFrameBuffer, mCurDimensions);
         area->y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
 
-        if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                              mCurDimensions.height == mGameWindowViewport.height)) {
+        if (!mRendersToFb || GameFbIsWindowSized()) {
             area->x += mGameWindowViewport.x;
             area->y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
         }
@@ -4153,6 +4153,18 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->Flush();
+    // Only ever post-process the game framebuffer itself
+    if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive && cmd->words.w1 != 0) {
+        gfx->mRapi->RunPostFx(C0(0, 8), *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1), gfx->mGameFb);
+    }
+    return false;
+}
+
 bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4724,6 +4736,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
+    { OTR_G_NEWDAWN_POSTFX, { "G_NEWDAWN_POSTFX", gfx_newdawn_postfx_handler_custom } },
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
@@ -5037,6 +5050,11 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 #endif
 }
 
+bool Interpreter::GameFbIsWindowSized() {
+    return mMsaaLevel > 1 && !mPostFxActive && mCurDimensions.width == mGameWindowViewport.width &&
+           mCurDimensions.height == mGameWindowViewport.height;
+}
+
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
@@ -5066,9 +5084,13 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    // Post-processing needs the game rendered offscreen even when the window could be rendered to directly
+    mPostFxActive = mRapi->PostFxAvailable() &&
+                    Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Enabled", 1) != 0;
+    const bool renderSizedFb = !ViewportMatchesRendererResolution() || mPostFxActive;
+    if (renderSizedFb || mMsaaLevel > 1) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        if (renderSizedFb) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {
@@ -5077,7 +5099,7 @@ void Interpreter::StartFrame() {
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
                                                mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        if (mMsaaLevel > 1 && renderSizedFb) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
         }
@@ -5112,7 +5134,7 @@ void Interpreter::RunGuiOnly() {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (!ViewportMatchesRendererResolution() || mPostFxActive) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -5177,7 +5199,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (!ViewportMatchesRendererResolution() || mPostFxActive) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
@@ -5255,8 +5277,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 
     // When rendering to the main window buffer or MSAA is enabled with a buffer size equal to the view port,
     // then the source coordinates must account for any docked ImGui elements
-    if (fb_src_id == 0 || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                           mCurDimensions.height == mGameWindowViewport.height)) {
+    if (fb_src_id == 0 || GameFbIsWindowSized()) {
         srcX0 = mGameWindowViewport.x;
         srcY0 = mGameWindowViewport.y;
         srcX1 = mGameWindowViewport.x + mGameWindowViewport.width;
@@ -5289,8 +5310,7 @@ void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
     x = x * RATIO_X(mActiveFrameBuffer, mCurDimensions) -
         (mNativeDimensions.width * RATIO_X(mActiveFrameBuffer, mCurDimensions) - mCurDimensions.width) / 2;
     y *= RATIO_Y(mActiveFrameBuffer, mCurDimensions);
-    if (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                          mCurDimensions.height == mGameWindowViewport.height)) {
+    if (!mRendersToFb || GameFbIsWindowSized()) {
         x += mGameWindowViewport.x;
         y += mGfxCurrentWindowDimensions.height - (mGameWindowViewport.y + mGameWindowViewport.height);
     }

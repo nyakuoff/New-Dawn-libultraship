@@ -6,6 +6,8 @@
 #include <set>
 #include "imconfig.h"
 
+struct NewDawnPostFxParams;
+
 namespace Fast {
 struct ShaderProgram;
 
@@ -79,6 +81,13 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+
+    // New Dawn scene post-processing (see fast/newdawn_postfx.h). Only implemented for OpenGL.
+    virtual bool PostFxAvailable() {
+        return false;
+    }
+    virtual void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;
