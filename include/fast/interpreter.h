@@ -80,7 +80,8 @@ enum class ShaderOpts {
     TEXEL0_BLEND,
     TEXEL1_BLEND,
     PRIM_DEPTH,
-    PRISM_SHADER, // 16-bit width
+    PER_PIXEL_LIGHTING,
+    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 18
     MAX
 };
 
@@ -113,6 +114,7 @@ struct CCFeatures {
     bool opt_invisible;
     bool opt_grayscale;
     bool opt_prim_depth;
+    bool opt_per_pixel_lighting;
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -135,7 +137,7 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 17;
+constexpr size_t SHADER_ID_SHIFT = 18;
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -218,6 +220,10 @@ struct LoadedVertex {
     float x, y, z, w;
     float u, v;
     struct RGBA color;
+    // Per-pixel lighting inputs (New Dawn). Model-space normal and the view-space position the
+    // CPU light model uses for point lights.
+    float normal[3];
+    float view_pos[3];
     uint8_t clip_rej;
 };
 
@@ -244,6 +250,9 @@ struct RSP {
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
     uint8_t current_num_lights;        // includes ambient light
     bool lights_changed;
+    // Bumped whenever the light set or the modelview matrix changes, so a per-pixel lighting batch
+    // can be flushed when the uniforms it was drawn with go stale.
+    uint32_t light_state_revision;
 
     uint32_t geometry_mode;
     int16_t fog_mul, fog_offset;
@@ -441,6 +450,8 @@ class Interpreter {
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
+    // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
+    void UpdatePerPixelLightingState(uint32_t shadeMask);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
     // lists carry stable path pointers; off by default.
@@ -541,6 +552,16 @@ class Interpreter {
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
+    // New Dawn per-pixel lighting (gNewDawn.Lighting.PerPixel). mPerPixelLightState is the state the
+    // next batch draws with; the backend re-uploads it when the serial or shader program changes.
+    bool mPerPixelLightingEnabled{};
+    float mPerPixelPointLightQuality{};
+    float mBatchPointLightQuality{};
+    GfxPerPixelLightingState mPerPixelLightState{};
+    int32_t mPerPixelLightSerial{};
+    int32_t mPerPixelLightUploadedSerial{};
+    uint32_t mBatchLightRevision{};
+    uint32_t mBatchShadeMask{ 0xFFFFFFFFu };
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

@@ -137,6 +137,10 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
+        if (mPerPixelLightState.serial != mPerPixelLightUploadedSerial) {
+            mRapi->SetPerPixelLighting(mPerPixelLightState);
+            mPerPixelLightUploadedSerial = mPerPixelLightState.serial;
+        }
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
@@ -1496,6 +1500,48 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
     Interpreter::NormalizeVector(coeffs);
 }
 
+// Copies the lights exactly as GfxSpVertex consumes them. The shader reproduces that arithmetic, so
+// the spaces and scaling here must stay in step with the CPU path in GfxSpVertex.
+void Interpreter::UpdatePerPixelLightingState(uint32_t shadeMask) {
+    GfxPerPixelLightingState& state = mPerPixelLightState;
+    const int ambientIndex = mRsp->current_num_lights > 0 ? mRsp->current_num_lights - 1 : 0;
+    const int numLights = std::clamp<int>(mRsp->current_num_lights - 1, 0, MAX_PER_PIXEL_LIGHTS);
+    const bool positionalMode = (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) != 0;
+
+    state.numLights = numLights;
+    const F3DLight_t& ambient = mRsp->current_lights[ambientIndex].l;
+    state.ambient[0] = ambient.col[0];
+    state.ambient[1] = ambient.col[1];
+    state.ambient[2] = ambient.col[2];
+
+    const float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+    for (int col = 0; col < 3; col++) {
+        for (int row = 0; row < 3; row++) {
+            state.viewMatrix[col * 3 + row] = mtx[col][row];
+        }
+    }
+
+    for (int i = 0; i < numLights; i++) {
+        const F3DLight& light = mRsp->current_lights[i];
+        GfxPerPixelLight& out = state.lights[i];
+        // For directional lights this is the same normalized model-space direction the CPU uses.
+        CalculateNormalDir(&light.l, out.dir);
+        out.color[0] = light.l.col[0];
+        out.color[1] = light.l.col[1];
+        out.color[2] = light.l.col[2];
+        out.pos[0] = light.p.pos[0];
+        out.pos[1] = light.p.pos[1];
+        out.pos[2] = light.p.pos[2];
+        out.atten[0] = light.p.unk7;
+        out.atten[1] = light.p.unkE;
+        out.positional = positionalMode && light.p.unk3 != 0;
+    }
+
+    state.shadeMask = static_cast<int32_t>(shadeMask);
+    state.pointLightQuality = mPerPixelPointLightQuality;
+    state.serial = ++mPerPixelLightSerial;
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
@@ -1549,6 +1595,7 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                       mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
         }
         mRsp->lights_changed = 1;
+        mRsp->light_state_revision++;
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
 }
@@ -1564,6 +1611,7 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
         }
     }
     mRsp->lights_changed = true;
+    mRsp->light_state_revision++;
 }
 
 float Interpreter::AdjXForAspectRatio(float x) const {
@@ -1611,7 +1659,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
+        // Per-pixel lighting needs the view-space position for point lights.
+        const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -1734,6 +1784,15 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         d->u = U;
         d->v = V;
+
+        if (per_pixel_lighting) {
+            d->normal[0] = vn->n[0];
+            d->normal[1] = vn->n[1];
+            d->normal[2] = vn->n[2];
+            d->view_pos[0] = world_pos[0];
+            d->view_pos[1] = world_pos[1];
+            d->view_pos[2] = world_pos[2];
+        }
 
         // trivial clip rejection
         d->clip_rej = 0;
@@ -1930,6 +1989,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= SHADER_OPT(PRIM_DEPTH);
     }
 
+    // New Dawn: replace the CPU vertex-shaded colour with a per-fragment light calculation.
+    const bool per_pixel_lighting = mPerPixelLightingEnabled && (mRsp->geometry_mode & G_LIGHTING) != 0;
+    if (per_pixel_lighting) {
+        cc_options |= SHADER_OPT(PER_PIXEL_LIGHTING);
+    }
+
     if (!mShaderStack.empty()) {
         cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
     } else {
@@ -2097,6 +2162,26 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
+
+    // Per-pixel lighting reads the lights from uniforms, so a batch can only be drawn while the
+    // light set and the shade input mapping it was built with are still current.
+    if (per_pixel_lighting) {
+        uint32_t shade_mask = 0;
+        for (int j = 0; j < 7; j++) {
+            if (comb->shader_input_mapping[0][j] == G_CCMUX_SHADE) {
+                shade_mask |= 1u << j;
+            }
+        }
+        if (mBatchLightRevision != mRsp->light_state_revision || mBatchShadeMask != shade_mask ||
+            mBatchPointLightQuality != mPerPixelPointLightQuality) {
+            Flush();
+            UpdatePerPixelLightingState(shade_mask);
+            mBatchLightRevision = mRsp->light_state_revision;
+            mBatchShadeMask = shade_mask;
+            mBatchPointLightQuality = mPerPixelPointLightQuality;
+        }
+    }
+
     uint8_t numInputs;
     bool usedTextures[2];
 
@@ -2114,6 +2199,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
         mBufVbo[mBufVboLen++] = z;
         mBufVbo[mBufVboLen++] = w;
+
+        if (per_pixel_lighting) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->normal[0];
+            mBufVbo[mBufVboLen++] = v_arr[i]->normal[1];
+            mBufVbo[mBufVboLen++] = v_arr[i]->normal[2];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[0];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[1];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[2];
+        }
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -2358,6 +2452,7 @@ void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* 
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) { // skip lookat
                 // NOTE: reads out of bounds if it is an ambient light
                 memcpy(mRsp->current_lights + lightidx, data, sizeof(F3DLight));
+                mRsp->light_state_revision++;
             } else if (lightidx < 0) {
                 memcpy(mRsp->lookat + offset / 24, data, sizeof(F3DLight_t)); // TODO Light?
             }
@@ -2385,6 +2480,7 @@ void Interpreter::GfxSpMovememF3d(uint8_t index, uint8_t offset, const void* dat
         case F3DEX_G_MV_L7:
             // NOTE: reads out of bounds if it is an ambient light
             memcpy(mRsp->current_lights + (index - F3DEX_G_MV_L0) / 2, data, sizeof(F3DLight_t));
+            mRsp->light_state_revision++;
             break;
     }
 }
@@ -2394,6 +2490,7 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
         case G_MW_NUMLIGHT:
             mRsp->current_num_lights = data / 24 + 1; // add ambient light
             mRsp->lights_changed = true;
+            mRsp->light_state_revision++;
             break;
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
@@ -2420,6 +2517,7 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             // The 31st bit is a flag that lights should be recalculated
             mRsp->current_num_lights = (data - 0x80000000U) / 32;
             mRsp->lights_changed = true;
+            mRsp->light_state_revision++;
             break;
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
@@ -3136,7 +3234,7 @@ void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
         rawTexMetadata.v_pixel_scale = tex->VPixelScale;
         rawTexMetadata.type = tex->Type;
         rawTexMetadata.resource = tex;
-        data = (uintptr_t) reinterpret_cast<char*>(tex->ImageData);
+        data = (uintptr_t)reinterpret_cast<char*>(tex->ImageData);
     }
 
     s16 dsdx = 4 << 10;
@@ -3173,7 +3271,7 @@ void Interpreter::Gfxs2dexBg1cyc(F3DuObjBg* bg) {
         rawTexMetadata.v_pixel_scale = tex->VPixelScale;
         rawTexMetadata.type = tex->Type;
         rawTexMetadata.resource = tex;
-        data = (uintptr_t) reinterpret_cast<char*>(tex->ImageData);
+        data = (uintptr_t)reinterpret_cast<char*>(tex->ImageData);
     }
 
     // TODO: Implement bg scaling correctly
@@ -4019,7 +4117,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
                 return false;
             }
 
-            i = (uintptr_t) reinterpret_cast<char*>(tex->ImageData);
+            i = (uintptr_t)reinterpret_cast<char*>(tex->ImageData);
             texFlags = tex->Flags;
             rawTexMetdata.width = tex->Width;
             rawTexMetdata.height = tex->Height;
@@ -4960,6 +5058,10 @@ void Interpreter::SpReset() {
     mRsp->modelview_matrix_stack_size = 1;
     mRsp->current_num_lights = 2;
     mRsp->lights_changed = true;
+    mRsp->light_state_revision = 1;
+    // Force the next per-pixel lighting batch to rebuild its uniforms from the new scene's lights.
+    mBatchLightRevision = ~0u;
+    mBatchShadeMask = 0xFFFFFFFFu;
     mRsp->lookat[0].dir[0] = 0;
     mRsp->lookat[0].dir[1] = 127;
     mRsp->lookat[0].dir[2] = 0;
@@ -5098,8 +5200,15 @@ void Interpreter::StartFrame() {
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
     // Post-processing needs the game rendered offscreen even when the window could be rendered to directly
-    mPostFxActive = mRapi->PostFxAvailable() &&
-                    Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Enabled", 1) != 0;
+    mPostFxActive = mRapi->PostFxAvailable() && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                                                    "gNewDawn.PostFx.Enabled", 1) != 0;
+    // New Dawn per-pixel lighting; a backend only gets it when it implements the shader side.
+    mPerPixelLightingEnabled =
+        mRapi->SupportsPerPixelLighting() &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.PerPixel", 0) != 0;
+    mPerPixelPointLightQuality = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.PointLightQuality", 0.0f),
+        0.0f, 1.0f);
     const bool renderSizedFb = !ViewportMatchesRendererResolution() || mPostFxActive;
     if (renderSizedFb || mMsaaLevel > 1) {
         mRendersToFb = true;
@@ -5445,6 +5554,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_invisible = (shader_id1 & SHADER_OPT(INVISIBLE)) != 0;
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_prim_depth = (shader_id1 & SHADER_OPT(PRIM_DEPTH)) != 0;
+    cc_features->opt_per_pixel_lighting = (shader_id1 & SHADER_OPT(PER_PIXEL_LIGHTING)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
