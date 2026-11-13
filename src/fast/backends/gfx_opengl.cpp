@@ -194,6 +194,7 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniformMatrix3fv(prg->per_pixel_view_matrix_location, 1, GL_FALSE, state.viewMatrix);
         glUniform1i(prg->per_pixel_shade_mask_location, state.shadeMask);
         glUniform1f(prg->per_pixel_quality_location, state.pointLightQuality);
+        glUniform4fv(prg->per_pixel_character_location, 1, state.characterLight);
     }
 }
 
@@ -745,6 +746,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
     prg->material_debug_location = glGetUniformLocation(shader_program, "uMaterialDebug");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
+    prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
 
     LoadShader(prg);
     // Sampler types must use distinct units even when their branch is disabled. Set this at creation,

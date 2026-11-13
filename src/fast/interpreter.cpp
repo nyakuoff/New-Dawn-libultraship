@@ -2011,7 +2011,69 @@ void Interpreter::UpdatePerPixelLightingState(uint32_t shadeMask) {
 
     state.shadeMask = static_cast<int32_t>(shadeMask);
     state.pointLightQuality = mPerPixelPointLightQuality;
+    UpdateCharacterLightingState(state, mtx);
     state.serial = ++mPerPixelLightSerial;
+}
+
+// New Dawn character lighting: lit draws under a non-identity model-to-world matrix (actor limbs and objects; room
+// meshes are drawn with the identity) get the camera position and a strength; everything else gets strength 0. The
+// camera is recovered from the combined view-projection in P: it is the point whose clip x, y and w are all zero
+// (the HUD's orthographic projection has no such point, so it stays off).
+void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]) {
+    state.characterLight[0] = state.characterLight[1] = state.characterLight[2] = state.characterLight[3] = 0.0f;
+    if (!mCharacterLighting || !mRapi->HdrWorldActive()) {
+        return;
+    }
+    bool identity = true;
+    for (int r = 0; r < 4 && identity; r++) {
+        for (int c = 0; c < 4; c++) {
+            if (std::fabs(mtx[r][c] - (r == c ? 1.0f : 0.0f)) > 1e-3f) {
+                identity = false;
+                break;
+            }
+        }
+    }
+    // Actor_Draw binds an actor's lights once, then a skeleton loads one matrix per limb. Props drawn as actors
+    // (stalls, towers, doors) load a single matrix after their lights, so they stay on the original shading.
+    if (identity || mMatrixLoadsSinceLights < 2) {
+        return;
+    }
+    // Solve [e 1] * P = (0, 0, *, 0) for columns 0, 1, 3.
+    static const int cols[3] = { 0, 1, 3 };
+    float a[3][4];
+    for (int i = 0; i < 3; i++) {
+        for (int r = 0; r < 3; r++) {
+            a[i][r] = mRsp->P_matrix[r][cols[i]];
+        }
+        a[i][3] = -mRsp->P_matrix[3][cols[i]];
+    }
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 3; r++) {
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) {
+                pivot = r;
+            }
+        }
+        if (std::fabs(a[pivot][col]) < 1e-9f) {
+            return;
+        }
+        for (int k = 0; k < 4; k++) {
+            std::swap(a[col][k], a[pivot][k]);
+        }
+        for (int r = 0; r < 3; r++) {
+            if (r == col) {
+                continue;
+            }
+            const float f = a[r][col] / a[col][col];
+            for (int k = col; k < 4; k++) {
+                a[r][k] -= f * a[col][k];
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        state.characterLight[i] = a[i][3] / a[i][i];
+    }
+    state.characterLight[3] = mCharacterStrength;
 }
 
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
@@ -2052,6 +2114,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         } else {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
+        if (mCharacterLighting && mRapi->HdrWorldActive()) {
+            mRsp->light_state_revision++; // the camera position is derived from P
+        }
     } else { // G_MTX_MODELVIEW
         if ((parameters & mtx_push) && mRsp->modelview_matrix_stack_size < 11) {
             ++mRsp->modelview_matrix_stack_size;
@@ -2068,6 +2133,7 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         }
         mRsp->lights_changed = 1;
         mRsp->light_state_revision++;
+        mMatrixLoadsSinceLights++;
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
 }
@@ -3077,6 +3143,7 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
         case G_MW_NUMLIGHT:
             mRsp->current_num_lights = data / 24 + 1; // add ambient light
             mRsp->lights_changed = true;
+            mMatrixLoadsSinceLights = 0;
             mRsp->light_state_revision++;
             break;
         case G_MW_FOG:
@@ -3104,6 +3171,7 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             // The 31st bit is a flag that lights should be recalculated
             mRsp->current_num_lights = (data - 0x80000000U) / 32;
             mRsp->lights_changed = true;
+            mMatrixLoadsSinceLights = 0;
             mRsp->light_state_revision++;
             break;
         case G_MW_FOG:
@@ -5918,6 +5986,11 @@ void Interpreter::StartFrame() {
     mAlphaToCoverageEnabled =
         mRapi->SupportsAlphaToCoverage() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AlphaToCoverage", 1) != 0;
+    mCharacterLighting = mPerPixelLightingEnabled &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.Characters", 0) != 0;
+    mCharacterStrength = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.CharactersStrength", 1.0f),
+        0.0f, 2.0f);
     mPerPixelPointLightQuality = std::clamp(
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.PointLightQuality", 0.0f),
         0.0f, 1.0f);

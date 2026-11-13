@@ -33,6 +33,7 @@ struct GfxPerPixelLightingState {
     float viewMatrix[9]; // modelview upper 3x3, column-major
     int32_t shadeMask;   // bit n set: shader input n comes from the shade colour
     float pointLightQuality;
+    float characterLight[4]; // xyz: camera position (world), w: character lighting strength (0 = off for this draw)
     int32_t serial;
     GfxPerPixelLight lights[MAX_PER_PIXEL_LIGHTS];
 };
