@@ -27,6 +27,8 @@ typedef struct NewDawnPostFxParams {
     float skySunDir[3];
     float skyFogColor[3];
     float skyPaletteColor[3]; /* current time-of-day sky palette, sRGB; read after UpdateSkybox */
+    float skyGroundAlbedo[3]; /* bounded representative ground reflectance, linear */
+    int32_t skySceneId;       /* cache invalidation only; never used to change game state */
     float skyWeather; /* 0 clear, 1 overcast */
 
     /* New Dawn real-time shadows. */

@@ -141,10 +141,14 @@ vec3 sky(vec3 ray) {
     return skyPaletteTint(radiance, uSunDir.y) * uIntensity;
 }
 void main() {
+#ifdef SKY_CAPTURE
+    vec3 ray = cubeDirection(vUv);
+#else
     vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
     vec4 a = uInvViewProj * vec4(ndc, -1.0, 1.0);
     vec4 b = uInvViewProj * vec4(ndc, 0.999, 1.0);
     vec3 ray = normalize(b.xyz/b.w - a.xyz/a.w);
+#endif
     vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
     // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
     vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.05, ray.y));
@@ -174,6 +178,9 @@ uniform float uWeather;
 uniform float uCoverage;
 uniform vec2 uWind;
 uniform float uIntensity;
+#ifdef SKY_CAPTURE
+uniform float uCloudStrength;
+#endif
 float noise3(vec3 p, float lod) {
     return textureLod(uNoise, p / 64.0, lod).r;
 }
@@ -204,6 +211,10 @@ float lightDensity(vec3 p) {
 void main() {
     oColor = vec4(0.0);
     if (uCoverage <= 0.0) return;
+#ifdef SKY_CAPTURE
+    vec3 ray = cubeDirection(vUv);
+    vec3 origin = uCubeOrigin * 0.00002;
+#else
     vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
     vec4 a = uInvViewProj * vec4(ndc, -1.0, 1.0);
     vec4 b = uInvViewProj * vec4(ndc, 0.999, 1.0);
@@ -211,6 +222,7 @@ void main() {
     if (ray.y <= 0.025) return;
     // Game units -> km. Using the near point also includes exact interpolated camera translation.
     vec3 origin = a.xyz/a.w * 0.00002;
+#endif
     origin.y = clamp(origin.y, -0.5, 1.2);
     float start = max((1.6-origin.y)/ray.y, 0.0);
     float end = min((3.4-origin.y)/ray.y, start + 45.0);
@@ -247,6 +259,9 @@ void main() {
     }
     float horizon = smoothstep(0.025, 0.12, ray.y);
     oColor = vec4(skyPaletteTint(color, uSunDir.y) * uIntensity, 1.0-trans) * horizon;
+#ifdef SKY_CAPTURE
+    oColor *= uCloudStrength;
+#endif
 }
 )GLSL";
 
@@ -263,6 +278,62 @@ void main() {
     c += texture(uClouds, vUv + texel * vec2(1.0,-1.0)) * 0.125;
     c += texture(uClouds, vUv - texel) * 0.125;
     oColor = c * uStrength;
+}
+)GLSL";
+
+static const char* kSkyCubeDirectionLib = R"GLSL(
+uniform int uCubeFace;
+uniform vec3 uCubeOrigin;
+vec3 cubeDirection(vec2 uv) {
+    vec2 p = uv*2.0-1.0;
+    if (uCubeFace == 0) return normalize(vec3(1.0,-p.y,-p.x));
+    if (uCubeFace == 1) return normalize(vec3(-1.0,-p.y,p.x));
+    if (uCubeFace == 2) return normalize(vec3(p.x,1.0,p.y));
+    if (uCubeFace == 3) return normalize(vec3(p.x,-1.0,-p.y));
+    if (uCubeFace == 4) return normalize(vec3(p.x,-p.y,1.0));
+    return normalize(vec3(-p.x,-p.y,-1.0));
+}
+)GLSL";
+
+static const char* kSkyConvolveShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform samplerCube uEnvironment;
+uniform vec3 uGroundAlbedo;
+void main() {
+    const vec3 luma = vec3(0.2126,0.7152,0.0722);
+    vec3 N = cubeDirection(vUv);
+    vec3 irradiance = vec3(0.0);
+    float upperReference = 0.0;
+    // Fixed equal-area sphere quadrature, E/pi. Lower directions reflect the actual cloudy sky
+    // through representative diffuse ground albedo; no artificial light is introduced at night.
+    for (int i=0; i<64; ++i) {
+        float y = 1.0-2.0*(float(i)+0.5)/64.0;
+        float r = sqrt(max(1.0-y*y,0.0));
+        float phi = float(i)*2.39996323;
+        vec3 d = vec3(r*cos(phi),y,r*sin(phi));
+        vec3 radiance = textureLod(uEnvironment, vec3(d.x,abs(d.y),d.z),0.0).rgb;
+        upperReference += dot(radiance,luma)*max(d.y,0.0)*(4.0/64.0);
+        if (d.y<0.0) radiance *= uGroundAlbedo;
+        irradiance += radiance * max(dot(N,d),0.0) * (4.0/64.0);
+    }
+    float y = dot(irradiance,luma);
+    vec3 chroma = y>1e-6 ? irradiance/y : vec3(1.0);
+    // Calibrate to the existing ambient energy rather than changing exposure/night visibility.
+    // Preserve at least 95% of baseline ambient luminance in every direction, allow 20% overhead fill.
+    float gain = clamp(y/max(upperReference*0.65,1e-6),0.95,1.20);
+    oColor = vec4(mix(vec3(1.0),chroma,0.65)*gain,1.0);
+}
+)GLSL";
+
+// Keep the ambient transfer in step with newDawnIrradiance in both packaged default shaders.
+static const char* kSkyAmbientLightingLib = R"GLSL(
+uniform bool uSkyAmbientEnabled;
+uniform samplerCube uSkyIrradiance;
+vec3 skyAmbientColor(vec3 baseline, vec3 N) {
+    if (!uSkyAmbientEnabled) return baseline;
+    float y = dot(baseline,vec3(0.2126,0.7152,0.0722));
+    return texture(uSkyIrradiance,N).rgb*y;
 }
 )GLSL";
 
@@ -813,8 +884,9 @@ void main() {
     }
 
     vec3 direct = uDirColor * ndl;
-    vec3 total = max(uAmbient + direct, vec3(1e-4));
-    vec3 shade = uAmbient + direct * lit;
+    vec3 ambient = skyAmbientColor(uAmbient, N);
+    vec3 total = max(ambient + direct, vec3(1e-4));
+    vec3 shade = ambient + direct * lit;
     vec3 factor = clamp(shade / total, vec3(uMinFactor), vec3(1.0));
     factor = mix(vec3(1.0), factor, uStrength);
     if (uHdr != 0) {
@@ -1340,6 +1412,15 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
         }
         uniforms[key] = glGetUniformLocation(prg, uname);
     }
+    // Postfx shadow programs also declare the ambient cube. Assign its distinct unit at link time,
+    // including legacy/HDR-off programs, before any validation or draw can observe the default unit 0.
+    if (auto ambient = uniforms.find("uSkyIrradiance"); ambient != uniforms.end()) {
+        GLint previous;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+        glUseProgram(prg);
+        glUniform1i(ambient->second, PostFxGL::kSkyAmbientUnit);
+        glUseProgram(previous);
+    }
     return prg;
 }
 
@@ -1520,6 +1601,14 @@ bool PostFxGL::BuildPrograms() {
     const char* cloudApply[] = { kVersion, kCloudApplyShader };
     mCloudMarch.id = BuildProgram("volumetric clouds", cloudMarch, 3, mCloudMarch.uniforms);
     mCloudApply.id = BuildProgram("cloud upscale", cloudApply, 2, mCloudApply.uniforms);
+    const char* skyEnvironment[] = { kVersion, "#define SKY_CAPTURE\n", kSkyPaletteLib, kSkyCubeDirectionLib,
+                                     kPhysicalSkyShader };
+    const char* cloudEnvironment[] = { kVersion, "#define SKY_CAPTURE\n", kSkyPaletteLib, kSkyCubeDirectionLib,
+                                       kCloudMarchShader };
+    const char* convolve[] = { kVersion, kSkyCubeDirectionLib, kSkyConvolveShader };
+    mSkyEnvironment.id = BuildProgram("sky radiance cube", skyEnvironment, 5, mSkyEnvironment.uniforms);
+    mCloudEnvironment.id = BuildProgram("cloud radiance cube", cloudEnvironment, 5, mCloudEnvironment.uniforms);
+    mSkyConvolve.id = BuildProgram("sky diffuse convolution", convolve, 3, mSkyConvolve.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -1536,8 +1625,9 @@ void main() { fragColor = texture(uScene, vUv); }
     const char* comp[] = { kVersion, kCompositeShader };
     const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
     const char* compNoDither[] = { kVersion, "#define NO_DITHER\n", kCompositeShader };
-    const char* shadowApply[] = { kVersion, kDepthLib, kShadowApplyShader };
-    const char* shadowApplyHdr[] = { kVersion, "#define HDR_SCENE\n", kDepthLib, kShadowApplyShader };
+    const char* shadowApply[] = { kVersion, kDepthLib, kSkyAmbientLightingLib, kShadowApplyShader };
+    const char* shadowApplyHdr[] = { kVersion, "#define HDR_SCENE\n", kDepthLib, kSkyAmbientLightingLib,
+                                     kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
     const char* water[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterShader };
@@ -1558,11 +1648,11 @@ void main() { fragColor = texture(uScene, vUv); }
     mDownHdr.id = BuildProgram("HDR bloom downsample", downHdr, 3, mDownHdr.uniforms);
     mCompositeHdr.id = BuildProgram("HDR bloom/display/grade", compHdr, 3, mCompositeHdr.uniforms);
     mCompositeNoDither.id = BuildProgram("LDR composite without dither", compNoDither, 3, mCompositeNoDither.uniforms);
-    mShadowApplyHdr.id = BuildProgram("HDR shadow apply", shadowApplyHdr, 4, mShadowApplyHdr.uniforms);
+    mShadowApplyHdr.id = BuildProgram("HDR shadow apply", shadowApplyHdr, 5, mShadowApplyHdr.uniforms);
     mDown.id = BuildProgram("bloom downsample shader", down, 2, mDown.uniforms);
     mUp.id = BuildProgram("bloom upsample shader", up, 2, mUp.uniforms);
     mComposite.id = BuildProgram("composite shader", comp, 2, mComposite.uniforms);
-    mShadowApply.id = BuildProgram("shadow apply shader", shadowApply, 3, mShadowApply.uniforms);
+    mShadowApply.id = BuildProgram("shadow apply shader", shadowApply, 4, mShadowApply.uniforms);
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     return mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id && mAo.id && mBlur.id &&
@@ -1658,7 +1748,8 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 4) ? "water"
                                 : (stage == 5) ? "water opaque copy"
                                 : (stage == 6) ? "physical sky"
-                                               : "volumetric clouds";
+                                : (stage == 7) ? "volumetric clouds"
+                                               : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -1686,6 +1777,9 @@ void PostFxGL::RestoreColor(const FramebufferOGL& fb) {
 }
 
 bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
+    // Eligibility must be re-established by this frame's physical-sky marker. Never reuse a previous
+    // outdoor frame's illumination in interiors, scripted/final-day skies, pause backgrounds or HDR fallbacks.
+    mSkyAmbientReady = false;
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -1741,24 +1835,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     return true;
 }
 
-void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
-    if (!mUsable || !mHdrActive || !mPhysicalSky.id || !mSkyApply.id || !params.shadowUseExactProj ||
-        !CvInt("gNewDawn.Sky.Physical", 0)) {
-        return;
-    }
-    GlStateGuard guard;
-    guard.Neutralise();
-    glBindVertexArray(mVao);
-    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
-    BeginTimer(kSkyTimerStage);
-    // Smooth atmospheric radiance needs no full-resolution raymarch or temporal history. Bilinear
-    // reconstruction is stable under camera motion and cannot ghost at scene cuts or the Moon's edge.
-    EnsureTarget(mSky, (fb.width + 1) / 2, (fb.height + 1) / 2, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
-    if (!mUsable) {
-        EndTimer(kSkyTimerStage);
-        return;
-    }
-    Use(mPhysicalSky);
+void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
     glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
     glUniform1f(Loc("uFlipY"), params.shadowFlipY);
@@ -1776,6 +1853,35 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
+    glUniform1f(Loc("uCoverage"), std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f));
+    // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
+    // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
+    static const auto epoch = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(seconds * 0.018, 1024.0)),
+                static_cast<float>(std::fmod(seconds * 0.009, 1024.0)));
+}
+
+void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
+    if (!mUsable || !mHdrActive || !mPhysicalSky.id || !mSkyApply.id || !params.shadowUseExactProj ||
+        !CvInt("gNewDawn.Sky.Physical", 0)) {
+        return;
+    }
+    mSkyFrame = frameIndex;
+    GlStateGuard guard;
+    guard.Neutralise();
+    glBindVertexArray(mVao);
+    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    BeginTimer(kSkyTimerStage);
+    // Smooth atmospheric radiance needs no full-resolution raymarch or temporal history. Bilinear
+    // reconstruction is stable under camera motion and cannot ghost at scene cuts or the Moon's edge.
+    EnsureTarget(mSky, (fb.width + 1) / 2, (fb.height + 1) / 2, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    if (!mUsable) {
+        EndTimer(kSkyTimerStage);
+        return;
+    }
+    Use(mPhysicalSky);
+    SetSkyUniforms(params);
     Draw(mSky);
     Use(mSkyApply);
     Bind(0, mSky.tex);
@@ -1788,6 +1894,7 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     EndTimer(kSkyTimerStage);
     CheckError("physical sky");
     RunClouds(params, fb);
+    RunSkyAmbient(params);
 }
 
 void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
@@ -1846,24 +1953,7 @@ void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL
     glBindTexture(GL_TEXTURE_3D, mCloudNoise);
     Use(mCloudMarch);
     glUniform1i(Loc("uNoise"), kFirstUnit + 1);
-    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
-    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
-    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
-    glUniform3fv(Loc("uSunDir"), 1, params.skySunDir);
-    glUniform1f(Loc("uWeather"), params.skyWeather);
-    glUniform1f(Loc("uCoverage"), coverage);
-    float palette[3];
-    for (int i = 0; i < 3; ++i) {
-        palette[i] = DecodeColor(params.skyPaletteColor[i]) * 0.8f + DecodeColor(params.skyFogColor[i]) * 0.2f;
-    }
-    glUniform3fv(Loc("uPaletteColor"), 1, palette);
-    glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
-    // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
-    // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
-    static const auto epoch = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
-    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(seconds * 0.018, 1024.0)),
-                static_cast<float>(std::fmod(seconds * 0.009, 1024.0)));
+    SetSkyUniforms(params);
     Draw(mClouds);
     Use(mCloudApply);
     Bind(0, mClouds.tex);
@@ -1875,6 +1965,156 @@ void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL
     Draw(fb.fbo, fb.width, fb.height);
     EndTimer(kCloudTimerStage);
     CheckError("volumetric clouds");
+}
+
+bool PostFxGL::EnsureCube(CubeTarget& target, int size) {
+    if (target.tex)
+        return true;
+    glActiveTexture(GL_TEXTURE0 + kFirstUnit);
+    glGenTextures(1, &target.tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, target.tex);
+    for (int face = 0; face < 6; ++face) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGB16F, size, size, 0, GL_RGB, GL_FLOAT, nullptr);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 0);
+    glGenFramebuffers(1, &target.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, target.tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        SPDLOG_ERROR("NewDawnSky: incomplete ambient cube; keeping legacy ambient");
+        mSkyAmbientUsable = false;
+        return false;
+    }
+    target.size = size;
+    return true;
+}
+
+void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
+    if (!CvInt("gNewDawn.Sky.Ambient", 0) || !mSkyAmbientUsable || !mSkyEnvironment.id || !mCloudEnvironment.id ||
+        !mSkyConvolve.id) {
+        return;
+    }
+    const float settings[] = { CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f),  CvFloat("gNewDawn.HDR.FogIntensity", 1.0f),
+                               CvFloat("gNewDawn.Sky.Strength", 1.0f),      CvFloat("gNewDawn.Sky.Coverage", 0.55f),
+                               CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), (float)CvInt("gNewDawn.Sky.Clouds", 0) };
+    float sunDot = 0.0f;
+    for (int i = 0; i < 3; ++i)
+        sunDot += params.skySunDir[i] * mSkyCachedSun[i];
+    bool settingsChanged = false;
+    for (int i = 0; i < 6; ++i)
+        settingsChanged |= settings[i] != mSkyCachedSettings[i];
+    // Eligibility is reset each HDR frame, while the lighting cache persists only across consecutive
+    // eligible frames. Refresh slowly moving cloud irradiance every eight rendered frames; force an
+    // immediate refresh after scene/fallback gaps, control/weather changes or about one degree of sun motion.
+    const bool refresh = !mSkyAmbientCacheValid || mSkyFrame - mSkyLastEligible != 1 ||
+                         mSkyCachedScene != params.skySceneId || mSkyFrame - mSkyLastRefresh >= 8 ||
+                         sunDot < 0.9998477f || std::abs(params.skyWeather - mSkyCachedWeather) > 0.01f ||
+                         settingsChanged;
+    mSkyLastEligible = mSkyFrame;
+    // This timer includes reuse frames, so its average is the actual amortised GPU cost per eligible frame.
+    BeginTimer(kSkyAmbientTimerStage);
+    if (!refresh) {
+        mSkyAmbientReady = true;
+        EndTimer(kSkyAmbientTimerStage);
+        CheckError("sky ambient reuse");
+        return;
+    }
+    GlStateGuard guard;
+    guard.Neutralise();
+    struct BindingGuard {
+        GLint cube, volume;
+        BindingGuard() {
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit);
+            glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &cube);
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+            glGetIntegerv(GL_TEXTURE_BINDING_3D, &volume);
+        }
+        ~BindingGuard() {
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+            glBindTexture(GL_TEXTURE_3D, volume);
+        }
+    } bindings;
+    glBindVertexArray(mVao);
+    if (!EnsureCube(mSkyRadiance, 16) || !EnsureCube(mSkyIrradiance, 8)) {
+        EndTimer(kSkyAmbientTimerStage);
+        return;
+    }
+    const bool clouds = CvInt("gNewDawn.Sky.Clouds", 0) && mCloudNoise &&
+                        CvFloat("gNewDawn.Sky.Coverage", 0.55f) > 0.0f &&
+                        CvFloat("gNewDawn.Sky.CloudStrength", 1.0f) > 0.0f;
+    const float cloudStrength = std::clamp(CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), 0.0f, 1.0f) *
+                                std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
+    // Exact interpolated near-centre point; its tiny near-plane offset is negligible at cloud-layer distances.
+    float origin[3];
+    const float* inv = params.shadowInvViewProj;
+    const float w = inv[15] - inv[11];
+    for (int i = 0; i < 3; ++i)
+        origin[i] = (inv[12 + i] - inv[8 + i]) / (std::abs(w) > 1e-6f ? w : 1.0f);
+    if (clouds) {
+        glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+        glBindTexture(GL_TEXTURE_3D, mCloudNoise);
+    }
+    // Group by program so shared uniforms/CVars are uploaded once, not twelve times between tiny draws.
+    // This also avoids GPU idle bubbles while the CPU changes program state for each cube face.
+    Use(mSkyEnvironment);
+    SetSkyUniforms(params);
+    glDisable(GL_BLEND);
+    for (int face = 0; face < 6; ++face) {
+        glBindFramebuffer(GL_FRAMEBUFFER, mSkyRadiance.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                               mSkyRadiance.tex, 0);
+        glUniform1i(Loc("uCubeFace"), face);
+        Draw(mSkyRadiance.fbo, mSkyRadiance.size, mSkyRadiance.size);
+    }
+    if (clouds) {
+        Use(mCloudEnvironment);
+        SetSkyUniforms(params);
+        glUniform1i(Loc("uNoise"), kFirstUnit + 1);
+        glUniform3fv(Loc("uCubeOrigin"), 1, origin);
+        glUniform1f(Loc("uCloudStrength"), cloudStrength);
+        glEnable(GL_BLEND);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+        for (int face = 0; face < 6; ++face) {
+            glBindFramebuffer(GL_FRAMEBUFFER, mSkyRadiance.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                                   mSkyRadiance.tex, 0);
+            glUniform1i(Loc("uCubeFace"), face);
+            Draw(mSkyRadiance.fbo, mSkyRadiance.size, mSkyRadiance.size);
+        }
+    }
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0 + kFirstUnit);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, mSkyRadiance.tex);
+    Use(mSkyConvolve);
+    glUniform1i(Loc("uEnvironment"), kFirstUnit);
+    glUniform3fv(Loc("uGroundAlbedo"), 1, params.skyGroundAlbedo);
+    for (int face = 0; face < 6; ++face) {
+        glBindFramebuffer(GL_FRAMEBUFFER, mSkyIrradiance.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                               mSkyIrradiance.tex, 0);
+        glUniform1i(Loc("uCubeFace"), face);
+        Draw(mSkyIrradiance.fbo, mSkyIrradiance.size, mSkyIrradiance.size);
+    }
+    glActiveTexture(GL_TEXTURE0 + kSkyAmbientUnit);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, mSkyIrradiance.tex);
+    mSkyAmbientReady = true;
+    mSkyAmbientCacheValid = true;
+    mSkyLastRefresh = mSkyFrame;
+    mSkyCachedScene = params.skySceneId;
+    mSkyCachedWeather = params.skyWeather;
+    std::copy(params.skySunDir, params.skySunDir + 3, mSkyCachedSun);
+    std::copy(settings, settings + 6, mSkyCachedSettings);
+    EndTimer(kSkyAmbientTimerStage);
+    CheckError("sky ambient cube");
 }
 
 GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
@@ -2258,6 +2498,8 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
                     (mHdrActive ? std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) : 1.0f);
     }
     glUniform3fv(Loc("uAmbient"), 1, ambient);
+    glUniform1i(Loc("uSkyAmbientEnabled"), SkyAmbientActive());
+    glUniform1i(Loc("uSkyIrradiance"), kSkyAmbientUnit);
     glUniform3fv(Loc("uDirColor"), 1, direct);
     glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);

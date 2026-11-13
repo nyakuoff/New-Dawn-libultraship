@@ -149,6 +149,17 @@
         uniform int uShadeMask;
         uniform float uPointLightQuality;
 
+#ifndef GL_ES
+        uniform bool uSkyAmbientEnabled;
+        uniform samplerCube uSkyIrradiance;
+        vec3 skyAmbientColor(vec3 baseline, vec3 N) {
+            if (!uSkyAmbientEnabled) return baseline;
+            float y = dot(baseline,vec3(0.2126,0.7152,0.0722));
+            return texture(uSkyIrradiance,N).rgb*y;
+        }
+
+#endif
+
         // Same light model as the CPU path in GfxSpVertex: this replaces the per-vertex shade
         // colour with the same arithmetic evaluated per fragment. Values are kept in the 0..255
         // range the CPU uses, including its per-light truncation, so parity is exact where the
@@ -156,6 +167,19 @@
         vec3 newDawnIrradiance(vec3 shadeNormal) {
             vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
             vec3 lit = (uLightAmbient / 255.0) * uHdrAmbient;
+#ifndef GL_ES
+            if (uSkyAmbientEnabled) {
+                // MM loads view into P; uViewMatrix here is the model-to-world transform.
+                // The cofactor handles scaled actors/bones and the existing material normal path.
+                mat3 cof = mat3(cross(uViewMatrix[1],uViewMatrix[2]),
+                                cross(uViewMatrix[2],uViewMatrix[0]),
+                                cross(uViewMatrix[0],uViewMatrix[1]));
+                float det = dot(uViewMatrix[0],cof[0]);
+                vec3 wn = cof * n * (det<0.0 ? -1.0 : 1.0);
+                wn = length(wn)>1e-6 ? normalize(wn) : vec3(0.0,1.0,0.0);
+                lit = skyAmbientColor(lit,wn);
+            }
+#endif
             for (int i = 0; i < uLightCount; ++i) {
                 float intensity;
                 if (uLightPositional[i] != 0) {
