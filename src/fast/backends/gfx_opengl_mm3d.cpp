@@ -127,7 +127,7 @@ vec2 coord(int i) {
     transformed.y=1.0-transformed.y; // CMB UVs address the decoded PICA atlas from its opposite edge.
     return transformed;
 }
-uniform float uKnee, uTop, uGain;
+uniform float uKnee, uTop, uGain, uTintMix;
 vec3 highlightKnee(vec3 c) {
     float knee=uKnee, top=uTop;
     c*=uGain;
@@ -202,7 +202,7 @@ void main() {
                   +uDiffuse.rgb*max(irr-uAmbient,0.0)*(uHDR!=0?uHdrSun:1.0)+uEmission.rgb;
     vec3 lightDisplay=uHDR!=0 ? encode(max(litEnergy,vec3(0.0))) : clamp(litEnergy,0.0,1.0);
     // Baked colour already contains the room's lighting; HDR sun/ambient gains apply only to the live 'lit' term.
-    vec3 bakedDisplay=bakedTint;
+    vec3 bakedDisplay=mix(vec3(1.0),bakedTint,uTintMix);
     vec4 primary=vec4(vColor.rgb*bakedDisplay,vColor.a);
     vec4 lit=vec4(lightDisplay,uDiffuse.a);
     vec4 prev=primary,buffer=vec4(0.0);
@@ -366,14 +366,24 @@ void MM3DGL::Draw(const NewDawnMM3DRoomParams& params,const float* projection,fl
         }
         glUniform3fv(U("uViewRight"),1,right); glUniform3fv(U("uViewUp"),1,up);
         glUniform1f(U("uFogNear"),params.fogNear);
-        glUniform3fv(U("uAmbient"),1,params.ambient);
+        // The N64 environment is tuned for unlit N64 room vertex colours; dark caves leave almost no ambient,
+        // which MM3D's baked rooms (x4 vertex colours) were never meant to run on. Keep a floor under it.
+        const float floorAmbient=std::clamp(cvars->GetFloat("gNewDawn.MM3D.AmbientFloor",0.22f),0.f,1.f);
+        float ambient[3];
+        for(int c=0;c<3;++c) ambient[c]=std::max(params.ambient[c],floorAmbient);
+        const float (*lightColor)[3]=params.lightColor;
+        if(timing && mTimerCount==0) SPDLOG_INFO("MM3D env: ambient {:.2f} {:.2f} {:.2f} light0 {:.2f} {:.2f} {:.2f} light1 {:.2f} {:.2f} {:.2f}",
+            params.ambient[0],params.ambient[1],params.ambient[2],params.lightColor[0][0],params.lightColor[0][1],params.lightColor[0][2],
+            params.lightColor[1][0],params.lightColor[1][1],params.lightColor[1][2]);
+        glUniform3fv(U("uAmbient"),1,ambient);
         glUniform3fv(U("uLightDirection"),2,&params.lightDirection[0][0]);
-        glUniform3fv(U("uLightColor"),2,&params.lightColor[0][0]);
+        glUniform3fv(U("uLightColor"),2,&lightColor[0][0]);
         glUniform3fv(U("uFogColor"),1,params.fogColor);
         glUniform1i(U("uHDR"),hdr);
         glUniform1f(U("uKnee"),cvars->GetFloat("gNewDawn.MM3D.Knee",0.45f));
         glUniform1f(U("uTop"),cvars->GetFloat("gNewDawn.MM3D.Top",0.9f));
-        glUniform1f(U("uGain"),cvars->GetFloat("gNewDawn.MM3D.Gain",0.95f));
+        glUniform1f(U("uTintMix"),cvars->GetFloat("gNewDawn.MM3D.TintMix",1.0f));
+        glUniform1f(U("uGain"),cvars->GetFloat("gNewDawn.MM3D.Gain",0.93f));
         glUniform1i(U("uPerPixel"),cvars->GetInteger("gNewDawn.Lighting.PerPixel",0));
         glUniform1f(U("uHdrAmbient"),std::clamp(cvars->GetFloat("gNewDawn.HDR.AmbientFill",0.4f),0.f,4.f));
         glUniform1f(U("uHdrSun"),std::clamp(cvars->GetFloat("gNewDawn.HDR.SunIntensity",1.8f),0.f,16.f));
