@@ -631,6 +631,8 @@ class Interpreter {
     std::vector<float> mShadowVertices;
     // Alpha-tested casters (gNewDawn.Shadows.Foliage): x,y,z,u,v per vertex, grouped by GL texture id.
     bool mShadowFoliage = false;
+    float mWindScale = 1.0f;
+    bool mWindSway = false; // inside a New Dawn wind scope (room geometry), render-only foliage sway
     uint32_t mShadowSerial = 0;
     size_t mShadowFoliageFloats = 0;
     std::unordered_map<uint32_t, std::vector<float>> mShadowFoliageByTex;

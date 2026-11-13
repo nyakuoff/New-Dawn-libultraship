@@ -2,6 +2,7 @@
 #include "fast/backends/gfx_opengl_postfx.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "fast/newdawn_wind.h"
 #include <stb_image.h>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -17,7 +18,7 @@ const char* kWeatherVertex = R"GLSL(#version 330 core
 uniform mat4 uViewProj;
 uniform vec3 uEye;
 uniform float uTime, uNdcXScale, uFlipY;
-uniform vec2 uProjection,uSize;
+uniform vec2 uProjection,uSize,uWindVel;
 uniform int uSnow;
 out vec2 vUv;
 out vec3 vWorld;
@@ -46,7 +47,7 @@ void main() {
         gl_Position.xy+=q*mix(1.0,2.4,seed.z)*uProjection;
     } else {
         // Motion blur: project the exposure-length fall vector; fixed minimum pixel width keeps far rain visible.
-        vec4 c1=uViewProj*vec4(p+vec3(3.6,-speed,1.8)*0.02,1.0);
+        vec4 c1=uViewProj*vec4(p+vec3(uWindVel.x,-speed,uWindVel.y)*0.02,1.0);
         c1.x/=uNdcXScale; c1.y*=uFlipY;
         vec2 n0=c0.xy/max(c0.w,0.01), n1=c1.xy/max(c1.w,0.01);
         vec2 d=(n1-n0)*uSize*0.5;
@@ -357,6 +358,14 @@ void PostFxGL::RunWeatherParticles(const NewDawnPostFxParams& p, const Framebuff
     const float projection = 1.0f / std::tan(p.fovyDegrees * 0.00872664626f);
     glUniform2f(Loc("uProjection"), projection * float(fb.height) / fb.width, projection);
     glUniform2f(Loc("uSize"), fb.width, fb.height);
+    // Gusting wind slants rain when the shared wind is enabled; otherwise the original gentle constant drift.
+    float windVel[2] = { 3.6f, 1.8f };
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Atmos.Wind", 0)) {
+        const auto wind = NewDawnWindAt(NewDawnWindSeconds());
+        windVel[0] = wind.dirX * wind.gust * 60.0f;
+        windVel[1] = wind.dirZ * wind.gust * 60.0f;
+    }
+    glUniform2f(Loc("uWindVel"), windVel[0], windVel[1]);
     glUniform2f(Loc("uNearFar"), p.zNear, p.zFar);
     float sky[3];
     for (int i = 0; i < 3; i++)
