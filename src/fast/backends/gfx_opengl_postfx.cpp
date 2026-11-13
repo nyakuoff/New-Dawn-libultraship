@@ -1189,6 +1189,10 @@ uniform sampler2DShadow uShadowCmp;
 uniform mat4 uInvViewProj, uLightViewProj;
 uniform vec3 uEye, uSunDir, uSunColor, uAmbient, uFogColor;
 uniform float uNdcXScale, uFlipY, uDensity, uBaseHeight, uHeight, uMaxDist;
+uniform bool uFogSun;
+uniform int uPointCount;
+uniform vec4 uPointPosRadius[4];
+uniform vec3 uPointColor[4];
 vec3 fogWorld(ivec2 p, float d) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
     vec4 w = uInvViewProj * vec4(ndc * vec2(uNdcXScale, uFlipY), d * 2.0 - 1.0, 1.0);
@@ -1202,11 +1206,11 @@ void main() {
     float len = length(ray);
     vec3 dir = ray / max(len, 1e-3);
     float L = min(len,uMaxDist);
-    const int steps = 24;
+    const int steps = 32;
     float ds = L / float(steps);
     // Interleaved gradient noise is fixed across frames: no animation-dependent grain or history on scene cuts.
     float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
-    const float g = 0.6;
+    const float g = 0.68;
     float phase = (1.0-g*g)/(12.566371*pow(max(1.0+g*g-2.0*g*dot(dir,uSunDir),0.01),1.5));
     vec3 ambient = mix(uFogColor, skyAmbientColor(uAmbient,normalize(vec3(-dir.x,0.6,-dir.z))),0.25);
     vec3 scatter = vec3(0.0);
@@ -1218,11 +1222,17 @@ void main() {
         vec4 lc = uLightViewProj * vec4(pos,1.0);
         vec3 sc = lc.xyz/lc.w*0.5+0.5;
         float lit = 1.0;
-        if (all(greaterThan(sc,vec3(0.0))) && all(lessThan(sc,vec3(1.0)))) {
+        if (uFogSun && all(greaterThan(sc,vec3(0.0))) && all(lessThan(sc,vec3(1.0)))) {
             float edge = smoothstep(0.0,0.04,min(min(sc.x,1.0-sc.x),min(sc.y,1.0-sc.y)));
             lit = mix(1.0,texture(uShadowCmp,vec3(sc.xy,sc.z-0.002)),edge);
         }
-        scatter += T*opacity*(ambient+uSunColor*(lit*phase*1.5));
+        vec3 local = vec3(0.0);
+        for (int j=0; j<uPointCount; ++j) {
+            float d = length(pos-uPointPosRadius[j].xyz)/max(uPointPosRadius[j].w,1.0);
+            float attenuation = pow(max(1.0-d,0.0),2.0);
+            local += uPointColor[j]*attenuation*2.5;
+        }
+        scatter += T*opacity*(ambient+uSunColor*(lit*phase*1.5)+local);
         T *= 1.0-opacity;
     }
     oColor = vec4(scatter,1.0-T);
@@ -2761,14 +2771,15 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
-    const bool doFog = doShadow && mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
+    const bool doFog = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && (doShadow || params.fogVolumetric == 2) &&
+                       mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doShafts = !doFog && doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn);
-    if (!doShadow && !doAo && !doScene && !doWater && !captureWater) {
+    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog) {
         return;
     }
 
@@ -2789,7 +2800,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater) {
+    if (doShadow || doAo || doWater || doFog) {
         PrepareDepth(fb);
     }
     if (doWater) {
@@ -3429,7 +3440,12 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     float lightViewProj[16];
-    BuildLightViewProj(params, lightViewProj);
+    if (params.fogVolumetric == 1) {
+        BuildLightViewProj(params, lightViewProj);
+    } else {
+        std::fill(lightViewProj, lightViewProj + 16, 0.0f);
+        lightViewProj[0] = lightViewProj[5] = lightViewProj[10] = lightViewProj[15] = 1.0f;
+    }
     float fogMul, fogOff;
     FogCoefficients(params, fogMul, fogOff);
     // Native start distance supplies the aerosol scale. Bound the artist input so special/near-infinite
@@ -3438,19 +3454,19 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     float startDistance = 2.0f * params.zNear * params.zFar /
                           (params.zFar + params.zNear - ndcStart * (params.zFar - params.zNear));
     const float sunHeight = std::clamp(params.shadowSunDir[1], 0.0f, 1.0f);
-    const float density = 0.16f / std::clamp(startDistance, 800.0f, 2400.0f) * params.fogDensityScale *
+    const float density = 0.32f / std::clamp(startDistance, 800.0f, 2400.0f) * params.fogDensityScale *
                           (1.4f - 0.7f * sunHeight);
-    const float sunFade = std::clamp((sunHeight - 0.03f) / 0.25f, 0.0f, 1.0f);
+    const float sunFade = params.fogVolumetric == 1 ? std::clamp((sunHeight + 0.02f) / 0.22f, 0.0f, 1.0f) : 0.0f;
     float fog[3], sun[3], ambient[3];
     for (int i = 0; i < 3; ++i) {
-        fog[i] = DecodeColor(params.shaftFogColor[i]) *
+        fog[i] = DecodeColor(params.fogColor[i]) *
                  std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
-        ambient[i] = DecodeColor(params.shadowAmbient[i]);
+        ambient[i] = DecodeColor(params.fogAmbient[i]);
         sun[i] = DecodeColor(params.shadowDirColor[i]) * sunFade *
                  std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f);
     }
     Bind(1, mDepth.tex);
-    Bind(3, mShadowMap.tex);
+    Bind(3, params.fogVolumetric == 2 ? mDepth.tex : mShadowMap.tex);
     glBindSampler(kFirstUnit + 3, mCmpSampler);
     Use(mFogMarch);
     glUniform2i(Loc("uSize"), w, h);
@@ -3461,6 +3477,14 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     glUniform3fv(Loc("uEye"), 1, params.shadowCameraEye);
     glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
     glUniform3fv(Loc("uSunColor"), 1, sun);
+    glUniform1i(Loc("uFogSun"), params.fogVolumetric == 1);
+    glUniform1i(Loc("uPointCount"), params.fogPointCount);
+    glUniform4fv(Loc("uPointPosRadius"), NEWDAWN_FOG_POINT_LIGHTS, params.fogPointPosRadius[0]);
+    float pointColors[NEWDAWN_FOG_POINT_LIGHTS][3];
+    for (int j = 0; j < NEWDAWN_FOG_POINT_LIGHTS; ++j)
+        for (int i = 0; i < 3; ++i)
+            pointColors[j][i] = DecodeColor(params.fogPointColor[j][i]);
+    glUniform3fv(Loc("uPointColor"), NEWDAWN_FOG_POINT_LIGHTS, pointColors[0]);
     glUniform3fv(Loc("uAmbient"), 1, ambient);
     glUniform3fv(Loc("uFogColor"), 1, fog);
     glUniform1i(Loc("uSkyAmbientEnabled"), SkyAmbientActive());

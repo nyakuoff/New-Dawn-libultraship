@@ -4985,7 +4985,7 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0,
-                                  gfx->mPostFxActive && params.waterEnabled != 0);
+                                  gfx->mPostFxActive && (params.waterEnabled != 0 || params.fogVolumetric != 0));
         return false;
     }
 
