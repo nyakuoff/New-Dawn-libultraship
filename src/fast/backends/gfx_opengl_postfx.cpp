@@ -1108,6 +1108,151 @@ void main() {
 )GLSL";
 
 
+// Analytic sun diffraction. A 1x1 disc integration supplies visible HDR energy, then a compact,
+// pixel-filtered six-ray aperture response and soft halo scatter it locally. No stock sprites or assets.
+static const char* kFlareVisibilityShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform vec2 uSunUv;
+uniform float uSunDepth;
+void main() {
+    vec3 radiance = vec3(0.0);
+    float visible = 0.0, total = 0.0;
+    for (int i=0; i<48; ++i) {
+        float r = sqrt((float(i)+0.5)/48.0);
+        float a = float(i)*2.39996323;
+        vec2 uv = uSunUv + vec2(cos(a),sin(a))*r*(0.012*float(uSize.y))/vec2(uSize);
+        float weight = 1.0-r*r*0.65;
+        total += weight;
+        if (any(lessThan(uv,vec2(0.0))) || any(greaterThan(uv,vec2(1.0)))) continue;
+        float d = texture(uDepth,uv).r;
+        float lit = smoothstep(uSunDepth-0.00002,uSunDepth-0.000002,d);
+        vec3 c = clamp(texture(uScene,uv).rgb,vec3(0.0),vec3(8.0));
+        radiance += c*lit*weight;
+        visible += lit*weight;
+    }
+    float visibility = visible/max(total,1e-6);
+    vec3 c = radiance/max(visible,1e-6);
+    float energy = dot(c,vec3(0.2126,0.7152,0.0722));
+    // Whiten the optical scatter; sunset colour stays local without a saturated screen veil.
+    vec3 tint = mix(vec3(1.0),c/max(energy,1e-4),0.25);
+    float strength = clamp(sqrt(max(energy,0.0)),0.0,2.0)*smoothstep(0.0,1.0,visibility);
+    oColor = vec4(tint*strength,visibility);
+}
+)GLSL";
+
+static const char* kFlareApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uFlareEmitter;
+uniform vec2 uSunUv;
+uniform vec2 uScreenSize;
+void main() {
+    vec3 energy = texelFetch(uFlareEmitter,ivec2(0),0).rgb;
+    vec2 p = (vUv-uSunUv)*vec2(uScreenSize.x/uScreenSize.y,1.0);
+    float r = length(p);
+    float pixel = 1.0/uScreenSize.y;
+    float rays = 0.0;
+    for (int i=0; i<3; ++i) {
+        float a = 0.17+float(i)*1.04719755;
+        vec2 axis = vec2(cos(a),sin(a));
+        float axial = abs(dot(p,axis));
+        float crossAxis = dot(p,vec2(-axis.y,axis.x));
+        float width = 0.00055+axial*0.003+pixel*0.8;
+        rays += exp(-crossAxis*crossAxis/(width*width))*exp(-axial/0.065);
+    }
+    float core = exp(-r*r/(2.0*0.012*0.012));
+    float halo = exp(-r/0.045);
+    float support = 1.0-smoothstep(0.20,0.29,r);
+    vec3 flare = energy*(0.45*rays+0.10*core+0.045*halo)*support;
+    oColor = vec4(flare,0.0);
+}
+)GLSL";
+
+// Height fog: single-scattering Beer-Lambert integration. Half resolution, fixed spatial jitter,
+// bilateral reconstruction, no temporal history. Native fog is retained and excludes our overlay at full extinction.
+static const char* kFogMarchShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2DShadow uShadowCmp;
+uniform mat4 uInvViewProj, uLightViewProj;
+uniform vec3 uEye, uSunDir, uSunColor, uAmbient, uFogColor;
+uniform float uNdcXScale, uFlipY, uDensity, uBaseHeight, uHeight, uMaxDist;
+vec3 fogWorld(ivec2 p, float d) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
+    vec4 w = uInvViewProj * vec4(ndc * vec2(uNdcXScale, uFlipY), d * 2.0 - 1.0, 1.0);
+    return w.xyz / w.w;
+}
+void main() {
+    ivec2 p = min(ivec2(gl_FragCoord.xy) * 2, uSize - 1);
+    float d = fetchDepth(p);
+    if (d >= 0.99999) { oColor = vec4(0.0); return; }
+    vec3 ray = fogWorld(p,d) - uEye;
+    float len = length(ray);
+    vec3 dir = ray / max(len, 1e-3);
+    float L = min(len,uMaxDist);
+    const int steps = 24;
+    float ds = L / float(steps);
+    // Interleaved gradient noise is fixed across frames: no animation-dependent grain or history on scene cuts.
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+    const float g = 0.6;
+    float phase = (1.0-g*g)/(12.566371*pow(max(1.0+g*g-2.0*g*dot(dir,uSunDir),0.01),1.5));
+    vec3 ambient = mix(uFogColor, skyAmbientColor(uAmbient,normalize(vec3(-dir.x,0.6,-dir.z))),0.25);
+    vec3 scatter = vec3(0.0);
+    float T = 1.0;
+    for (int i=0; i<steps; ++i) {
+        vec3 pos = uEye + dir * ((float(i)+jitter)*ds);
+        float density = uDensity * exp(clamp(-(pos.y-uBaseHeight)/uHeight,-8.0,0.7));
+        float opacity = 1.0-exp(-density*ds);
+        vec4 lc = uLightViewProj * vec4(pos,1.0);
+        vec3 sc = lc.xyz/lc.w*0.5+0.5;
+        float lit = 1.0;
+        if (all(greaterThan(sc,vec3(0.0))) && all(lessThan(sc,vec3(1.0)))) {
+            float edge = smoothstep(0.0,0.04,min(min(sc.x,1.0-sc.x),min(sc.y,1.0-sc.y)));
+            lit = mix(1.0,texture(uShadowCmp,vec3(sc.xy,sc.z-0.002)),edge);
+        }
+        scatter += T*opacity*(ambient+uSunColor*(lit*phase*1.5));
+        T *= 1.0-opacity;
+    }
+    oColor = vec4(scatter,1.0-T);
+}
+)GLSL";
+
+static const char* kFogApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uFogVolume;
+uniform ivec2 uHalfSize;
+uniform float uFogMul, uFogOff;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = fetchDepth(p);
+    // Never haze the sky or replace the game's distance fade. The same projection/fog coefficients as native draws.
+    if (d >= 0.99999) { oColor = vec4(0.0); return; }
+    float nativeFog = clamp(((d*2.0-1.0)*uFogMul+uFogOff)/255.0,0.0,1.0);
+    float z = linDepth(d);
+    vec2 hp = (vec2(p)+0.5)*0.5-0.5;
+    ivec2 base = ivec2(floor(hp));
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    float sigma = max(z*0.04,12.0);
+    for (int y=-1; y<=2; ++y) {
+        for (int x=-1; x<=2; ++x) {
+            ivec2 q = clamp(base+ivec2(x,y),ivec2(0),uHalfSize-1);
+            float qd = fetchDepth(min(q*2,uSize-1));
+            if (qd >= 0.99999) continue;
+            float dz = (linDepth(qd)-z)/sigma;
+            vec2 delta = vec2(q)-hp;
+            float w = exp(-dz*dz-dot(delta,delta)*0.65);
+            sum += texelFetch(uFogVolume,q,0)*w;
+            wsum += w;
+        }
+    }
+    oColor = sum/max(wsum,1e-6)*(1.0-nativeFog);
+}
+)GLSL";
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Water. At the scene-end marker (after the game's own translucent water): for every pixel whose view ray crosses a
 // water plane (from the scene collision) before it reaches the depth-buffer surface, add a Fresnel-weighted sky tint and
@@ -1726,13 +1871,15 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
         }
         uniforms[key] = glGetUniformLocation(prg, uname);
     }
-    // Postfx shadow programs also declare the ambient cube. Assign its distinct unit at link time,
-    // including legacy/HDR-off programs, before any validation or draw can observe the default unit 0.
+    // Assign sampler units before any validation/draw, including legacy and feature-off programs.
+    // Cubes and volume/emitter own 12..15; shared colour, depth and shadow compare use 8, 9 and 11.
     GLint previous;
     glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
     glUseProgram(prg);
     for (auto sampler : { std::pair<const char*, int>{ "uSkyIrradiance", PostFxGL::kSkyAmbientUnit },
-                          { "uSkySpecular", PostFxGL::kSkyReflectionUnit } }) {
+                          { "uSkySpecular", PostFxGL::kSkyReflectionUnit },
+                          { "uFogVolume", PostFxGL::kFogUnit },
+                          { "uFlareEmitter", PostFxGL::kFlareUnit }, { "uScene", 8 }, { "uDepth", 9 }, { "uShadowCmp", 11 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -1853,10 +2000,28 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units < kFirstUnit + 4) {
+    if (units <= kFlareUnit) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
+
+    // Fog/emitter own units 14/15. Keep complete transparent dummies bound even with the features off.
+    GLint previousActive;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+    glActiveTexture(GL_TEXTURE0 + kFogUnit);
+    glGenTextures(1, &mFogNeutral);
+    glBindTexture(GL_TEXTURE_2D, mFogNeutral);
+    const float neutral[4] = {};
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_FLOAT, neutral);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0 + kFlareUnit);
+    glGenTextures(1, &mFlareNeutral);
+    glBindTexture(GL_TEXTURE_2D, mFlareNeutral);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_FLOAT, neutral);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(previousActive);
 
     if (!BuildPrograms()) {
         SPDLOG_WARN("NewDawnPostFx: disabled, shader build failed");
@@ -1990,6 +2155,15 @@ void main() { fragColor = texture(uScene, vUv); }
         glUseProgram(previousProgram);
         glActiveTexture(previousActive);
     }
+    const char* flareVisibility[] = { kVersion, kDepthLib, kFlareVisibilityShader };
+    const char* flareApply[] = { kVersion, kFlareApplyShader };
+    mFlareVisibility.id = BuildProgram("sun disc visibility", flareVisibility, 3, mFlareVisibility.uniforms);
+    mFlareApply.id = BuildProgram("sun diffraction", flareApply, 2, mFlareApply.uniforms);
+    const char* fogMarch[] = { kVersion, kDepthLib, kSkyAmbientLightingLib, kFogMarchShader };
+    const char* fogApply[] = { kVersion, kDepthLib, kFogApplyShader };
+    // Optional: fog shader failure must not disable the existing renderer.
+    mFogMarch.id = BuildProgram("volumetric fog march", fogMarch, 4, mFogMarch.uniforms);
+    mFogApply.id = BuildProgram("volumetric fog apply", fogApply, 3, mFogApply.uniforms);
     const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
     const char* shaftBlur[] = { kVersion, kShaftBlurShader };
     const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
@@ -2106,6 +2280,8 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 5) ? "water opaque copy"
                                 : (stage == 6) ? "physical sky"
                                 : (stage == 7) ? "volumetric clouds"
+                                : (stage == 9) ? "volumetric fog"
+                                : (stage == 10) ? "sun diffraction flare"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -2558,7 +2734,9 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
-    const bool doShafts = doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
+    const bool doFog = doShadow && mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
+                       params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doShafts = !doFog && doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
@@ -2615,6 +2793,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(kShaftTimerStage);
     }
 
+    if (doFog) {
+        BeginTimer(kFogTimerStage);
+        RunVolumetricFog(params, fb);
+        EndTimer(kFogTimerStage);
+    }
     if (captureWater) {
         BeginTimer(kWaterCaptureTimerStage);
         // AO split view leaves its apply scissor enabled; copies must cover the whole source.
@@ -3100,6 +3283,131 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
     CheckError("water");
+}
+
+void PostFxGL::RunSunFlare(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if (!mUsable || !mHdrActive || !mFlareVisibility.id || !mFlareApply.id || !params.shadowUseExactProj)
+        return;
+    float clip[4] = {};
+    for (int j = 0; j < 4; ++j) {
+        clip[j] = params.flareSunPos[0] * params.shadowViewProj[j] +
+                  params.flareSunPos[1] * params.shadowViewProj[4 + j] +
+                  params.flareSunPos[2] * params.shadowViewProj[8 + j] + params.shadowViewProj[12 + j];
+    }
+    if (clip[3] <= 0.0f)
+        return;
+    float uv[2] = { (clip[0] / clip[3] / params.shadowNdcXScale) * 0.5f + 0.5f,
+                    (clip[1] / clip[3] * params.shadowFlipY) * 0.5f + 0.5f };
+    if (uv[0] < -0.02f || uv[0] > 1.02f || uv[1] < -0.02f || uv[1] > 1.02f)
+        return;
+    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    GlStateGuard guard;
+    guard.Neutralise();
+    glBindVertexArray(mVao);
+    BeginTimer(kFlareTimerStage);
+    const int w = fb.width, h = fb.height;
+    PrepareDepth(fb);
+    EnsureTarget(mScene, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mFlareEmitter, 1, 1, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    if (!mUsable) {
+        EndTimer(kFlareTimerStage);
+        return;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mScene.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mScene.tex);
+    Bind(1, mDepth.tex);
+    Use(mFlareVisibility);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform2fv(Loc("uSunUv"), 1, uv);
+    glUniform1f(Loc("uSunDepth"), std::min(clip[2] / clip[3] * 0.5f + 0.5f, 1.0f));
+    Draw(mFlareEmitter);
+    glActiveTexture(GL_TEXTURE0 + kFlareUnit);
+    glBindTexture(GL_TEXTURE_2D, mFlareEmitter.tex);
+    Use(mFlareApply);
+    glUniform2fv(Loc("uSunUv"), 1, uv);
+    glUniform2f(Loc("uScreenSize"), (float)w, (float)h);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0 + kFlareUnit);
+    glBindTexture(GL_TEXTURE_2D, mFlareNeutral);
+    EndTimer(kFlareTimerStage);
+    CheckError("sun diffraction flare");
+}
+
+void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const int w = fb.width, h = fb.height;
+    const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+    EnsureTarget(mFog, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    if (!mUsable)
+        return;
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    float lightViewProj[16];
+    BuildLightViewProj(params, lightViewProj);
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
+    // Native start distance supplies the aerosol scale. Bound the artist input so special/near-infinite
+    // fog distances cannot make the volume opaque or numerically unstable.
+    float ndcStart = fogMul > 0.0f ? std::clamp(-fogOff / fogMul, -1.0f, 1.0f) : 1.0f;
+    float startDistance = 2.0f * params.zNear * params.zFar /
+                          (params.zFar + params.zNear - ndcStart * (params.zFar - params.zNear));
+    const float sunHeight = std::clamp(params.shadowSunDir[1], 0.0f, 1.0f);
+    const float density = 0.16f / std::clamp(startDistance, 800.0f, 2400.0f) * params.fogDensityScale *
+                          (1.4f - 0.7f * sunHeight);
+    const float sunFade = std::clamp((sunHeight - 0.03f) / 0.25f, 0.0f, 1.0f);
+    float fog[3], sun[3], ambient[3];
+    for (int i = 0; i < 3; ++i) {
+        fog[i] = DecodeColor(params.shaftFogColor[i]) *
+                 std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
+        ambient[i] = DecodeColor(params.shadowAmbient[i]);
+        sun[i] = DecodeColor(params.shadowDirColor[i]) * sunFade *
+                 std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f);
+    }
+    Bind(1, mDepth.tex);
+    Bind(3, mShadowMap.tex);
+    glBindSampler(kFirstUnit + 3, mCmpSampler);
+    Use(mFogMarch);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform3fv(Loc("uEye"), 1, params.shadowCameraEye);
+    glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
+    glUniform3fv(Loc("uSunColor"), 1, sun);
+    glUniform3fv(Loc("uAmbient"), 1, ambient);
+    glUniform3fv(Loc("uFogColor"), 1, fog);
+    glUniform1i(Loc("uSkyAmbientEnabled"), SkyAmbientActive());
+    glUniform1f(Loc("uDensity"), density);
+    glUniform1f(Loc("uBaseHeight"), params.fogBaseHeight);
+    glUniform1f(Loc("uHeight"), params.fogHeight);
+    glUniform1f(Loc("uMaxDist"), std::min(params.zFar, 6000.0f));
+    Draw(mFog);
+    glBindSampler(kFirstUnit + 3, 0);
+
+    glActiveTexture(GL_TEXTURE0 + kFogUnit);
+    glBindTexture(GL_TEXTURE_2D, mFog.tex);
+    Use(mFogApply);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform2i(Loc("uHalfSize"), hw, hh);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniform1f(Loc("uFogMul"), fogMul);
+    glUniform1f(Loc("uFogOff"), fogOff);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0 + kFogUnit);
+    glBindTexture(GL_TEXTURE_2D, mFogNeutral);
+    CheckError("volumetric fog");
 }
 
 void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {

@@ -222,6 +222,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     std::unique_ptr<MM3DGL> mMM3D;
     int mHdrGameFb = -1;
     bool mHdrSky = false;
+    bool mSunFlare = false;
     std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
 #endif
 };
