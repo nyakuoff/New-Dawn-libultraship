@@ -4794,6 +4794,11 @@ bool gfx_newdawn_mm3d_handler_custom(F3DGfx** cmd0) {
                     }
                 }
             }
+            static int sLogged = 0;
+            if (sLogged < 2) {
+                ++sLogged;
+                SPDLOG_INFO("MM3D: {} shadow-caster triangles recorded after the room pass", gfx->mShadowVertices.size() / 9);
+            }
         }
     }
     return false;
