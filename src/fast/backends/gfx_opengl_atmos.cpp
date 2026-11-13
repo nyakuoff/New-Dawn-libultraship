@@ -45,7 +45,7 @@ void main() {
     vec2 corners[6] = vec2[6](vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     vec2 q = corners[gl_VertexID];
     vUv = q*0.5+0.5;
-    float radius = mix(0.45,1.5,seed.z);
+    float radius = mix(1.4,3.8,seed.z);
     if (uKind == 1) radius *= 1.6;
     if (uKind == 2) radius = mix(1.2,2.4,seed.z);
     if (uKind == 3) {
@@ -108,7 +108,7 @@ void main() {
         radiance = mix(vec3(1.1,2.8,0.20), vec3(2.8,2.0,0.15),vSeed)*uNight;
     } else {
         float sun = uBiome == 4 ? 0.0 : sunlight()*(1.0-uNight)*(1.0-clamp(uRain,0.0,1.0));
-        radiance = uSunColor*sun*1.6;
+        radiance = uSunColor*sun*2.0;
         if (uKind == 1) radiance *= vec3(0.95,1.0,0.65);
         for (int i=0;i<uLightCount;i++) {
             float distance = length(vWorld-uLights[i].xyz);
@@ -289,7 +289,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUniform1i(Loc("uKind"), 0);
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 3072);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 4096);
     if (p.atmosBiome == 2 || p.atmosBiome == 3) {
         if (p.atmosNight < 1.0f) {
             glUniform1i(Loc("uKind"), 1);
