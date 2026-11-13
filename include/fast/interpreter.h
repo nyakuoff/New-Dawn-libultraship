@@ -495,6 +495,7 @@ class Interpreter {
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
+    void UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
     // lists carry stable path pointers; off by default.
@@ -569,6 +570,9 @@ class Interpreter {
     uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
     bool mTextureCacheDebug = false;
     bool mMaterialsEnabled = false;
+    bool mCharacterLighting = false;
+    uint32_t mMatrixLoadsSinceLights = 0;
+    float mCharacterStrength = 1.0f;
     struct MaterialMaps {
         std::shared_ptr<Fast::Texture> albedo, normal, roughness;
     };

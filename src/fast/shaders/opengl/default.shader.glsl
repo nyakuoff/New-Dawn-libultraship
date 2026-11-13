@@ -223,6 +223,88 @@
             }
             return clamp(floor(lit), 0.0, 255.0) / 255.0;
         }
+
+        // New Dawn character lighting. xyz: camera position in the same (world) space as vViewPos; w: strength,
+        // 0 for room meshes, the HUD and everything while the feature is off.
+        uniform vec4 uCharLight;
+
+        // Additive linear radiance for lit actor draws: a Fresnel rim (sky behind the subject, the scene's
+        // own light colours indoors, sun when backlit) and a bounded specular from the same lights. Both are
+        // tied to the albedo so dark texels stay dark, and skin-like hues get no specular.
+        vec3 newDawnCharacter(vec3 albedoLin, vec3 albedoGamma, vec3 shadeNormal) {
+            vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
+            mat3 cof = mat3(cross(uViewMatrix[1], uViewMatrix[2]),
+                            cross(uViewMatrix[2], uViewMatrix[0]),
+                            cross(uViewMatrix[0], uViewMatrix[1]));
+            float det = dot(uViewMatrix[0], cof[0]);
+            vec3 wn = cof * n * (det < 0.0 ? -1.0 : 1.0);
+            wn = length(wn) > 1e-6 ? normalize(wn) : vec3(0.0, 1.0, 0.0);
+            vec3 v = uCharLight.xyz - vViewPos;
+            float vl = length(v);
+            if (vl < 1.0) return vec3(0.0);
+            v /= vl;
+            float nv = clamp(dot(wn, v), 0.0, 1.0);
+            float fres = pow(1.0 - nv, 2.0);
+
+            // Material class from the albedo alone (render state has no material id): bright neutral texels read as
+            // metal, skin hues stay matte, saturated cloth gets only a faint broad sheen.
+            float mx = max(albedoGamma.r, max(albedoGamma.g, albedoGamma.b));
+            float mn = min(albedoGamma.r, min(albedoGamma.g, albedoGamma.b));
+            float sat = (mx - mn) / max(mx, 0.001);
+            float luma = dot(albedoGamma, vec3(0.2126, 0.7152, 0.0722));
+            float metal = (1.0 - smoothstep(0.12, 0.36, sat)) * smoothstep(0.32, 0.65, luma);
+            float skin = step(albedoGamma.g, albedoGamma.r) * step(albedoGamma.b, albedoGamma.g) *
+                         smoothstep(0.10, 0.20, sat) * (1.0 - smoothstep(0.55, 0.75, sat)) *
+                         smoothstep(0.22, 0.38, luma);
+            float specWeight = mix(0.07 * (1.0 - skin), 1.0, metal);
+            float rough = mix(0.62, 0.30, metal);
+            float a2 = pow(rough, 4.0);
+            float f0 = mix(0.04, 0.5, metal);
+
+            vec3 ambient = (uLightAmbient / 255.0) * uHdrAmbient;
+            vec3 rimBase = ambient;
+#ifndef GL_ES
+            if (uSkyAmbientEnabled) rimBase = skyAmbientColor(ambient, reflect(-v, wn));
+#endif
+            vec3 rim = rimBase * 5.5 * fres;
+            vec3 spec = vec3(0.0);
+            for (int i = 0; i < uLightCount; ++i) {
+                vec3 l;
+                vec3 radiance = uLightColor[i] / 255.0;
+                if (uLightPositional[i] != 0) {
+                    vec3 delta = uLightPos[i] - vViewPos;
+                    float dist = length(delta);
+                    l = delta / max(dist, 0.0001);
+                    float d2 = max(dot(delta.xy, delta.xy) + 2.0 * delta.z * delta.z, 0.000001);
+                    float distf = mix(floor(sqrt(d2)), sqrt(d2), uPointLightQuality);
+                    radiance /= 1.0 + (distf * uLightAtten[i].x * 2.0 + distf * distf * uLightAtten[i].y / 8.0) / 65535.0;
+                } else {
+                    l = normalize(uViewMatrix * uLightDir[i]);
+                    radiance *= uHdrSun;
+                }
+                float nl = dot(wn, l);
+                // Light from behind the subject, seen from the camera, wraps around the silhouette.
+                float back = smoothstep(-0.1, 0.7, -dot(v, l));
+                rim += radiance * fres * back * clamp(nl + 0.3, 0.0, 1.0) * 2.6;
+                if (nl <= 0.0 || nv <= 0.0) continue;
+                vec3 h = normalize(v + l);
+                float nh = max(dot(wn, h), 0.0);
+                float vh = clamp(dot(v, h), 0.0, 1.0);
+                float denom = nh * nh * (a2 - 1.0) + 1.0;
+                float d = a2 / max(denom * denom, 0.00001);
+                float gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);
+                float gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);
+                float vis = 0.5 / max(gv + gl, 0.00001);
+                float fr = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+                spec += radiance * (fr * d * vis * nl);
+            }
+            // The specular is bounded per channel by the lit albedo, so a black or dark texel cannot be lifted.
+            vec3 budget = albedoLin * (0.03 + 0.9 * metal);
+            spec *= specWeight;
+            spec = budget * spec / max(budget + spec, vec3(0.000001));
+            // Characters are read at close range; far-away large props drawn as actors fade out (Link is ~60 units).
+            return (albedoLin * rim + spec) * uCharLight.w * (1.0 - smoothstep(400.0, 800.0, vl));
+        }
     @end
 
     @if(o_material_maps)
@@ -529,9 +611,18 @@
         texel = WRAP(texel, -0.51, 1.51);
         texel = clamp(texel, 0.0, 1.0);
         if (uHdrWorld) {
+            vec3 albedoGamma = texel.rgb;
             texel.rgb = hdrDecode(texel.rgb) * uHdrSky;
             @if(o_per_pixel_lighting)
-                if (hdrDiffuse) texel.rgb *= newDawnIrradiance(shadeNormal);
+                if (hdrDiffuse) {
+                    vec3 albedoLin = texel.rgb;
+                    texel.rgb *= newDawnIrradiance(shadeNormal);
+                    bool characterLit = uCharLight.w > 0.0;
+                    @if(o_material_maps)
+                        characterLit = characterLit && !materialDiffuse;
+                    @end
+                    if (characterLit) texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal);
+                }
             @end
         }
         @if(o_material_maps)
