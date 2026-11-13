@@ -98,6 +98,9 @@ uniform sampler2D uWeatherScene,uWeatherDepth,uWeatherRoof,uWeatherRing;
 uniform samplerCube uWeatherEnvironment;
 uniform mat4 uInvViewProj,uRoofViewProj;
 uniform float uNdcXScale,uFlipY,uWetness,uRain,uTime;
+uniform int uBoxCount;
+uniform vec4 uBoxRect[16]; // minX, minZ, maxX, maxZ of the water planes (the water pass owns ripples and foam there)
+uniform float uBoxY[16];
 uniform vec3 uEye,uSunDir,uSunColor;
 float hash(vec2 p) { return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 float noise(vec2 p) {
@@ -118,6 +121,10 @@ void main() {
     float edge=min(min(roof.x,1.0-roof.x),min(roof.y,1.0-roof.y));
     float covered=smoothstep(0.0,0.08,edge)*step(0.0,roof.z)*step(roof.z,1.0);
     float exposed=covered>0.0 ? step(roof.z,texture(uWeatherRoof,roof.xy).r+0.0012)*covered : 0.0;
+    float underWater=0.0;
+    for (int i=0;i<uBoxCount;i++)
+        if (P.x>=uBoxRect[i].x && P.x<=uBoxRect[i].z && P.z>=uBoxRect[i].y && P.z<=uBoxRect[i].w && P.y<uBoxY[i]+2.0) underWater=1.0;
+    exposed*=1.0-underWater;
     float wet=exposed*uWetness;
     float flatness=smoothstep(0.65,0.95,N.y);
     float patch=smoothstep(0.34,0.72,noise(P.xz*0.012));
@@ -325,6 +332,22 @@ void PostFxGL::RunWeather(const NewDawnPostFxParams& p, const FramebufferOGL& fb
         glUniform1f(Loc("uWetness"), mWeatherWetness);
         glUniform1f(Loc("uRain"), rain);
         glUniform1f(Loc("uTime"), time);
+        {
+            float rect[NEWDAWN_MAX_WATER_BOXES * 4], surfaceY[NEWDAWN_MAX_WATER_BOXES];
+            const int count = std::clamp(p.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+            for (int i = 0; i < count; i++) {
+                rect[i * 4 + 0] = p.waterBoxes[i][0];
+                rect[i * 4 + 1] = p.waterBoxes[i][1];
+                rect[i * 4 + 2] = p.waterBoxes[i][2];
+                rect[i * 4 + 3] = p.waterBoxes[i][3];
+                surfaceY[i] = p.waterBoxes[i][4];
+            }
+            glUniform1i(Loc("uBoxCount"), count);
+            if (count > 0) {
+                glUniform4fv(Loc("uBoxRect"), count, rect);
+                glUniform1fv(Loc("uBoxY"), count, surfaceY);
+            }
+        }
         glUniform3fv(Loc("uEye"), 1, p.atmosEye);
         glUniform3fv(Loc("uSunDir"), 1, p.shadowSunDir);
         glUniform3fv(Loc("uSunColor"), 1, p.atmosSunColor);
