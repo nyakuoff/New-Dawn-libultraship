@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <string>
 #include <vector>
@@ -86,22 +87,27 @@ vec2 density(vec3 p) {
 vec3 sky(vec3 ray) {
     vec3 origin = vec3(0.0, Rg + 0.2, 0.0);
     float distance = exitDistance(origin, ray);
-    float ds = distance / 12.0;
     vec2 optical = vec2(0.0);
     vec3 sumR = vec3(0.0), sumM = vec3(0.0);
     float aerosol = mix(1.0, 3.0, uWeather);
     for (int i = 0; i < 12; ++i) {
-        vec3 p = origin + ray * (float(i) + 0.5) * ds;
+        float t0 = pow(float(i) / 12.0, 2.0) * distance;
+        float t1 = pow(float(i+1) / 12.0, 2.0) * distance;
+        float ds = t1-t0;
+        vec3 p = origin + ray * (t0+t1) * 0.5;
         vec2 local = density(p) * ds;
         optical += local * 0.5;
-        float sunStep = exitDistance(p, uSunDir) / 4.0;
+        float sunDistance = exitDistance(p, uSunDir);
         vec2 sunOptical = vec2(0.0);
         // Planet shadow, smoothed over the solar disc at sunset.
         float mu = dot(normalize(p), uSunDir);
         float horizon = -sqrt(max(1.0 - Rg*Rg / dot(p,p), 0.0));
         float visible = smoothstep(horizon - 0.005, horizon + 0.005, mu);
         for (int j = 0; j < 4; ++j) {
-            sunOptical += density(p + uSunDir * (float(j) + 0.5) * sunStep) * sunStep;
+            // Concentrate quadrature near the sample: uniform steps miss dense air at low sun angles.
+            float s0 = pow(float(j)/4.0, 2.0) * sunDistance;
+            float s1 = pow(float(j+1)/4.0, 2.0) * sunDistance;
+            sunOptical += density(p + uSunDir * (s0+s1)*0.5) * (s1-s0);
         }
         vec2 total = optical + sunOptical;
         vec3 transmission = exp(-betaR * total.x - betaM * aerosol * total.y);
@@ -128,7 +134,7 @@ void main() {
     vec3 ray = normalize(b.xyz/b.w - a.xyz/a.w);
     vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
     // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
-    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.22, ray.y));
+    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.05, ray.y));
     oColor = vec4(color, 1.0);
 }
 )GLSL";
@@ -139,6 +145,112 @@ out vec4 oColor;
 uniform sampler2D uSky;
 uniform float uStrength;
 void main() { oColor = vec4(texture(uSky, vUv).rgb, uStrength); }
+)GLSL";
+
+// A world-anchored cumulus layer, with Beer-Lambert view/light transmittance and a low-frequency
+// coverage map. Fixed samples + filtered noise + spatial upscale avoid a history buffer and its cut/occlusion ghosts.
+static const char* kCloudMarchShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler3D uNoise;
+uniform mat4 uInvViewProj;
+uniform float uNdcXScale;
+uniform float uFlipY;
+uniform vec3 uSunDir;
+uniform float uWeather;
+uniform float uCoverage;
+uniform vec2 uWind;
+uniform float uIntensity;
+float noise3(vec3 p, float lod) {
+    return textureLod(uNoise, p / 64.0, lod).r;
+}
+float density(vec3 p, float lod) {
+    float h = (p.y - 1.6) / 1.8;
+    if (h <= 0.0 || h >= 1.0) return 0.0;
+    p.xz += uWind;
+    // Weather cells span tens of km; the density octaves span km down to hundreds of metres.
+    float weather = noise3(vec3(p.x / 16.0, 3.0, p.z / 16.0), 0.0);
+    float cover = clamp(uCoverage + (weather - 0.5) * 0.65 + uWeather * 0.25, 0.0, 1.0);
+    float shape = noise3(p, lod) * 0.55 + noise3(p * 2.0, lod+1.0) * 0.25 +
+                  noise3(p * 4.0, lod+2.0) * 0.14 + noise3(p * 8.0, lod+3.0) * 0.06;
+    float profile = smoothstep(0.0, 0.15, h) * (1.0 - smoothstep(0.45, 1.0, h));
+    float threshold = 0.72 - cover * 0.48 + (1.0 - profile) * 0.22;
+    return smoothstep(threshold, threshold + 0.10, shape) * profile;
+}
+float lightDensity(vec3 p) {
+    float h = (p.y - 1.6) / 1.8;
+    if (h <= 0.0 || h >= 1.0) return 0.0;
+    p.xz += uWind;
+    float weather = noise3(vec3(p.x / 16.0, 3.0, p.z / 16.0), 0.0);
+    float cover = clamp(uCoverage + (weather - 0.5) * 0.65 + uWeather * 0.25, 0.0, 1.0);
+    float profile = smoothstep(0.0, 0.15, h) * (1.0 - smoothstep(0.45, 1.0, h));
+    float shape = noise3(p, 0.0)*0.70 + noise3(p*2.0, 0.0)*0.30;
+    return smoothstep(0.72 - cover * 0.48 + (1.0-profile)*0.22, 0.82 - cover * 0.48 + (1.0-profile)*0.22,
+                      shape) * profile;
+}
+void main() {
+    oColor = vec4(0.0);
+    if (uCoverage <= 0.0) return;
+    vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
+    vec4 a = uInvViewProj * vec4(ndc, -1.0, 1.0);
+    vec4 b = uInvViewProj * vec4(ndc, 0.999, 1.0);
+    vec3 ray = normalize(b.xyz/b.w - a.xyz/a.w);
+    if (ray.y <= 0.025) return;
+    // Game units -> km. Using the near point also includes exact interpolated camera translation.
+    vec3 origin = a.xyz/a.w * 0.00002;
+    origin.y = clamp(origin.y, -0.5, 1.2);
+    float start = max((1.6-origin.y)/ray.y, 0.0);
+    float end = min((3.4-origin.y)/ray.y, start + 45.0);
+    float ds = (end-start)/40.0;
+    float lod = clamp(log2(max(ds * 0.75, 0.001)), -4.0, 3.0);
+    // A spatial, world-direction-anchored offset breaks up marching bands without frame-varying noise.
+    float jitter = noise3(ray * 512.0 + origin * 0.125, 0.0);
+    float day = smoothstep(-0.10, 0.06, uSunDir.y);
+    vec3 light = day > 0.01 ? uSunDir : -uSunDir;
+    light.y = max(light.y, 0.04);
+    light = normalize(light);
+    vec3 sunColor = exp(-vec3(0.005802,0.013558,0.033100) * 8.0 / max(uSunDir.y, 0.035));
+    sunColor = mix(vec3(0.018,0.026,0.045), sunColor * 1.7, day);
+    float c = max(dot(ray, light), 0.0);
+    float phase = 0.35 + 0.65 * pow(c, 8.0); // broad forward lobe, bounded for HDR silver linings
+    float trans = 1.0;
+    vec3 color = vec3(0.0);
+    for (int i = 0; i < 40; ++i) {
+        vec3 p = origin + ray * (start + (float(i)+jitter)*ds);
+        float d = density(p, lod);
+        if (d > 0.002) {
+            float tau = lightDensity(p + light*0.25)*0.45 + lightDensity(p + light*0.85)*0.85 +
+                        lightDensity(p + light*1.8)*1.2;
+            float sunTrans = exp(-tau * 2.2);
+            float h = clamp((p.y-1.6)/1.8, 0.0, 1.0);
+            vec3 ambient = mix(vec3(0.085,0.11,0.16), vec3(0.20,0.25,0.33), h) * day +
+                           vec3(0.0015,0.0025,0.005) * (1.0-day);
+            vec3 lighting = ambient + sunColor * phase * sunTrans * (0.8 + 0.2*(1.0-exp(-d*2.0)));
+            float opacity = 1.0-exp(-d*ds*2.8);
+            color += trans * opacity * lighting;
+            trans *= 1.0-opacity;
+            if (trans < 0.015) break;
+        }
+    }
+    float horizon = smoothstep(0.025, 0.12, ray.y);
+    oColor = vec4(color * uIntensity, 1.0-trans) * horizon;
+}
+)GLSL";
+
+static const char* kCloudApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uClouds;
+uniform float uStrength;
+void main() {
+    vec2 texel = 0.75 / vec2(textureSize(uClouds, 0));
+    vec4 c = texture(uClouds, vUv) * 0.5;
+    c += texture(uClouds, vUv + texel * vec2(1.0,1.0)) * 0.125;
+    c += texture(uClouds, vUv + texel * vec2(-1.0,1.0)) * 0.125;
+    c += texture(uClouds, vUv + texel * vec2(1.0,-1.0)) * 0.125;
+    c += texture(uClouds, vUv - texel) * 0.125;
+    oColor = c * uStrength;
+}
 )GLSL";
 
 static void FogCoefficients(const NewDawnPostFxParams& params, float& fogMul, float& fogOff) {
@@ -1391,6 +1503,10 @@ bool PostFxGL::BuildPrograms() {
     // Sky shaders fail independently; an unavailable optional sky never disables the established HDR path.
     mPhysicalSky.id = BuildProgram("physical sky", physicalSky, 2, mPhysicalSky.uniforms);
     mSkyApply.id = BuildProgram("sky upscale", skyApply, 2, mSkyApply.uniforms);
+    const char* cloudMarch[] = { kVersion, kCloudMarchShader };
+    const char* cloudApply[] = { kVersion, kCloudApplyShader };
+    mCloudMarch.id = BuildProgram("volumetric clouds", cloudMarch, 2, mCloudMarch.uniforms);
+    mCloudApply.id = BuildProgram("cloud upscale", cloudApply, 2, mCloudApply.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -1528,7 +1644,8 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 3) ? "sun shafts"
                                 : (stage == 4) ? "water"
                                 : (stage == 5) ? "water opaque copy"
-                                               : "physical sky";
+                                : (stage == 6) ? "physical sky"
+                                               : "volumetric clouds";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -1652,6 +1769,89 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     Draw(fb.fbo, fb.width, fb.height);
     EndTimer(kSkyTimerStage);
     CheckError("physical sky");
+    RunClouds(params, fb);
+}
+
+void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const float strength = std::clamp(CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), 0.0f, 1.0f) *
+                           std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
+    const float coverage = std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f);
+    if (!CvInt("gNewDawn.Sky.Clouds", 0) || strength <= 0.0f || coverage <= 0.0f || !mCloudMarch.id ||
+        !mCloudApply.id) {
+        return;
+    }
+    GlStateGuard guard;
+    guard.Neutralise();
+    // Volume binding is separate from the backend's 2D texture cache. Restore it even on target failure;
+    // the outer guard restores the active texture unit after this local guard has restored its binding.
+    struct VolumeBindingGuard {
+        GLint previous;
+        VolumeBindingGuard() {
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+            glGetIntegerv(GL_TEXTURE_BINDING_3D, &previous);
+        }
+        ~VolumeBindingGuard() {
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+            glBindTexture(GL_TEXTURE_3D, previous);
+        }
+    } volumeBinding;
+    glBindVertexArray(mVao);
+    BeginTimer(kCloudTimerStage);
+    if (!mCloudNoise) {
+        // A small, seamless, original noise volume. No asset IO, licensed textures or random game state.
+        constexpr int size = 64;
+        std::vector<uint8_t> noise(size * size * size);
+        uint32_t seed = 0x91E10DA5;
+        for (auto& value : noise) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            value = static_cast<uint8_t>(seed >> 24);
+        }
+        glGenTextures(1, &mCloudNoise);
+        glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+        glBindTexture(GL_TEXTURE_3D, mCloudNoise);
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, size, size, size, 0, GL_RED, GL_UNSIGNED_BYTE, noise.data());
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT);
+        glGenerateMipmap(GL_TEXTURE_3D);
+    }
+    EnsureTarget(mClouds, (fb.width + 1) / 2, (fb.height + 1) / 2, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    if (!mUsable) {
+        EndTimer(kCloudTimerStage);
+        return;
+    }
+    glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
+    glBindTexture(GL_TEXTURE_3D, mCloudNoise);
+    Use(mCloudMarch);
+    glUniform1i(Loc("uNoise"), kFirstUnit + 1);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform3fv(Loc("uSunDir"), 1, params.skySunDir);
+    glUniform1f(Loc("uWeather"), params.skyWeather);
+    glUniform1f(Loc("uCoverage"), coverage);
+    glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
+    // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
+    // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
+    static const auto epoch = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(seconds * 0.018, 1024.0)),
+                static_cast<float>(std::fmod(seconds * 0.009, 1024.0)));
+    Draw(mClouds);
+    Use(mCloudApply);
+    Bind(0, mClouds.tex);
+    glUniform1i(Loc("uClouds"), kFirstUnit);
+    glUniform1f(Loc("uStrength"), strength);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    Draw(fb.fbo, fb.width, fb.height);
+    EndTimer(kCloudTimerStage);
+    CheckError("volumetric clouds");
 }
 
 GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {

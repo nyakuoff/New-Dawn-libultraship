@@ -91,6 +91,10 @@ class PostFxGL {
     Program mHdrCopy;
     Program mPhysicalSky, mSkyApply;
     Target mSky;
+    Program mCloudMarch, mCloudApply;
+    Target mClouds;
+    GLuint mCloudNoise = 0;
+    void RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
@@ -114,8 +118,9 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 7;
+    static constexpr int kQueryStages = 8;
     static constexpr int kSkyTimerStage = 6;
+    static constexpr int kCloudTimerStage = 7;
     static constexpr int kShadowTimerStage = 2;
     static constexpr int kShaftTimerStage = 3;
     static constexpr int kWaterTimerStage = 4;
