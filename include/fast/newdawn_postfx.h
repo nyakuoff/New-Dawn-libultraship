@@ -26,6 +26,7 @@ typedef struct NewDawnPostFxParams {
     /* Read-only normal outdoor sky state. Unknown/scripted skies never emit the physical-sky marker. */
     float skySunDir[3];
     float skyFogColor[3];
+    float skyPaletteColor[3]; /* current time-of-day sky palette, sRGB; read after UpdateSkybox */
     float skyWeather; /* 0 clear, 1 overcast */
 
     /* New Dawn real-time shadows. */

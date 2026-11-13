@@ -61,6 +61,19 @@ static float DecodeColor(float c) {
 // Single scattering in a spherical atmosphere. Distances in km; Rayleigh coefficients at sea level,
 // exponential 8 km / 1.2 km scale heights and a Cornette-Shanks aerosol phase. Original implementation.
 // No sun disc here: Environment_Draw retains the game's sun, stars and Moon in their original order.
+static const char* kSkyPaletteLib = R"GLSL(
+uniform vec3 uPaletteColor;
+vec3 skyPaletteTint(vec3 radiance, float sunHeight) {
+    const vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+    float twilight = (1.0-smoothstep(0.12, 0.42, abs(sunHeight))) * smoothstep(-0.15, 0.025, sunHeight);
+    float y = dot(radiance, luma);
+    vec3 tint = uPaletteColor / max(dot(uPaletteColor, luma), 0.001);
+    // Retain scattering luminance/gradient and the bright Mie aureole; restore Termina's dusk/dawn mood.
+    float weight = 0.82 * twilight * (1.0-smoothstep(0.8, 3.0, y));
+    return mix(radiance, tint * y, weight);
+}
+)GLSL";
+
 static const char* kPhysicalSkyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -125,7 +138,7 @@ vec3 sky(vec3 ray) {
     // Bounded multiple-scattering fill and starlight; the game still draws the visible stars afterwards.
     radiance += vec3(0.018, 0.035, 0.065) * daylight + vec3(0.0015, 0.0025, 0.006) * (1.0-daylight);
     radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), uWeather * 0.65);
-    return radiance * uIntensity;
+    return skyPaletteTint(radiance, uSunDir.y) * uIntensity;
 }
 void main() {
     vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
@@ -233,7 +246,7 @@ void main() {
         }
     }
     float horizon = smoothstep(0.025, 0.12, ray.y);
-    oColor = vec4(color * uIntensity, 1.0-trans) * horizon;
+    oColor = vec4(skyPaletteTint(color, uSunDir.y) * uIntensity, 1.0-trans) * horizon;
 }
 )GLSL";
 
@@ -1498,14 +1511,14 @@ void PostFxGL::Init() {
 }
 
 bool PostFxGL::BuildPrograms() {
-    const char* physicalSky[] = { kVersion, kPhysicalSkyShader };
+    const char* physicalSky[] = { kVersion, kSkyPaletteLib, kPhysicalSkyShader };
     const char* skyApply[] = { kVersion, kSkyApplyShader };
     // Sky shaders fail independently; an unavailable optional sky never disables the established HDR path.
-    mPhysicalSky.id = BuildProgram("physical sky", physicalSky, 2, mPhysicalSky.uniforms);
+    mPhysicalSky.id = BuildProgram("physical sky", physicalSky, 3, mPhysicalSky.uniforms);
     mSkyApply.id = BuildProgram("sky upscale", skyApply, 2, mSkyApply.uniforms);
-    const char* cloudMarch[] = { kVersion, kCloudMarchShader };
+    const char* cloudMarch[] = { kVersion, kSkyPaletteLib, kCloudMarchShader };
     const char* cloudApply[] = { kVersion, kCloudApplyShader };
-    mCloudMarch.id = BuildProgram("volumetric clouds", cloudMarch, 2, mCloudMarch.uniforms);
+    mCloudMarch.id = BuildProgram("volumetric clouds", cloudMarch, 3, mCloudMarch.uniforms);
     mCloudApply.id = BuildProgram("cloud upscale", cloudApply, 2, mCloudApply.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
@@ -1756,6 +1769,11 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
             DecodeColor(params.skyFogColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
     }
     glUniform3fv(Loc("uFog"), 1, fog);
+    float palette[3];
+    for (int i = 0; i < 3; ++i) {
+        palette[i] = DecodeColor(params.skyPaletteColor[i]) * 0.8f + DecodeColor(params.skyFogColor[i]) * 0.2f;
+    }
+    glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
     Draw(mSky);
@@ -1834,6 +1852,11 @@ void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL
     glUniform3fv(Loc("uSunDir"), 1, params.skySunDir);
     glUniform1f(Loc("uWeather"), params.skyWeather);
     glUniform1f(Loc("uCoverage"), coverage);
+    float palette[3];
+    for (int i = 0; i < 3; ++i) {
+        palette[i] = DecodeColor(params.skyPaletteColor[i]) * 0.8f + DecodeColor(params.skyFogColor[i]) * 0.2f;
+    }
+    glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
     // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
