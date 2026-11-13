@@ -143,43 +143,49 @@ GLuint Compile(GLenum type, const char* text) {
 }
 } // namespace
 
-bool PostFxGL::BuildAtmosProgram() {
-    // Lazy, optional: an atmosphere failure never disables the established postfx pipeline.
-    if (mAtmosAttempted)
-        return mAtmos.id != 0;
-    mAtmosAttempted = true;
-    GLuint vs = Compile(GL_VERTEX_SHADER, kVertex), fs = Compile(GL_FRAGMENT_SHADER, kFragment);
+bool PostFxGL::BuildAtmosShader(Program& program, const char* vertex, const char* fragment) {
+    GLuint vs = Compile(GL_VERTEX_SHADER, vertex), fs = Compile(GL_FRAGMENT_SHADER, fragment);
     if (!vs || !fs) {
         glDeleteShader(vs);
         glDeleteShader(fs);
         return false;
     }
-    mAtmos.id = glCreateProgram();
-    glAttachShader(mAtmos.id, vs);
-    glAttachShader(mAtmos.id, fs);
-    glLinkProgram(mAtmos.id);
+    program.id = glCreateProgram();
+    glAttachShader(program.id, vs);
+    glAttachShader(program.id, fs);
+    glLinkProgram(program.id);
     glDeleteShader(vs);
     glDeleteShader(fs);
     GLint ok;
-    glGetProgramiv(mAtmos.id, GL_LINK_STATUS, &ok);
+    glGetProgramiv(program.id, GL_LINK_STATUS, &ok);
     if (!ok) {
         char log[2048];
-        glGetProgramInfoLog(mAtmos.id, sizeof(log), nullptr, log);
+        glGetProgramInfoLog(program.id, sizeof(log), nullptr, log);
         SPDLOG_ERROR("NewDawnAtmos link: {}", log);
-        glDeleteProgram(mAtmos.id);
-        mAtmos.id = 0;
+        glDeleteProgram(program.id);
+        program.id = 0;
         return false;
     }
     GLint count;
-    glGetProgramiv(mAtmos.id, GL_ACTIVE_UNIFORMS, &count);
+    glGetProgramiv(program.id, GL_ACTIVE_UNIFORMS, &count);
     for (GLint i = 0; i < count; i++) {
         char name[256];
         GLsizei length;
         GLint size;
         GLenum type;
-        glGetActiveUniform(mAtmos.id, i, sizeof(name), &length, &size, &type, name);
-        mAtmos.uniforms[name] = glGetUniformLocation(mAtmos.id, name);
+        glGetActiveUniform(program.id, i, sizeof(name), &length, &size, &type, name);
+        program.uniforms[name] = glGetUniformLocation(program.id, name);
     }
+    return true;
+}
+
+bool PostFxGL::BuildAtmosProgram() {
+    // Lazy, optional: an atmosphere failure never disables the established postfx pipeline.
+    if (mAtmosAttempted)
+        return mAtmos.id != 0;
+    mAtmosAttempted = true;
+    if (!BuildAtmosShader(mAtmos, kVertex, kFragment))
+        return false;
     Use(mAtmos);
     glUniform1i(Loc("uAtmosSprite"), kSpriteUnit);
     glUniform1i(Loc("uAtmosDepth"), kDepthUnit);

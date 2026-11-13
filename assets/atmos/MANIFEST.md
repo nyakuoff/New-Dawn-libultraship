@@ -8,3 +8,5 @@ Downloaded: 2026-11-13.
 Used: circle_05.png, soft round alpha sprite. dust_64.png is a 64x64 Lanczos-downsampled RGBA copy.
 Inspected only: light_01.png, light_02.png, light_03.png, smoke_01.png.
 No proprietary game assets are included.
+
+A2 also uses circle_01.png, downsampled to splash_64.png (64x64), under the same CC0 license.

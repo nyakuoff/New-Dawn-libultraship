@@ -6,6 +6,8 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN 9 /* native rain draw scope, updates/RNG still run */
+#define NEWDAWN_POSTFX_STAGE_WEATHER_END 10
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN 7 /* native sun flare draw scope; environment updates still run */
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_END 8
 #define NEWDAWN_POSTFX_STAGE_SKY_BEGIN 4 /* explicit skybox colour calibration */
@@ -66,9 +68,10 @@ typedef struct NewDawnPostFxParams {
 
     /* Render-only ambient particles. Scene and lights are read-only snapshots. */
 #define NEWDAWN_ATMOS_LIGHTS 8
-    int32_t atmosBiome, atmosScene;
+    int32_t atmosBiome, atmosScene, atmosParticles, atmosWeather;
+    float atmosSnow;
     float atmosNight, atmosRain;
-    float atmosEye[3], atmosSunColor[3];
+    float atmosEye[3], atmosSunColor[3], atmosSkyColor[3];
     int32_t atmosLightCount;
     float atmosLights[NEWDAWN_ATMOS_LIGHTS][4]; /* position, radius */
     float atmosLightColors[NEWDAWN_ATMOS_LIGHTS][3];
