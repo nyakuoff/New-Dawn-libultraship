@@ -205,6 +205,7 @@
         uniform sampler2D uMaterialNormal;
         uniform sampler2D uMaterialRoughness;
         uniform float uMaterialStrength;
+        uniform int uMaterialDebug; // 1: specular only, 2: roughness, 3: N.V sign, 4: diffuse only
         uniform vec2 uMaterialMirror;
 
         // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
@@ -242,7 +243,10 @@
         // so material surfaces keep the scene's tone and only gain relief and highlights.
         vec3 materialSpecular(vec3 n, float roughness, float weight, bool hdrLit) {
             vec3 v = -vViewPos / max(length(vViewPos), 0.0001);
-            float nv = max(dot(n, v), 0.001);
+            float nv = clamp(dot(n, v), 0.0, 1.0);
+            // A BRDF has no response below either hemisphere. Clamping a negative N.V
+            // positive instead produced bright grazing lobes on the game's authored normals.
+            if (nv <= 0.0) return vec3(0.0);
             float a2 = pow(roughness, 4.0);
             float sun = hdrLit ? uHdrSun : 1.0;
             vec3 result = vec3(0.0);
@@ -261,10 +265,11 @@
                 } else {
                     l = normalize(uViewMatrix * uLightDir[i]);
                 }
-                float nl = max(dot(n, l), 0.0);
+                float nl = clamp(dot(n, l), 0.0, 1.0);
+                if (nl <= 0.0) continue;
                 vec3 h = (v + l) / max(length(v + l), 0.0001);
                 float nh = max(dot(n, h), 0.0);
-                float vh = max(dot(v, h), 0.0);
+                float vh = clamp(dot(v, h), 0.0, 1.0);
                 float denom = nh * nh * (a2 - 1.0) + 1.0;
                 // GGX/Smith/Schlick dielectric. The game's irradiance is Lambert without 1/pi, so the
                 // specular is pi-scaled to stay in the same radiometric convention.
@@ -276,7 +281,10 @@
                 float f = fresnel * min(uMaterialStrength, 1.0) * weight;
                 result += vec3(f * d * visibility) * (uLightColor[i] / 255.0) * nl * attenuation;
             }
-            return max(result, vec3(0.0));
+            // These replacements contain painted lighting, not calibrated PBR albedo.
+            // A fully rough companion must not add an untextured white lobe over it.
+            float smoothness = 1.0 - roughness;
+            return max(result, vec3(0.0)) * smoothness * smoothness;
         }
     @end
 
@@ -479,8 +487,23 @@
         @if(o_material_maps)
             if (materialDiffuse) {
                 vec3 specular = materialSpecular(materialN, materialRoughness, materialWeight, hdrDiffuse);
-                if (uHdrWorld) texel.rgb += specular;
-                else texel.rgb = fromLinear(vec4(hdrDecode(texel.rgb) + specular, 1.0)).rgb;
+                // Bound the additive lobe relative to the already lit linear texel, per
+                // channel: painted cracks and shadowed/black texels must stay dark. The
+                // smooth knee preserves small highlights; rough surfaces get at most 2%
+                // extra linear radiance, while smoother wet/metal surfaces have more room.
+                vec3 diffuse = uHdrWorld ? texel.rgb : hdrDecode(texel.rgb);
+                float smoothness2 = (1.0 - materialRoughness) * (1.0 - materialRoughness);
+                vec3 budget = max(diffuse, vec3(0.0)) * (0.02 + 0.5 * smoothness2 * smoothness2);
+                specular = budget * specular / max(budget + specular, vec3(0.000001));
+                if (uMaterialDebug == 4) specular = vec3(0.0);
+                if (uHdrWorld) texel.rgb = diffuse + specular;
+                else texel.rgb = fromLinear(vec4(diffuse + specular, 1.0)).rgb;
+                if (uMaterialDebug == 1) texel.rgb = uHdrWorld ? specular : fromLinear(vec4(specular, 1.0)).rgb;
+                if (uMaterialDebug == 2) texel.rgb = vec3(materialRoughness);
+                if (uMaterialDebug == 3) {
+                    float nv = dot(materialN, normalize(-vViewPos));
+                    texel.rgb = nv > 0.0 ? vec3(0.0, nv, 0.0) : vec3(-nv, 0.0, 0.0);
+                }
             }
         @end
         // TODO discard if alpha is 0?
