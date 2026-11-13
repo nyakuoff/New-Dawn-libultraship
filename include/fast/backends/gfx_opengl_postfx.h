@@ -46,6 +46,7 @@ class PostFxGL {
     // Dedicated world-shader unit; the interpreter owns 0..7 and ordinary postfx use 8..11.
     static constexpr int kSkyAmbientUnit = 12;
     static constexpr int kSkyReflectionUnit = 13;
+    static constexpr int kFogUnit = 14;
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
     }
@@ -93,6 +94,7 @@ class PostFxGL {
     void RunShadows(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* positions,
                     uint32_t vertexCount, int debug);
     void RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
@@ -155,12 +157,16 @@ class PostFxGL {
     uint32_t mWaterOpaqueFrame = UINT32_MAX;
     Target mShadowMap;
     Target mShaftA, mShaftB; // half resolution
+    Program mFogMarch, mFogApply;
+    Target mFog;
+    GLuint mFogNeutral = 0;
     static constexpr int kMaxBloomLevels = 6;
     Target mBloom[kMaxBloomLevels];
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 9;
+    static constexpr int kQueryStages = 10;
+    static constexpr int kFogTimerStage = 9;
     static constexpr int kSkyTimerStage = 6;
     static constexpr int kCloudTimerStage = 7;
     static constexpr int kSkyAmbientTimerStage = 8;

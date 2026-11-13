@@ -56,6 +56,12 @@ typedef struct NewDawnPostFxParams {
     float shaftStrength;     /* already multiplied by the sun-height and sun-colour fades */
     float shaftFogColor[3];  /* 0..1, the game's fog colour */
 
+    /* Render-only height fog. Normal outdoor scenes only; native distance fog remains authoritative. */
+    int32_t fogVolumetric;
+    float fogBaseHeight;
+    float fogHeight;
+    float fogDensityScale;
+
     /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
 #define NEWDAWN_MAX_WATER_BOXES 16
     int32_t waterEnabled;
