@@ -125,6 +125,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     }
 
     if (mCurrentShaderProgram->material_strength_location >= 0) {
+        glUniform1i(mCurrentShaderProgram->material_debug_location,
+                    Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                        "gNewDawn.Materials.Debug.View", 0));
         const auto& materialAlbedo = textures[mCurrentTextureIds[mCurrentShaderProgram->materialTile]];
         glUniform2f(mCurrentShaderProgram->material_mirror_location, materialAlbedo.mirrorS, materialAlbedo.mirrorT);
         glUniform1f(mCurrentShaderProgram->material_strength_location,
@@ -731,6 +734,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_shade_mask_location = glGetUniformLocation(shader_program, "uShadeMask");
     prg->material_mirror_location = glGetUniformLocation(shader_program, "uMaterialMirror");
     prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
+    prg->material_debug_location = glGetUniformLocation(shader_program, "uMaterialDebug");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
 
     LoadShader(prg);
