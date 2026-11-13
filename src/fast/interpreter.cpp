@@ -4928,9 +4928,10 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     // Only ever post-process the game framebuffer itself
     if (gfx->mPostFxActive && gfx->mRendersToFb && !gfx->mFbActive) {
         NewDawnPostFxParams effective = params;
-        if (stage == NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY) {
+        if (stage == NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY || stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN) {
             // P includes the interpolated camera view, independent of the rotating skybox model matrix.
             effective.shadowUseExactProj = Invert4x4(gfx->mRsp->P_matrix, effective.shadowInvViewProj);
+            memcpy(effective.shadowViewProj, gfx->mRsp->P_matrix, sizeof(effective.shadowViewProj));
             float xScale = gfx->AdjXForAspectRatio(1.0f);
             effective.shadowNdcXScale = xScale > 1e-6f ? 1.0f / xScale : 1.0f;
             effective.shadowFlipY = gfx->mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
