@@ -137,12 +137,17 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
                                0.0f, 2.0f));
     }
     glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
-    bool skyAmbient = false;
+    bool skyAmbient = false, skyReflections = false;
 #ifndef USE_OPENGLES
     skyAmbient = HdrWorldActive() && mPostFx && mPostFx->SkyAmbientActive() && !mHdrSky;
+    skyReflections = HdrWorldActive() && mPostFx && mPostFx->SkyReflectionsActive() && !mHdrSky;
+    if (skyReflections)
+        glUniform3fv(mCurrentShaderProgram->sky_eye_location, 1, mPostFx->SkyReflectionEye());
 #endif
     glUniform1i(mCurrentShaderProgram->sky_ambient_enabled_location, skyAmbient);
     glUniform1i(mCurrentShaderProgram->sky_irradiance_location, 12);
+    glUniform1i(mCurrentShaderProgram->sky_reflections_enabled_location, skyReflections);
+    glUniform1i(mCurrentShaderProgram->sky_specular_location, 13);
     if (HdrWorldActive()) {
         auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sky_location,
@@ -722,6 +727,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->hdr_location = glGetUniformLocation(shader_program, "uHdrWorld");
     prg->sky_ambient_enabled_location = glGetUniformLocation(shader_program, "uSkyAmbientEnabled");
     prg->sky_irradiance_location = glGetUniformLocation(shader_program, "uSkyIrradiance");
+    prg->sky_reflections_enabled_location = glGetUniformLocation(shader_program, "uSkyReflectionsEnabled");
+    prg->sky_specular_location = glGetUniformLocation(shader_program, "uSkySpecular");
+    prg->sky_eye_location = glGetUniformLocation(shader_program, "uSkyEye");
     prg->hdr_sun_location = glGetUniformLocation(shader_program, "uHdrSun");
     prg->hdr_ambient_location = glGetUniformLocation(shader_program, "uHdrAmbient");
     prg->hdr_sky_location = glGetUniformLocation(shader_program, "uHdrSky");
@@ -750,6 +758,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     // Sampler types must use distinct units even when their branch is disabled. Set this at creation,
     // before any possible draw/validation, for HDR-off and Ambient-off programs as well.
     glUniform1i(prg->sky_irradiance_location, 12);
+    glUniform1i(prg->sky_specular_location, 13);
 
     if (cc_features.opt_material_maps) {
         glUniform1i(glGetUniformLocation(shader_program, "uMaterialNormal"), MATERIAL_NORMAL_TEXTURE);
@@ -1127,6 +1136,8 @@ void GfxRenderingAPIOGL::Init() {
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glActiveTexture(GL_TEXTURE0 + PostFxGL::kSkyReflectionUnit);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, mSkyAmbientNeutral);
     glActiveTexture(previousActive);
     mPostFx = std::make_unique<PostFxGL>();
     mPostFx->Init();

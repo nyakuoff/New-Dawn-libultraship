@@ -40,6 +40,7 @@ struct ShaderProgram {
     uint8_t numAttribs;
     GLint hdr_location, hdr_sun_location, hdr_ambient_location, hdr_sky_location, hdr_fog_location;
     GLint sky_ambient_enabled_location, sky_irradiance_location;
+    GLint sky_reflections_enabled_location, sky_specular_location, sky_eye_location;
     GLint frameCountLocation;
     GLint noiseScaleLocation;
     GLint prim_depth_location;

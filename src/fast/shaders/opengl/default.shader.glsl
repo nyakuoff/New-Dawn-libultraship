@@ -231,6 +231,11 @@
         uniform float uMaterialStrength;
         uniform int uMaterialDebug; // 1: specular only, 2: roughness, 3: N.V sign, 4: diffuse only
         uniform vec2 uMaterialMirror;
+#ifndef GL_ES
+        uniform bool uSkyReflectionsEnabled;
+        uniform samplerCube uSkySpecular;
+        uniform vec3 uSkyEye;
+#endif
 
         // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
         // +Y-up normals (texture rows increase down). Keeping the signed determinant handles
@@ -262,6 +267,27 @@
             if (abs(det) < 1e-12 || min(t2, b2) < 1e-16) return n;
             return normalize(t * inversesqrt(t2) * mapped.x - b * inversesqrt(b2) * mapped.y + n * mapped.z);
         }
+
+#ifndef GL_ES
+        vec3 materialSkySpecular(vec3 n, float roughness, float weight) {
+            if (!uSkyReflectionsEnabled) return vec3(0.0);
+            // MM's modelview attributes are world-space: its camera view is in P.
+            vec3 skyView = normalize(uSkyEye - vViewPos);
+            float skyNv = max(dot(n, skyView), 0.0);
+            if (skyNv > 0.0) {
+                // Analytic split-sum BRDF fit, with the prefiltered GGX environment in four roughness steps.
+                vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+                vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+                vec4 r = roughness * c0 + c1;
+                float a004 = min(r.x * r.x, exp2(-9.28 * skyNv)) * r.x + r.y;
+                vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
+                vec3 environment = textureLod(uSkySpecular, reflect(-skyView, n), roughness * 4.0).rgb;
+                return environment * max(0.04 * ab.x + ab.y, 0.0) *
+                          min(uMaterialStrength, 1.0) * weight * (1.0-roughness) * (1.0-roughness);
+            }
+            return vec3(0.0);
+        }
+#endif
 
         // Specular only: the diffuse term reuses the game's own per-pixel light model (see shadeNormal),
         // so material surfaces keep the scene's tone and only gain relief and highlights.
@@ -511,6 +537,9 @@
         @if(o_material_maps)
             if (materialDiffuse) {
                 vec3 specular = materialSpecular(materialN, materialRoughness, materialWeight, hdrDiffuse);
+#ifndef GL_ES
+                if (hdrDiffuse) specular += materialSkySpecular(materialN, materialRoughness, materialWeight);
+#endif
                 // Bound the additive lobe relative to the already lit linear texel, per
                 // channel: painted cracks and shadowed/black texels must stay dark. The
                 // smooth knee preserves small highlights; rough surfaces get at most 2%

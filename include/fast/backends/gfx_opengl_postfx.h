@@ -45,6 +45,13 @@ class PostFxGL {
     }
     // Dedicated world-shader unit; the interpreter owns 0..7 and ordinary postfx use 8..11.
     static constexpr int kSkyAmbientUnit = 12;
+    static constexpr int kSkyReflectionUnit = 13;
+    bool SkyReflectionsActive() const {
+        return mHdrActive && mSkyReflectionsReady;
+    }
+    const float* SkyReflectionEye() const {
+        return mSkyReflectionEye;
+    }
 
     struct Settings {
         bool postFxOn, aoOn, bloomOn, gradeOn;
@@ -73,9 +80,9 @@ class PostFxGL {
     struct CubeTarget {
         GLuint tex = 0;
         GLuint fbo = 0;
-        int size = 0;
+        int size = 0, levels = 0;
     };
-    bool EnsureCube(CubeTarget& target, int size);
+    bool EnsureCube(CubeTarget& target, int size, int levels = 1);
     void SetSkyUniforms(const NewDawnPostFxParams& params);
     void RunSkyAmbient(const NewDawnPostFxParams& params);
     bool BuildPrograms();
@@ -114,15 +121,17 @@ class PostFxGL {
     Program mCloudMarch, mCloudApply;
     Target mClouds;
     GLuint mCloudNoise = 0;
-    Program mSkyEnvironment, mCloudEnvironment, mSkyConvolve;
-    CubeTarget mSkyRadiance, mSkyIrradiance;
+    Program mSkyEnvironment, mCloudEnvironment, mSkyConvolve, mSkyPrefilter;
+    CubeTarget mSkyRadiance, mSkyIrradiance, mSkySpecular;
+    bool mSkyReflectionsReady = false;
+    float mSkyReflectionEye[3] = {};
     bool mSkyAmbientReady = false;
     bool mSkyAmbientUsable = true;
     bool mSkyAmbientCacheValid = false;
     uint32_t mSkyFrame = 0, mSkyLastEligible = UINT32_MAX, mSkyLastRefresh = 0;
     int32_t mSkyCachedScene = -1;
     float mSkyCachedSun[3] = {}, mSkyCachedWeather = 0.0f;
-    float mSkyCachedSettings[6] = {};
+    float mSkyCachedSettings[7] = {};
     void RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;

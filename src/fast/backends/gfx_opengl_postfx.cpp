@@ -83,6 +83,7 @@ uniform float uFlipY;
 uniform vec3 uSunDir;
 uniform vec3 uFog;
 uniform float uWeather;
+uniform float uOvercast;
 uniform float uIntensity;
 const float PI = 3.14159265;
 const float Rg = 6360.0;
@@ -102,7 +103,7 @@ vec3 sky(vec3 ray) {
     float distance = exitDistance(origin, ray);
     vec2 optical = vec2(0.0);
     vec3 sumR = vec3(0.0), sumM = vec3(0.0);
-    float aerosol = mix(1.0, 3.0, uWeather);
+    float aerosol = mix(mix(1.0, 3.0, uWeather), 10.0, uOvercast);
     for (int i = 0; i < 12; ++i) {
         float t0 = pow(float(i) / 12.0, 2.0) * distance;
         float t1 = pow(float(i+1) / 12.0, 2.0) * distance;
@@ -137,7 +138,9 @@ vec3 sky(vec3 ray) {
     float daylight = smoothstep(-0.12, 0.12, uSunDir.y);
     // Bounded multiple-scattering fill and starlight; the game still draws the visible stars afterwards.
     radiance += vec3(0.018, 0.035, 0.065) * daylight + vec3(0.0015, 0.0025, 0.006) * (1.0-daylight);
-    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), uWeather * 0.65);
+    // Overcast (winter snow sky): low contrast, mostly the fog's own hue, so the deck meets the snow fog.
+    float haze = max(uWeather * 0.65, uOvercast * 0.8);
+    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), haze);
     return skyPaletteTint(radiance, uSunDir.y) * uIntensity;
 }
 void main() {
@@ -151,7 +154,10 @@ void main() {
 #endif
     vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
     // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
-    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.05, ray.y));
+    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, mix(0.05, 0.45, uOvercast), ray.y));
+#ifdef SKY_CAPTURE
+    color = cubeFinite(color);
+#endif
     oColor = vec4(color, 1.0);
 }
 )GLSL";
@@ -175,6 +181,8 @@ uniform float uNdcXScale;
 uniform float uFlipY;
 uniform vec3 uSunDir;
 uniform float uWeather;
+uniform float uOvercast;
+uniform vec3 uFog;
 uniform float uCoverage;
 uniform vec2 uWind;
 uniform float uIntensity;
@@ -213,6 +221,9 @@ void main() {
     if (uCoverage <= 0.0) return;
 #ifdef SKY_CAPTURE
     vec3 ray = cubeDirection(vUv);
+    // Cube captures include the lower hemisphere; cloud slabs exist only above the horizon.
+    // A negative march length there can overflow extinction and contaminate rough specular mips with NaNs.
+    if (ray.y <= 0.025) return;
     vec3 origin = uCubeOrigin * 0.00002;
 #else
     vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
@@ -251,16 +262,22 @@ void main() {
             vec3 ambient = mix(vec3(0.085,0.11,0.16), vec3(0.20,0.25,0.33), h) * day +
                            vec3(0.0015,0.0025,0.005) * (1.0-day);
             vec3 lighting = ambient + sunColor * phase * sunTrans * (0.8 + 0.2*(1.0-exp(-d*2.0)));
+            // Overcast snow deck: a bright, low-contrast layer lit by the diffuse fog colour. Its base is a
+            // little darker, and thick cores shade softly instead of blackening.
+            vec3 deck = uFog * (0.68 + 0.30*h) * (0.74 + 0.26*sunTrans) * (1.0 - 0.22*smoothstep(0.25, 1.0, d));
+            lighting = mix(lighting, deck, uOvercast); // fog colour already carries the time of day
             float opacity = 1.0-exp(-d*ds*2.8);
             color += trans * opacity * lighting;
             trans *= 1.0-opacity;
             if (trans < 0.015) break;
         }
     }
-    float horizon = smoothstep(0.025, 0.12, ray.y);
+    float horizon = smoothstep(0.025, mix(0.12, 0.45, uOvercast), ray.y);
     oColor = vec4(skyPaletteTint(color, uSunDir.y) * uIntensity, 1.0-trans) * horizon;
 #ifdef SKY_CAPTURE
     oColor *= uCloudStrength;
+    if (any(isnan(oColor)) || any(isinf(oColor))) oColor = vec4(0.0);
+    oColor = max(oColor, vec4(0.0));
 #endif
 }
 )GLSL";
@@ -284,6 +301,11 @@ void main() {
 static const char* kSkyCubeDirectionLib = R"GLSL(
 uniform int uCubeFace;
 uniform vec3 uCubeOrigin;
+// A single invalid cached texel would otherwise contaminate every surface for eight frames.
+vec3 cubeFinite(vec3 c) {
+    if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
+    return max(c,vec3(0.0));
+}
 vec3 cubeDirection(vec2 uv) {
     vec2 p = uv*2.0-1.0;
     if (uCubeFace == 0) return normalize(vec3(1.0,-p.y,-p.x));
@@ -322,7 +344,38 @@ void main() {
     // Calibrate to the existing ambient energy rather than changing exposure/night visibility.
     // Preserve at least 95% of baseline ambient luminance in every direction, allow 20% overhead fill.
     float gain = clamp(y/max(upperReference*0.65,1e-6),0.95,1.20);
-    oColor = vec4(mix(vec3(1.0),chroma,0.65)*gain,1.0);
+    oColor = vec4(cubeFinite(mix(vec3(1.0),chroma,0.65)*gain),1.0);
+}
+)GLSL";
+
+// Deterministic GGX prefilter. The base mip retains cloud shape; the other four soften with roughness.
+static const char* kSkyPrefilterShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform samplerCube uEnvironment;
+uniform float uRoughness;
+void main() {
+    vec3 N = cubeDirection(vUv);
+    if (uRoughness < 0.001) { oColor = vec4(cubeFinite(textureLod(uEnvironment,N,0.0).rgb),1.0); return; }
+    vec3 up = abs(N.y)<0.99 ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 T = normalize(cross(up,N)), B = cross(N,T);
+    vec3 sum = vec3(0.0); float weight = 0.0;
+    float a = uRoughness*uRoughness;
+    for (int i=0; i<32; ++i) {
+        float x = float(i)/32.0;
+        // Radical inverse for this fixed 32-sample Hammersley sequence, compatible with GLSL 1.30.
+        float y=0.0, f=0.5; int bits=i;
+        for (int b=0; b<5; ++b) { y+=float(bits%2)*f; bits/=2; f*=0.5; }
+        float phi=6.2831853*x;
+        float ct=sqrt((1.0-y)/(1.0+(a*a-1.0)*y));
+        float st=sqrt(max(1.0-ct*ct,0.0));
+        vec3 H=T*(cos(phi)*st)+B*(sin(phi)*st)+N*ct;
+        vec3 L=reflect(-N,H);
+        float nl=max(dot(N,L),0.0);
+        // Sky/ground seam stays tied to the game's horizon, rather than reflecting a bright lower dome.
+        sum+=textureLod(uEnvironment,L,0.0).rgb*nl; weight+=nl;
+    }
+    oColor=vec4(cubeFinite(sum/max(weight,1e-5)),1.0);
 }
 )GLSL";
 
@@ -1117,6 +1170,8 @@ uniform float uPixelAngle;
 uniform vec3 uLightDir;
 uniform vec3 uLightColor;
 uniform vec3 uSky;
+uniform bool uSkyReflectionsEnabled;
+uniform samplerCube uSkySpecular;
 #ifdef WATER_REFLECTIONS
 uniform mat4 uViewProj;
 uniform sampler2D uOpaqueColor;
@@ -1291,6 +1346,10 @@ void main() {
     float ndv = max(dot(N, V), 1e-3);
     float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
     vec3 refl = uSky * fres;
+    if (uSkyReflectionsEnabled) {
+        vec3 R = reflect(-V, normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25)));
+        refl = textureLod(uSkySpecular, R, 0.4 + clamp(footprint * 0.02, 0.0, 1.1)).rgb * fres;
+    }
 
     vec3 L = uLightDir;
     vec3 Hv = normalize(L + V);
@@ -1320,6 +1379,19 @@ void main() {
     }
     // A premultiplied reflection can darken the painted water as well as brighten it. Screen-only addition
     // erased dark reflected objects. Lift the Fresnel response perceptually while retaining its view-angle falloff.
+    if (uSkyReflectionsEnabled) {
+        vec3 R = reflect(-V, reflectionNormal);
+        vec3 environment = textureLod(uSkySpecular, R, 0.4 + clamp(footprint * 0.02, 0.0, 1.1)).rgb;
+        // Retain the established perceptual visibility for confident geometry hits. The cube uses
+        // physical water Schlick (F0=0.02), so a miss cannot increase reflection strength or wash out
+        // mid-angle turquoise. Confidence crossfades the two premultiplied contributions.
+        float ssrWeight = uReflectionStrength * sqrt(fres) * shore * hit.a;
+        float skyWeight = 0.4 * uReflectionStrength * fres * shore * (1.0-hit.a);
+        float weight = ssrWeight + skyWeight;
+        vec3 glints = max(add - refl * 0.6 * uStrength * shore, vec3(0.0));
+        oColor = vec4(environment * skyWeight + hit.rgb * ssrWeight + glints * (1.0-weight), weight);
+        return;
+    }
     float reflectionWeight = uReflectionStrength * sqrt(fres) * shore * hit.a;
     add += uSky * fres * 0.6 * uReflectionStrength * shore * (1.0 - hit.a);
     oColor = vec4(hit.rgb * reflectionWeight + max(add, 0.0) * (1.0 - reflectionWeight), reflectionWeight);
@@ -1434,13 +1506,15 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
     }
     // Postfx shadow programs also declare the ambient cube. Assign its distinct unit at link time,
     // including legacy/HDR-off programs, before any validation or draw can observe the default unit 0.
-    if (auto ambient = uniforms.find("uSkyIrradiance"); ambient != uniforms.end()) {
-        GLint previous;
-        glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
-        glUseProgram(prg);
-        glUniform1i(ambient->second, PostFxGL::kSkyAmbientUnit);
-        glUseProgram(previous);
+    GLint previous;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+    glUseProgram(prg);
+    for (auto sampler : { std::pair<const char*, int>{ "uSkyIrradiance", PostFxGL::kSkyAmbientUnit },
+                          { "uSkySpecular", PostFxGL::kSkyReflectionUnit } }) {
+        if (auto location = uniforms.find(sampler.first); location != uniforms.end())
+            glUniform1i(location->second, sampler.second);
     }
+    glUseProgram(previous);
     return prg;
 }
 
@@ -1634,6 +1708,8 @@ bool PostFxGL::BuildPrograms() {
     const char* cloudEnvironment[] = { kVersion, "#define SKY_CAPTURE\n", kSkyPaletteLib, kSkyCubeDirectionLib,
                                        kCloudMarchShader };
     const char* convolve[] = { kVersion, kSkyCubeDirectionLib, kSkyConvolveShader };
+    const char* prefilter[] = { kVersion, kSkyCubeDirectionLib, kSkyPrefilterShader };
+    mSkyPrefilter.id = BuildProgram("sky GGX prefilter", prefilter, 3, mSkyPrefilter.uniforms);
     mSkyEnvironment.id = BuildProgram("sky radiance cube", skyEnvironment, 5, mSkyEnvironment.uniforms);
     mCloudEnvironment.id = BuildProgram("cloud radiance cube", cloudEnvironment, 5, mCloudEnvironment.uniforms);
     mSkyConvolve.id = BuildProgram("sky diffuse convolution", convolve, 3, mSkyConvolve.uniforms);
@@ -1812,6 +1888,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     // Eligibility must be re-established by this frame's physical-sky marker. Never reuse a previous
     // outdoor frame's illumination in interiors, scripted/final-day skies, pause backgrounds or HDR fallbacks.
     mSkyAmbientReady = false;
+    mSkyReflectionsReady = false;
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -1884,8 +1961,10 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     }
     glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
+    glUniform1f(Loc("uOvercast"), params.skyOvercast);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
-    glUniform1f(Loc("uCoverage"), std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f));
+    glUniform1f(Loc("uCoverage"),
+                std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast));
     // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
@@ -1999,23 +2078,28 @@ void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL
     CheckError("volumetric clouds");
 }
 
-bool PostFxGL::EnsureCube(CubeTarget& target, int size) {
-    if (target.tex)
+bool PostFxGL::EnsureCube(CubeTarget& target, int size, int levels) {
+    if (target.size == size && target.levels == levels)
         return true;
     glActiveTexture(GL_TEXTURE0 + kFirstUnit);
-    glGenTextures(1, &target.tex);
+    if (!target.tex)
+        glGenTextures(1, &target.tex);
     glBindTexture(GL_TEXTURE_CUBE_MAP, target.tex);
-    for (int face = 0; face < 6; ++face) {
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGB16F, size, size, 0, GL_RGB, GL_FLOAT, nullptr);
-    }
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    for (int level = 0; level < levels; ++level)
+        for (int face = 0; face < 6; ++face) {
+            const int dim = std::max(size >> level, 1);
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, level, GL_RGB16F, dim, dim, 0, GL_RGB, GL_FLOAT,
+                         nullptr);
+        }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 0);
-    glGenFramebuffers(1, &target.fbo);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, levels - 1);
+    if (!target.fbo)
+        glGenFramebuffers(1, &target.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, target.tex, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -2024,22 +2108,29 @@ bool PostFxGL::EnsureCube(CubeTarget& target, int size) {
         return false;
     }
     target.size = size;
+    target.levels = levels;
     return true;
 }
 
 void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
-    if (!CvInt("gNewDawn.Sky.Ambient", 0) || !mSkyAmbientUsable || !mSkyEnvironment.id || !mCloudEnvironment.id ||
+    const bool ambient = CvInt("gNewDawn.Sky.Ambient", 0) != 0;
+    const bool reflections = CvInt("gNewDawn.Sky.Reflections", 0) != 0 && mSkyPrefilter.id;
+    if ((!ambient && !reflections) || !mSkyAmbientUsable || !mSkyEnvironment.id || !mCloudEnvironment.id ||
         !mSkyConvolve.id) {
         return;
     }
-    const float settings[] = { CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f),  CvFloat("gNewDawn.HDR.FogIntensity", 1.0f),
-                               CvFloat("gNewDawn.Sky.Strength", 1.0f),      CvFloat("gNewDawn.Sky.Coverage", 0.55f),
-                               CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), (float)CvInt("gNewDawn.Sky.Clouds", 0) };
+    const float settings[] = { CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f),
+                               CvFloat("gNewDawn.HDR.FogIntensity", 1.0f),
+                               CvFloat("gNewDawn.Sky.Strength", 1.0f),
+                               CvFloat("gNewDawn.Sky.Coverage", 0.55f),
+                               CvFloat("gNewDawn.Sky.CloudStrength", 1.0f),
+                               (float)CvInt("gNewDawn.Sky.Clouds", 0),
+                               (float)reflections };
     float sunDot = 0.0f;
     for (int i = 0; i < 3; ++i)
         sunDot += params.skySunDir[i] * mSkyCachedSun[i];
     bool settingsChanged = false;
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
         settingsChanged |= settings[i] != mSkyCachedSettings[i];
     // Eligibility is reset each HDR frame, while the lighting cache persists only across consecutive
     // eligible frames. Refresh slowly moving cloud irradiance every eight rendered frames; force an
@@ -2049,10 +2140,16 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
                          sunDot < 0.9998477f || std::abs(params.skyWeather - mSkyCachedWeather) > 0.01f ||
                          settingsChanged;
     mSkyLastEligible = mSkyFrame;
+    // Exact interpolated near-centre point; its near-plane offset is negligible at sky distances.
+    const float* inv = params.shadowInvViewProj;
+    const float w = inv[15] - inv[11];
+    for (int i = 0; i < 3; ++i)
+        mSkyReflectionEye[i] = (inv[12 + i] - inv[8 + i]) / (std::abs(w) > 1e-6f ? w : 1.0f);
     // This timer includes reuse frames, so its average is the actual amortised GPU cost per eligible frame.
     BeginTimer(kSkyAmbientTimerStage);
     if (!refresh) {
-        mSkyAmbientReady = true;
+        mSkyAmbientReady = ambient;
+        mSkyReflectionsReady = reflections;
         EndTimer(kSkyAmbientTimerStage);
         CheckError("sky ambient reuse");
         return;
@@ -2075,7 +2172,8 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
         }
     } bindings;
     glBindVertexArray(mVao);
-    if (!EnsureCube(mSkyRadiance, 16) || !EnsureCube(mSkyIrradiance, 8)) {
+    if (!EnsureCube(mSkyRadiance, reflections ? 32 : 16) || !EnsureCube(mSkyIrradiance, 8) ||
+        (reflections && !EnsureCube(mSkySpecular, 32, 5))) {
         EndTimer(kSkyAmbientTimerStage);
         return;
     }
@@ -2084,12 +2182,6 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
                         CvFloat("gNewDawn.Sky.CloudStrength", 1.0f) > 0.0f;
     const float cloudStrength = std::clamp(CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), 0.0f, 1.0f) *
                                 std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
-    // Exact interpolated near-centre point; its tiny near-plane offset is negligible at cloud-layer distances.
-    float origin[3];
-    const float* inv = params.shadowInvViewProj;
-    const float w = inv[15] - inv[11];
-    for (int i = 0; i < 3; ++i)
-        origin[i] = (inv[12 + i] - inv[8 + i]) / (std::abs(w) > 1e-6f ? w : 1.0f);
     if (clouds) {
         glActiveTexture(GL_TEXTURE0 + kFirstUnit + 1);
         glBindTexture(GL_TEXTURE_3D, mCloudNoise);
@@ -2110,7 +2202,7 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
         Use(mCloudEnvironment);
         SetSkyUniforms(params);
         glUniform1i(Loc("uNoise"), kFirstUnit + 1);
-        glUniform3fv(Loc("uCubeOrigin"), 1, origin);
+        glUniform3fv(Loc("uCubeOrigin"), 1, mSkyReflectionEye);
         glUniform1f(Loc("uCloudStrength"), cloudStrength);
         glEnable(GL_BLEND);
         glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
@@ -2138,13 +2230,31 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
     }
     glActiveTexture(GL_TEXTURE0 + kSkyAmbientUnit);
     glBindTexture(GL_TEXTURE_CUBE_MAP, mSkyIrradiance.tex);
-    mSkyAmbientReady = true;
+    mSkyAmbientReady = ambient;
+    mSkyReflectionsReady = reflections;
+    if (reflections) {
+        Use(mSkyPrefilter);
+        glUniform1i(Loc("uEnvironment"), kFirstUnit);
+        for (int level = 0; level < 5; ++level) {
+            glUniform1f(Loc("uRoughness"), level / 4.0f);
+            for (int face = 0; face < 6; ++face) {
+                glBindFramebuffer(GL_FRAMEBUFFER, mSkySpecular.fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                                       mSkySpecular.tex, level);
+                glUniform1i(Loc("uCubeFace"), face);
+                Draw(mSkySpecular.fbo, std::max(mSkySpecular.size >> level, 1),
+                     std::max(mSkySpecular.size >> level, 1));
+            }
+        }
+        glActiveTexture(GL_TEXTURE0 + kSkyReflectionUnit);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, mSkySpecular.tex);
+    }
     mSkyAmbientCacheValid = true;
     mSkyLastRefresh = mSkyFrame;
     mSkyCachedScene = params.skySceneId;
     mSkyCachedWeather = params.skyWeather;
     std::copy(params.skySunDir, params.skySunDir + 3, mSkyCachedSun);
-    std::copy(settings, settings + 6, mSkyCachedSettings);
+    std::copy(settings, settings + 7, mSkyCachedSettings);
     EndTimer(kSkyAmbientTimerStage);
     CheckError("sky ambient cube");
 }
@@ -2626,6 +2736,8 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     }
     glUniform3fv(Loc("uLightColor"), 1, light);
     glUniform3fv(Loc("uSky"), 1, sky);
+    glUniform1i(Loc("uSkyReflectionsEnabled"), SkyReflectionsActive());
+    glUniform1i(Loc("uSkySpecular"), kSkyReflectionUnit);
     if (filter) {
         glDisable(GL_BLEND);
         Draw(mWaterReflectionRaw);
