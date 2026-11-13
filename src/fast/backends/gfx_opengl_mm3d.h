@@ -11,7 +11,7 @@ class MM3DGL {
     ~MM3DGL();
     bool Prepare(const NewDawnMM3DRoomParams& params);
     void Draw(const NewDawnMM3DRoomParams& params, const float* projection, float aspect, float flipY,
-              bool hdr, bool mipmaps, float anisotropy, float lodBias);
+              bool hdr, bool mipmaps, float anisotropy, float lodBias, const NewDawnMM3DScroll* scroll);
 
   private:
     struct Mesh { GLuint vao = 0, vbo = 0, ibo = 0; };

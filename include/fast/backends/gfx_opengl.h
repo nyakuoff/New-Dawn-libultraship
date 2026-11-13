@@ -113,7 +113,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void OnResize() override;
     bool MM3DAvailable() const override;
     bool PrepareMM3DRoom(const NewDawnMM3DRoomParams&) override;
-    void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float*, float, float) override;
+    void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float*, float, float, const NewDawnMM3DScroll*) override;
     bool HdrWorldActive() const override;
     void FinishWorld() override;
     void StartFrame() override;
