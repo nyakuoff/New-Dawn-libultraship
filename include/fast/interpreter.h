@@ -19,6 +19,7 @@
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
 #include "fast/newdawn_postfx.h"
+#include "fast/newdawn_mm3d.h"
 #include "fast/debug/GfxDebugger.h"
 
 #include "fast/resource/type/Texture.h"
@@ -500,6 +501,7 @@ class Interpreter {
     void GfxSpPopMatrix(uint32_t count);
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
+    void SyncViewportScissor();
     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpExtraGeometryMode(uint32_t clear, uint32_t set);
@@ -607,6 +609,9 @@ class Interpreter {
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
+    bool mMM3DSuppress = false;
+    float mMM3DProjection[16] = {};
+    float mMM3DAspect = 1.0f, mMM3DFlipY = 1.0f;
     bool mShadowRecording = false;
     bool mShadowOverflowLogged = false;
     bool mShadowExactProj = false;

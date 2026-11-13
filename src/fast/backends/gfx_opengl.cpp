@@ -22,6 +22,7 @@
 
 #include "fast/backends/gfx_opengl.h"
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "gfx_opengl_mm3d.h"
 #include "ship/window/gui/Gui.h"
 #include <prism/processor.h>
 #include <fstream>

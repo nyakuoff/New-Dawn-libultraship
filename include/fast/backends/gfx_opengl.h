@@ -28,6 +28,7 @@
 
 namespace Fast {
 class PostFxGL;
+class MM3DGL;
 
 struct ShaderProgram {
     GLuint openglProgramId;
@@ -110,6 +111,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) override;
     void Init() override;
     void OnResize() override;
+    bool MM3DAvailable() const override;
+    bool PrepareMM3DRoom(const NewDawnMM3DRoomParams&) override;
+    void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float*, float, float) override;
     bool HdrWorldActive() const override;
     void FinishWorld() override;
     void StartFrame() override;
@@ -206,6 +210,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     uint32_t mShadowCasterVertexCount = 0;
 
 #ifndef USE_OPENGLES
+    std::unique_ptr<MM3DGL> mMM3D;
     int mHdrGameFb = -1;
     bool mHdrSky = false;
     std::unique_ptr<PostFxGL> mPostFx; // only complete (and only built) where gfx_opengl_postfx.h is available
