@@ -610,6 +610,8 @@ class Interpreter {
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
     bool mMM3DSuppress = false;
+    int mMM3DSegment = 0;                // segment DL (8..13) currently executing inside a suppressed room
+    NewDawnMM3DScroll mMM3DScroll = {};  // live AnimatedMat scroll captured from those segment DLs
     float mMM3DProjection[16] = {};
     float mMM3DAspect = 1.0f, mMM3DFlipY = 1.0f;
     bool mShadowRecording = false;

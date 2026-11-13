@@ -8,6 +8,7 @@
 
 struct NewDawnPostFxParams;
 struct NewDawnMM3DRoomParams;
+struct NewDawnMM3DScroll;
 
 namespace Fast {
 struct ShaderProgram;
@@ -125,7 +126,7 @@ class GfxRenderingAPI {
     virtual bool MM3DAvailable() const { return false; }
     virtual bool PrepareMM3DRoom(const NewDawnMM3DRoomParams&) { return false; }
     virtual void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float* viewProjection,
-                              float aspectScale, float flipY) {}
+                              float aspectScale, float flipY, const NewDawnMM3DScroll* scroll) {}
 
     // New Dawn scene post-processing (see fast/newdawn_postfx.h). Only implemented for OpenGL.
     virtual bool HdrWorldActive() const {

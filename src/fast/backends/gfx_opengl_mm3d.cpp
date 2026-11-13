@@ -318,7 +318,7 @@ bool MM3DGL::Prepare(const NewDawnMM3DRoomParams& params) {
 }
 
 void MM3DGL::Draw(const NewDawnMM3DRoomParams& params,const float* projection,float aspect,float flipY,
-                  bool hdr,bool mipmaps,float anisotropy,float lodBias) {
+                  bool hdr,bool mipmaps,float anisotropy,float lodBias,const NewDawnMM3DScroll* scroll) {
     if (mFailed || !mProgram) return;
     const auto begin=std::chrono::steady_clock::now();
     auto cvars=Ship::Context::GetRawInstance()->GetConsoleVariables();
@@ -391,7 +391,14 @@ void MM3DGL::Draw(const NewDawnMM3DRoomParams& params,const float* projection,fl
                     const auto& binding=mat.bindings[t]; const std::string suffix="["+std::to_string(t)+"]";
                     glUniform1i(U("uHasTexture"+suffix),binding.texture>=0);
                     glUniform1i(U("uSource"+suffix),binding.source); glUniform1i(U("uMapping"+suffix),binding.mapping);
-                    glUniform4fv(U("uUVScaleTranslate"+suffix),1,binding.transform);
+                    float uv[4]={binding.transform[0],binding.transform[1],binding.transform[2],binding.transform[3]};
+                    if(scroll && mat.animSegment>=8 && mat.animSegment<16 && t<2 && binding.texture>=0) {
+                        // Texture coords are scale*(uv-translate): a shift of f periods needs translate += f/scale.
+                        const float* o=scroll->offset[mat.animSegment][t];
+                        if(uv[0]!=0.f) uv[2]+=o[0]/uv[0];
+                        if(uv[1]!=0.f) uv[3]-=o[1]/uv[1]; // the shader flips V: N64 t grows downward, MM3D v upward
+                    }
+                    glUniform4fv(U("uUVScaleTranslate"+suffix),1,uv);
                     glUniform1f(U("uUVRotation"+suffix),binding.transform[4]);
                     glActiveTexture(GL_TEXTURE8+t); glBindSampler(8+t,0);
                     if(binding.texture<0) { glBindTexture(GL_TEXTURE_2D,0); continue; }
@@ -422,9 +429,10 @@ bool GfxRenderingAPIOGL::PrepareMM3DRoom(const NewDawnMM3DRoomParams& params) {
     if (!mMM3D) mMM3D=std::make_unique<MM3DGL>();
     return mMM3D->Prepare(params);
 }
-void GfxRenderingAPIOGL::DrawMM3DRoom(const NewDawnMM3DRoomParams& params,const float* projection,float aspect,float flipY) {
+void GfxRenderingAPIOGL::DrawMM3DRoom(const NewDawnMM3DRoomParams& params,const float* projection,float aspect,float flipY,
+                                      const NewDawnMM3DScroll* scroll) {
     mMM3D->Draw(params,projection,aspect,flipY,HdrWorldActive(),mMipmapsEnabled,
-                 mMaxAnisotropy > 1.0f ? std::min(mRequestedAnisotropy,mMaxAnisotropy) : 0.0f,mLodBias);
+                 mMaxAnisotropy > 1.0f ? std::min(mRequestedAnisotropy,mMaxAnisotropy) : 0.0f,mLodBias,scroll);
 }
 } // namespace Fast
 #elif defined(ENABLE_OPENGL)
@@ -432,6 +440,6 @@ void GfxRenderingAPIOGL::DrawMM3DRoom(const NewDawnMM3DRoomParams& params,const 
 namespace Fast {
 bool GfxRenderingAPIOGL::MM3DAvailable() const { return false; }
 bool GfxRenderingAPIOGL::PrepareMM3DRoom(const NewDawnMM3DRoomParams&) { return false; }
-void GfxRenderingAPIOGL::DrawMM3DRoom(const NewDawnMM3DRoomParams&,const float*,float,float) {}
+void GfxRenderingAPIOGL::DrawMM3DRoom(const NewDawnMM3DRoomParams&,const float*,float,float,const NewDawnMM3DScroll*) {}
 }
 #endif

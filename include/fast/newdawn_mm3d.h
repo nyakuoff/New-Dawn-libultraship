@@ -19,6 +19,7 @@ struct NewDawnMM3DBinding {
 
 struct NewDawnMM3DMaterial {
     NewDawnMM3DBinding bindings[3];
+    int32_t animSegment; /* N64 animated-material segment (8..13) scrolling this material, 0 = static */
     int32_t cull; /* 0 none, 1 back, 2 front */
     int32_t blend, alphaTest, depthTest, depthWrite, fog, fragmentLighting, vertexLighting;
     uint32_t alphaFunction, depthFunction;
@@ -44,6 +45,11 @@ struct NewDawnMM3DMesh {
     const uint32_t* indices;
     const NewDawnMM3DDraw* draws;
     const NewDawnMM3DTexture* textures;
+};
+
+/* Live N64 AnimatedMat scroll per segment and layer, in fractions of one texture period (u, v). */
+struct NewDawnMM3DScroll {
+    float offset[16][2][2];
 };
 
 struct NewDawnMM3DRoomParams {

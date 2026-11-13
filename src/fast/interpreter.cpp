@@ -4308,6 +4308,9 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+    if (gfx->mMM3DSuppress && (cmd->words.w1 >> 24) >= 8 && (cmd->words.w1 >> 24) <= 13) {
+        gfx->mMM3DSegment = cmd->words.w1 >> 24; // AnimatedMat DL: its tile-size lerp is the live scroll
+    }
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
@@ -4771,8 +4774,9 @@ bool gfx_newdawn_mm3d_handler_custom(F3DGfx** cmd0) {
         gfx->mMM3DFlipY = gfx->mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
     } else if (gfx->mMM3DSuppress) {
         gfx->mMM3DSuppress = false;
+        gfx->mMM3DSegment = 0;
         gfx->SyncViewportScissor();
-        gfx->mRapi->DrawMM3DRoom(params, gfx->mMM3DProjection, gfx->mMM3DAspect, gfx->mMM3DFlipY);
+        gfx->mRapi->DrawMM3DRoom(params, gfx->mMM3DProjection, gfx->mMM3DAspect, gfx->mMM3DFlipY, &gfx->mMM3DScroll);
         if (gfx->mShadowRecording && params.pass == 0) {
             for (uint32_t m = 0; m < params.meshCount; ++m) {
                 const auto& mesh = *params.meshes[m];
@@ -5023,6 +5027,15 @@ bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
     gfx->mRdp->texture_tile[tile].lrt = coords[3] + t * (coords[7] - coords[3]);
     gfx->mRdp->textures_changed[0] = true;
     gfx->mRdp->textures_changed[1] = true;
+
+    if (gfx->mMM3DSuppress && gfx->mMM3DSegment != 0 && tile < 2) {
+        // Tile size is 10.2 fixed point: scroll in texels = uls/4; window width = (lrs-uls)/4+1 = texture period.
+        const auto& t = gfx->mRdp->texture_tile[tile];
+        const float width = (t.lrs - t.uls) / 4.0f + 1.0f, height = (t.lrt - t.ult) / 4.0f + 1.0f;
+        float* out = gfx->mMM3DScroll.offset[gfx->mMM3DSegment][tile];
+        out[0] = width > 0 ? t.uls / 4.0f / width : 0.0f;
+        out[1] = height > 0 ? t.ult / 4.0f / height : 0.0f;
+    }
 
     return false;
 }
