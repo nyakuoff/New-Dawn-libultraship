@@ -24,7 +24,7 @@ class PostFxGL {
              const float* shadowPositions, uint32_t shadowVertexCount);
 
     bool BeginHdr(const FramebufferOGL& fb);
-    void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void EndHdr(const FramebufferOGL& fb);
     GLuint HdrSnapshot(const FramebufferOGL& fb);
     GLuint HdrDisplayTexture() const {
@@ -33,6 +33,11 @@ class PostFxGL {
     bool HdrActive() const {
         return mHdrActive;
     }
+    bool SkyAmbientActive() const {
+        return mHdrActive && mSkyAmbientReady;
+    }
+    // Dedicated world-shader unit; the interpreter owns 0..7 and ordinary postfx use 8..11.
+    static constexpr int kSkyAmbientUnit = 12;
 
     struct Settings {
         bool postFxOn, aoOn, bloomOn, gradeOn;
@@ -58,6 +63,14 @@ class PostFxGL {
         GLuint id = 0;
         std::unordered_map<std::string, GLint> uniforms; // cached when linked
     };
+    struct CubeTarget {
+        GLuint tex = 0;
+        GLuint fbo = 0;
+        int size = 0;
+    };
+    bool EnsureCube(CubeTarget& target, int size);
+    void SetSkyUniforms(const NewDawnPostFxParams& params);
+    void RunSkyAmbient(const NewDawnPostFxParams& params);
     bool BuildPrograms();
     void EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type, bool depthStencil,
                       bool linear);
@@ -94,6 +107,15 @@ class PostFxGL {
     Program mCloudMarch, mCloudApply;
     Target mClouds;
     GLuint mCloudNoise = 0;
+    Program mSkyEnvironment, mCloudEnvironment, mSkyConvolve;
+    CubeTarget mSkyRadiance, mSkyIrradiance;
+    bool mSkyAmbientReady = false;
+    bool mSkyAmbientUsable = true;
+    bool mSkyAmbientCacheValid = false;
+    uint32_t mSkyFrame = 0, mSkyLastEligible = UINT32_MAX, mSkyLastRefresh = 0;
+    int32_t mSkyCachedScene = -1;
+    float mSkyCachedSun[3] = {}, mSkyCachedWeather = 0.0f;
+    float mSkyCachedSettings[6] = {};
     void RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
@@ -118,9 +140,10 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 8;
+    static constexpr int kQueryStages = 9;
     static constexpr int kSkyTimerStage = 6;
     static constexpr int kCloudTimerStage = 7;
+    static constexpr int kSkyAmbientTimerStage = 8;
     static constexpr int kShadowTimerStage = 2;
     static constexpr int kShaftTimerStage = 3;
     static constexpr int kWaterTimerStage = 4;

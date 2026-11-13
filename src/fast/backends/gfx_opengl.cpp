@@ -137,6 +137,12 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
                                0.0f, 2.0f));
     }
     glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
+    bool skyAmbient = false;
+#ifndef USE_OPENGLES
+    skyAmbient = HdrWorldActive() && mPostFx && mPostFx->SkyAmbientActive() && !mHdrSky;
+#endif
+    glUniform1i(mCurrentShaderProgram->sky_ambient_enabled_location, skyAmbient);
+    glUniform1i(mCurrentShaderProgram->sky_irradiance_location, 12);
     if (HdrWorldActive()) {
         auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sky_location,
@@ -714,6 +720,8 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->numAttribs = cnt;
 
     prg->hdr_location = glGetUniformLocation(shader_program, "uHdrWorld");
+    prg->sky_ambient_enabled_location = glGetUniformLocation(shader_program, "uSkyAmbientEnabled");
+    prg->sky_irradiance_location = glGetUniformLocation(shader_program, "uSkyIrradiance");
     prg->hdr_sun_location = glGetUniformLocation(shader_program, "uHdrSun");
     prg->hdr_ambient_location = glGetUniformLocation(shader_program, "uHdrAmbient");
     prg->hdr_sky_location = glGetUniformLocation(shader_program, "uHdrSky");
@@ -739,6 +747,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
 
     LoadShader(prg);
+    // Sampler types must use distinct units even when their branch is disabled. Set this at creation,
+    // before any possible draw/validation, for HDR-off and Ambient-off programs as well.
+    glUniform1i(prg->sky_irradiance_location, 12);
 
     if (cc_features.opt_material_maps) {
         glUniform1i(glGetUniformLocation(shader_program, "uMaterialNormal"), MATERIAL_NORMAL_TEXTURE);
@@ -1100,6 +1111,23 @@ void GfxRenderingAPIOGL::Init() {
     }
 
 #ifndef USE_OPENGLES
+    // Always provide a complete neutral cube on the dedicated unit, including the feature-off path.
+    // Later eligible sky frames replace this binding with the generated irradiance cube.
+    GLint previousActive;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+    glActiveTexture(GL_TEXTURE0 + PostFxGL::kSkyAmbientUnit);
+    glGenTextures(1, &mSkyAmbientNeutral);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, mSkyAmbientNeutral);
+    const uint8_t neutral[4] = { 255, 255, 255, 255 };
+    for (int face = 0; face < 6; ++face) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, neutral);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glActiveTexture(previousActive);
     mPostFx = std::make_unique<PostFxGL>();
     mPostFx->Init();
 #endif
@@ -1579,7 +1607,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
     }
     if (stage == NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY) {
         if (HdrWorldActive())
-            mPostFx->RunPhysicalSky(params, mFrameBuffers[gameFbId]);
+            mPostFx->RunPhysicalSky(params, mFrameBuffers[gameFbId], mFrameCount);
         return;
     }
     if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END &&
