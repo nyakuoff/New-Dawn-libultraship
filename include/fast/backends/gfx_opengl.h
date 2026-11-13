@@ -58,6 +58,7 @@ struct ShaderProgram {
     GLint per_pixel_view_matrix_location;
     GLint per_pixel_shade_mask_location;
     GLint per_pixel_quality_location;
+    GLint per_pixel_character_location;
     int materialTile = 0;
     GLint material_strength_location;
     GLint material_debug_location;
