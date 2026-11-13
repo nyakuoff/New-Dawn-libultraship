@@ -68,4 +68,10 @@ typedef struct NewDawnPostFxParams {
     float waterLightColor[3]; /* glint colour, already scaled by the light's fade */
     float waterSkyColor[3];   /* what the water reflects at grazing angles (the game's fog colour) */
     float waterCameraEye[3];
+    float waterFoam;       /* shoreline/contact foam strength, already multiplied by the per-scene factor */
+    float waterRefraction; /* refraction + depth absorption strength, already multiplied by the per-scene factor */
+    float waterSurfaceVisibility; /* transmission of the native full-screen sun glare */
+    float waterRestyle;           /* 0..1: replace the painted water colour with the absorption/scattering model */
+    float waterScatter[3];        /* linear in-scatter colour of deep water (lit by the scene's light) */
+    float waterAbsorb[3];         /* per-channel absorption coefficient, 1/world units */
 } NewDawnPostFxParams;
