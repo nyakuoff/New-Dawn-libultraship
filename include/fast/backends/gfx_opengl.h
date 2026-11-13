@@ -143,6 +143,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     bool PostFxAvailable() override;
     void RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) override;
     void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) override;
+    void SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
+                                  uint32_t batchCount) override;
     bool SupportsAlphaToCoverage() const override {
         return true;
     }
@@ -209,6 +211,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     size_t mPixelDepthRbSize = 0;
     const float* mShadowCasterPositions = nullptr;
     uint32_t mShadowCasterVertexCount = 0;
+    const float* mShadowFoliageVerts = nullptr;
+    const GfxShadowFoliageBatch* mShadowFoliageBatches = nullptr;
+    uint32_t mShadowFoliageBatchCount = 0;
 
 #ifndef USE_OPENGLES
     GLuint mSkyAmbientNeutral = 0;

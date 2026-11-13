@@ -223,6 +223,7 @@ struct TextureCacheValue {
     uint8_t cms, cmt;
     bool linear_filter;
     uint64_t byte_size = 0;
+    uint32_t shadow_pin = 0; // == Interpreter::mShadowSerial while a recorded foliage caster still needs the texture
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
@@ -489,6 +490,8 @@ class Interpreter {
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
     void RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3);
+    void RecordShadowFoliageTriangle(const LoadedVertex* const v[3], uint32_t tile, uint32_t texWidth,
+                                     uint32_t texHeight, TextureCacheNode* node);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
@@ -622,6 +625,13 @@ class Interpreter {
     float mShadowNdcXScale = 1.0f;
     float mShadowFlipY = 1.0f;
     std::vector<float> mShadowVertices;
+    // Alpha-tested casters (gNewDawn.Shadows.Foliage): x,y,z,u,v per vertex, grouped by GL texture id.
+    bool mShadowFoliage = false;
+    uint32_t mShadowSerial = 0;
+    size_t mShadowFoliageFloats = 0;
+    std::unordered_map<uint32_t, std::vector<float>> mShadowFoliageByTex;
+    std::vector<float> mShadowFoliageVerts;
+    std::vector<GfxShadowFoliageBatch> mShadowFoliageBatches;
     // New Dawn per-pixel lighting (gNewDawn.Lighting.PerPixel). mPerPixelLightState is the state the
     // next batch draws with; the backend re-uploads it when the serial or shader program changes.
     bool mPerPixelLightingEnabled{};

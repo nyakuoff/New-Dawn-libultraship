@@ -23,6 +23,13 @@ class PostFxGL {
     void Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& gameFb, uint32_t frameIndex,
              const float* shadowPositions, uint32_t shadowVertexCount);
 
+    // Alpha-tested shadow casters for the next Run (5 floats per vertex, batched by GL texture id).
+    void SetFoliageCasters(const float* verts, const GfxShadowFoliageBatch* batches, uint32_t batchCount) {
+        mFoliageVerts = verts;
+        mFoliageBatches = batches;
+        mFoliageBatchCount = batchCount;
+    }
+
     bool BeginHdr(const FramebufferOGL& fb);
     void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void EndHdr(const FramebufferOGL& fb);
@@ -120,12 +127,16 @@ class PostFxGL {
     void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
-    Program mShadowDepth, mShadowApply;
+    Program mShadowDepth, mShadowApply, mShadowFoliage;
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
     GLuint mVao = 0;
     GLuint mShadowVao = 0, mShadowVbo = 0;
+    GLuint mFoliageVao = 0, mFoliageVbo = 0;
+    const float* mFoliageVerts = nullptr;
+    const GfxShadowFoliageBatch* mFoliageBatches = nullptr;
+    uint32_t mFoliageBatchCount = 0;
 
     Target mDepth;
     Target mAoRaw, mAoBlur;
