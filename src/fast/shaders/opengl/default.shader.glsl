@@ -420,9 +420,9 @@
                 vec4 texVal@{i} = hookTexture2D(@{i}, uTex@{i}, vTexCoordAdj@{i}, texSize@{i}, ddx@{i}, ddy@{i});
 
                 @if(o_masks[i])
-                    @if(opengles) 
+                    @if(opengles)
                         vec2 maskSize@{i} = vec2(textureSize(uTexMask@{i}, 0));
-                    @else 
+                    @else
                         vec2 maskSize@{i} = textureSize(uTexMask@{i}, 0);
                     @end
 
@@ -483,7 +483,7 @@
 
         @if(o_alpha)
             vec4 texel;
-        @else 
+        @else
             vec3 texel;
         @end
 

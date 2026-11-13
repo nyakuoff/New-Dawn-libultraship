@@ -1004,6 +1004,12 @@ void GfxRenderingAPIOGL::SetAlphaToCoverage(bool enable) {
 }
 
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+#ifndef USE_OPENGLES
+    // The physical sky's Mie lobe, sun disc and HDR bloom provide local glare. Suppress only the
+    // explicitly tagged native full-screen sun wash; LDR and HDR fallback frames retain it.
+    if (mSunGlare && HdrWorldActive())
+        return;
+#endif
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
@@ -1607,17 +1613,23 @@ void GfxRenderingAPIOGL::FinishWorld() {
     }
     mHdrGameFb = -1;
     mHdrSky = false;
+    mSunGlare = false;
 #endif
 }
 
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
+    if (stage == NEWDAWN_POSTFX_STAGE_SUN_GLARE_BEGIN || stage == NEWDAWN_POSTFX_STAGE_SUN_GLARE_END) {
+        mSunGlare = stage == NEWDAWN_POSTFX_STAGE_SUN_GLARE_BEGIN;
+        return;
+    }
     if (stage == NEWDAWN_POSTFX_STAGE_SKY_BEGIN || stage == NEWDAWN_POSTFX_STAGE_SKY_END) {
         mHdrSky = stage == NEWDAWN_POSTFX_STAGE_SKY_BEGIN;
         return;
     }
     if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
         mHdrSky = false;
+        mSunGlare = false;
         if (mPostFx && mPostFx->BeginHdr(mFrameBuffers[gameFbId])) {
             mHdrGameFb = gameFbId;
         }
