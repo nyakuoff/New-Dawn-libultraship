@@ -7,6 +7,7 @@
 #include "imconfig.h"
 
 struct NewDawnPostFxParams;
+struct NewDawnMM3DRoomParams;
 
 namespace Fast {
 struct ShaderProgram;
@@ -119,6 +120,12 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+
+    // Return false before suppressing native room geometry on unsupported backends.
+    virtual bool MM3DAvailable() const { return false; }
+    virtual bool PrepareMM3DRoom(const NewDawnMM3DRoomParams&) { return false; }
+    virtual void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float* viewProjection,
+                              float aspectScale, float flipY) {}
 
     // New Dawn scene post-processing (see fast/newdawn_postfx.h). Only implemented for OpenGL.
     virtual bool HdrWorldActive() const {

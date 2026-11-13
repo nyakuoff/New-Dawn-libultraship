@@ -198,6 +198,7 @@
 #define G_SETTARGETINTERPINDEX 0x46
 #define G_SETTILESIZE_LERP 0x4a
 #define G_NEWDAWN_POSTFX 0x4b
+#define G_NEWDAWN_MM3D 0x4c
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2862,6 +2863,14 @@ typedef union Gfx {
                                                                                  \
         _g0->words.w0 = _SHIFTL(G_NEWDAWN_POSTFX, 24, 8) | _SHIFTL((stage), 0, 8);   \
         _g0->words.w1 = (uintptr_t)(params);                                     \
+    }
+
+/* Preserve native room command state between begin/end; draw on end. */
+#define gSPNewDawnMM3D(pkt, operation, params)                                     \
+    {                                                                            \
+        Gfx* _g0 = (Gfx*)(pkt);                                                   \
+        _g0->words.w0 = _SHIFTL(G_NEWDAWN_MM3D, 24, 8) | _SHIFTL((operation), 0, 8); \
+        _g0->words.w1 = (uintptr_t)(params);                                       \
     }
 
 #define gSPExtraGeometryMode(pkt, c, s)                                                 \

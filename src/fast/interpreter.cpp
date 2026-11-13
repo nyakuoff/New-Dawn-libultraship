@@ -2250,7 +2250,27 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
+void Interpreter::SyncViewportScissor() {
+    if (mRdp->viewport_or_scissor_changed) {
+        if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
+            Flush();
+            mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
+            mRenderingState.viewport = mRdp->viewport;
+        }
+        if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
+            Flush();
+            mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
+            mRenderingState.scissor = mRdp->scissor;
+        }
+        mRdp->viewport_or_scissor_changed = false;
+    }
+
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    if (mMM3DSuppress && !is_rect) {
+        return; // Preserve state/vertices/rectangles, suppress only room triangles and their old casters.
+    }
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
@@ -2336,19 +2356,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRenderingState.decal_mode = zmode_decal;
     }
 
-    if (mRdp->viewport_or_scissor_changed) {
-        if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
-            Flush();
-            mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
-            mRenderingState.viewport = mRdp->viewport;
-        }
-        if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
-            Flush();
-            mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
-            mRenderingState.scissor = mRdp->scissor;
-        }
-        mRdp->viewport_or_scissor_changed = false;
-    }
+    SyncViewportScissor();
 
     uint64_t cc_id = mRdp->combine_mode;
     uint64_t cc_options = 0;
@@ -4747,6 +4755,46 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_newdawn_mm3d_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    gfx->Flush();
+    if (!cmd->words.w1 || !gfx->mRapi->MM3DAvailable()) {
+        return false;
+    }
+    const auto& params = *reinterpret_cast<const NewDawnMM3DRoomParams*>(cmd->words.w1);
+    if (C0(0, 8) == 0) {
+        // Upload/compile must succeed BEFORE any native triangle gets suppressed.
+        gfx->mMM3DSuppress = gfx->mRapi->PrepareMM3DRoom(params);
+        memcpy(gfx->mMM3DProjection, gfx->mRsp->P_matrix, sizeof(gfx->mMM3DProjection));
+        gfx->mMM3DAspect = gfx->AdjXForAspectRatio(1.0f);
+        gfx->mMM3DFlipY = gfx->mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
+    } else if (gfx->mMM3DSuppress) {
+        gfx->mMM3DSuppress = false;
+        gfx->SyncViewportScissor();
+        gfx->mRapi->DrawMM3DRoom(params, gfx->mMM3DProjection, gfx->mMM3DAspect, gfx->mMM3DFlipY);
+        if (gfx->mShadowRecording && params.pass == 0) {
+            for (uint32_t m = 0; m < params.meshCount; ++m) {
+                const auto& mesh = *params.meshes[m];
+                for (uint32_t d = 0; d < mesh.drawCount; ++d) {
+                    const auto& draw = mesh.draws[d];
+                    // Match native policy: solid opaque depth-writing surfaces only.
+                    if (draw.material.blend || draw.material.alphaTest || !draw.material.depthWrite) continue;
+                    for (uint32_t i = 0; i < draw.indexCount; i += 3) {
+                        LoadedVertex vertices[3] = {};
+                        for (int k = 0; k < 3; ++k) {
+                            const float* v = mesh.vertices + mesh.indices[draw.firstIndex + i + k] * 16;
+                            memcpy(vertices[k].view_pos, v, sizeof(float) * 3);
+                        }
+                        gfx->RecordShadowTriangle(&vertices[0], &vertices[1], &vertices[2]);
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -5364,6 +5412,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
     { OTR_G_NEWDAWN_POSTFX, { "G_NEWDAWN_POSTFX", gfx_newdawn_postfx_handler_custom } },
+    { OTR_G_NEWDAWN_MM3D, { "G_NEWDAWN_MM3D", gfx_newdawn_mm3d_handler_custom } },
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
@@ -5687,6 +5736,7 @@ bool Interpreter::GameFbIsWindowSized() {
 }
 
 void Interpreter::StartFrame() {
+    mMM3DSuppress = false;
     PumpAltTextureLoads();
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
