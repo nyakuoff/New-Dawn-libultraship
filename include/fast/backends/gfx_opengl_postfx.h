@@ -89,6 +89,12 @@ class PostFxGL {
     void SetSkyUniforms(const NewDawnPostFxParams& params);
     void RunSkyAmbient(const NewDawnPostFxParams& params);
     bool BuildPrograms();
+    bool BuildAtmosProgram();
+    void RunAtmos(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* lightMatrix,
+                  bool shadowReady);
+    Program mAtmos;
+    bool mAtmosAttempted = false;
+    GLuint mAtmosSprite = 0, mAtmosLeaf = 0, mAtmosNeutralDepth = 0;
     void EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type, bool depthStencil,
                       bool linear);
     void PrepareDepth(const FramebufferOGL& fb);
@@ -170,7 +176,7 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 11;
+    static constexpr int kQueryStages = 12;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;
     static constexpr int kSkyTimerStage = 6;

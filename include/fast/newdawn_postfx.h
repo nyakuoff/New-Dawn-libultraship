@@ -64,6 +64,15 @@ typedef struct NewDawnPostFxParams {
     float fogHeight;
     float fogDensityScale;
 
+    /* Render-only ambient particles. Scene and lights are read-only snapshots. */
+#define NEWDAWN_ATMOS_LIGHTS 8
+    int32_t atmosBiome, atmosScene;
+    float atmosNight, atmosRain;
+    float atmosEye[3], atmosSunColor[3];
+    int32_t atmosLightCount;
+    float atmosLights[NEWDAWN_ATMOS_LIGHTS][4]; /* position, radius */
+    float atmosLightColors[NEWDAWN_ATMOS_LIGHTS][3];
+
     /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
 #define NEWDAWN_MAX_WATER_BOXES 16
     int32_t waterEnabled;
