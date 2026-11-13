@@ -1546,6 +1546,13 @@ void GfxRenderingAPIOGL::SetShadowCasterGeometry(const float* positions, uint32_
     mShadowCasterVertexCount = vertexCount;
 }
 
+void GfxRenderingAPIOGL::SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
+                                                  uint32_t batchCount) {
+    mShadowFoliageVerts = verts;
+    mShadowFoliageBatches = batches;
+    mShadowFoliageBatchCount = batchCount;
+}
+
 bool GfxRenderingAPIOGL::HdrWorldActive() const {
 #ifndef USE_OPENGLES
     return mPostFx && mPostFx->HdrActive() && mCurrentFrameBuffer == mHdrGameFb;
@@ -1636,6 +1643,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         glBindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
     }
     if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
+        mPostFx->SetFoliageCasters(mShadowFoliageVerts, mShadowFoliageBatches, mShadowFoliageBatchCount);
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
     }
@@ -1643,6 +1651,9 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         FinishWorld();
     mShadowCasterPositions = nullptr;
     mShadowCasterVertexCount = 0;
+    mShadowFoliageVerts = nullptr;
+    mShadowFoliageBatches = nullptr;
+    mShadowFoliageBatchCount = 0;
 #endif
 }
 } // namespace Fast

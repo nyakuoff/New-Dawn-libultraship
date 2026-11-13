@@ -764,6 +764,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
 }
 
 bool Interpreter::TextureCacheNodeInUse(const TextureCacheNode* node) const {
+    if (node->second.shadow_pin == mShadowSerial) {
+        return true; // a recorded foliage caster samples this texture in the shadow pass later this frame
+    }
     for (int i = 0; i < MATERIAL_TEXTURE_SLOTS; i++) {
         if (mRenderingState.mTextures[i] == node) {
             return true;
@@ -916,6 +919,11 @@ void Interpreter::BeginShadowRecording(bool enabled, bool captureCamera) {
     mShadowRecording = enabled;
     mShadowVertices.clear();
     mShadowOverflowLogged = false;
+    mShadowSerial++; // expires last frame's texture pins
+    mShadowFoliage = enabled &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.Foliage", 0) != 0;
+    mShadowFoliageByTex.clear();
+    mShadowFoliageFloats = 0;
     mShadowExactProj = false;
     if (!enabled && !captureCamera) {
         return;
@@ -950,6 +958,73 @@ void Interpreter::EndShadowRecording() {
 void Interpreter::SubmitShadowCasters() {
     mRapi->SetShadowCasterGeometry(mShadowVertices.empty() ? nullptr : mShadowVertices.data(),
                                    (uint32_t)(mShadowVertices.size() / 3));
+    mShadowFoliageVerts.clear();
+    mShadowFoliageBatches.clear();
+    for (const auto& [textureId, floats] : mShadowFoliageByTex) {
+        mShadowFoliageBatches.push_back(
+            { textureId, (uint32_t)(mShadowFoliageVerts.size() / 5), (uint32_t)(floats.size() / 5) });
+        mShadowFoliageVerts.insert(mShadowFoliageVerts.end(), floats.begin(), floats.end());
+    }
+    mRapi->SetShadowFoliageGeometry(mShadowFoliageVerts.data(), mShadowFoliageBatches.data(),
+                                    (uint32_t)mShadowFoliageBatches.size());
+}
+
+// Same UV derivation as the main draw (post-texgen, tile shift/offset, linear-filter half texel), so the shadow's
+// cut-out lines up with the leaf the player sees.
+void Interpreter::RecordShadowFoliageTriangle(const LoadedVertex* const v[3], uint32_t tile, uint32_t texWidth,
+                                              uint32_t texHeight, TextureCacheNode* node) {
+    constexpr size_t kMaxFoliageFloats = 5 * 1024 * 1024;
+    if (mShadowFoliageFloats + 15 > kMaxFoliageFloats || texWidth == 0 || texHeight == 0) {
+        return;
+    }
+    node->second.shadow_pin = mShadowSerial;
+    auto& out = mShadowFoliageByTex[node->second.texture_id];
+    const int shifts = mRdp->texture_tile[tile].shifts;
+    const int shiftt = mRdp->texture_tile[tile].shiftt;
+    const bool linear = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    for (int i = 0; i < 3; i++) {
+        float u = v[i]->u / 32.0f;
+        float t = v[i]->v / 32.0f;
+        if (shifts != 0) {
+            u = shifts <= 10 ? u / (1 << shifts) : u * (1 << (16 - shifts));
+        }
+        if (shiftt != 0) {
+            t = shiftt <= 10 ? t / (1 << shiftt) : t * (1 << (16 - shiftt));
+        }
+        u -= mRdp->texture_tile[tile].uls / 4.0f;
+        t -= mRdp->texture_tile[tile].ult / 4.0f;
+        if (linear) {
+            u += 0.5f;
+            t += 0.5f;
+        }
+        out.push_back(v[i]->view_pos[0]);
+        out.push_back(v[i]->view_pos[1]);
+        out.push_back(v[i]->view_pos[2]);
+        out.push_back(u / texWidth);
+        out.push_back(t / texHeight);
+    }
+    mShadowFoliageFloats += 15;
+}
+
+// True when the alpha combiner output is the tile-0 texel alpha (optionally modulated by a constant or vertex
+// alpha), so a texel-alpha test in the shadow pass reproduces the cutout. Anything fed by TEXEL1, LOD or the
+// combined-colour of an unrelated cycle is left out.
+static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
+    bool texel0 = false;
+    for (uint32_t cycle = 0; cycle < (twoCycle ? 2u : 1u); cycle++) {
+        for (uint32_t k = 0; k < 4; k++) {
+            const uint32_t mux = (combineMode >> (cycle * 28 + 16 + k * 3)) & 7;
+            // In the second cycle the hardware swaps the texel inputs: TEXEL1 reads slot 0 there.
+            const bool slot0 = twoCycle ? (cycle == 0 ? mux == G_ACMUX_TEXEL0 : mux == G_ACMUX_TEXEL1)
+                                        : (mux == G_ACMUX_TEXEL0 || mux == G_ACMUX_TEXEL1);
+            const bool slot1 = twoCycle && (cycle == 0 ? mux == G_ACMUX_TEXEL1 : mux == G_ACMUX_TEXEL0);
+            if (slot1 || (k == 2 && (mux == G_ACMUX_LOD_FRACTION || mux == G_ACMUX_PRIM_LOD_FRAC))) {
+                return false;
+            }
+            texel0 |= slot0;
+        }
+    }
+    return texel0;
 }
 
 void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
@@ -2292,9 +2367,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
+    // New Dawn: cut-out (texture-edge) geometry also casts, using its texel alpha. Like the opaque casters it counts
+    // when off-screen or back-facing, so those triangles continue as far as the texture lookup and stop there.
+    bool foliageCaster = false;
+    if (mShadowFoliage && mShadowRecording && !is_rect) {
+        const uint32_t om = mRdp->other_mode_l;
+        const bool blendsMemory = ((om & (3 << 20)) == (G_BL_CLR_MEM << 20) && (om & (3 << 16)) == (G_BL_1MA << 16)) ||
+                                  ((om & (3 << 22)) == (G_BL_CLR_MEM << 22) && (om & (3 << 18)) == (G_BL_1MA << 18));
+        foliageCaster = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC && (om & CVG_X_ALPHA) == CVG_X_ALPHA &&
+                        (om & G_ZS_PRIM) == 0 && !blendsMemory &&
+                        !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+    }
+    bool rejected = false;
+
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
-        return;
+        if (!foliageCaster) {
+            return;
+        }
+        rejected = true;
     }
 
     const uint32_t cull_both = get_attr(CULL_BOTH);
@@ -2323,15 +2414,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         auto cull_type = mRsp->geometry_mode & cull_both;
 
         if (cull_type == cull_front) {
-            if (cross <= 0) {
-                return;
-            }
+            rejected |= cross <= 0;
         } else if (cull_type == cull_back) {
-            if (cross >= 0) {
-                return;
-            }
+            rejected |= cross >= 0;
         } else if (cull_type == cull_both) {
             // Why is this even an option?
+            rejected = true;
+        }
+        if (rejected && !foliageCaster) {
             return;
         }
     }
@@ -2593,6 +2683,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 UpdateTextureCacheSize(SHADER_FIRST_REPLACEMENT_TEXTURE + i);
             }
         }
+    }
+
+    if (foliageCaster && comb->usedTextures[0] && mRenderingState.mTextures[0] != nullptr &&
+        !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[0].blended &&
+        AlphaCombinerUsesTexel0(mRdp->combine_mode, use_2cyc)) {
+        RecordShadowFoliageTriangle(v_arr, effective_tile[0], tex_width[0], tex_height[0], mRenderingState.mTextures[0]);
+    }
+    if (rejected) {
+        return;
     }
 
     bool materialReady = false;
@@ -5805,6 +5904,8 @@ void Interpreter::StartFrame() {
     mShadowRecording = false;
     mShadowOverflowLogged = false;
     mShadowVertices.clear();
+    mShadowFoliage = false;
+    mShadowFoliageByTex.clear();
     // New Dawn per-pixel lighting; a backend only gets it when it implements the shader side.
     mPerPixelLightingEnabled =
         mRapi->SupportsPerPixelLighting() &&

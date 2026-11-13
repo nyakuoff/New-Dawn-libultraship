@@ -675,6 +675,26 @@ void main() {
 }
 )GLSL";
 
+// Alpha-tested casters (tree leaves, fences): same 0.19 cutout threshold as the main draw's texture-edge path.
+static const char* kShadowFoliageVertex = R"GLSL(
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aUv;
+uniform mat4 uLightViewProj;
+out vec2 vUv;
+void main() {
+    vUv = aUv;
+    gl_Position = uLightViewProj * vec4(aPos, 1.0);
+}
+)GLSL";
+
+static const char* kShadowFoliageFragment = R"GLSL(
+in vec2 vUv;
+uniform sampler2D uTex;
+void main() {
+    if (texture(uTex, vUv).a <= 0.19) discard;
+}
+)GLSL";
+
 static const char* kShadowApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -1481,6 +1501,14 @@ void PostFxGL::Init() {
     glBindBuffer(GL_ARRAY_BUFFER, mShadowVbo);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glGenVertexArrays(1, &mFoliageVao);
+    glGenBuffers(1, &mFoliageVbo);
+    glBindVertexArray(mFoliageVao);
+    glBindBuffer(GL_ARRAY_BUFFER, mFoliageVbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (const void*)(3 * sizeof(float)));
     glBindVertexArray(0);
     glGenSamplers(1, &mCmpSampler);
     glSamplerParameteri(mCmpSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1527,6 +1555,8 @@ void main() { fragColor = texture(uScene, vUv); }
     const char* shadowApplyHdr[] = { kVersion, "#define HDR_SCENE\n", kDepthLib, kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
     const char* shadowDepthFs[] = { kVersion, kShadowDepthFragment };
+    const char* foliageVs[] = { kVersion, kShadowFoliageVertex };
+    const char* foliageFs[] = { kVersion, kShadowFoliageFragment };
     const char* water[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterShader };
     mWater.id = BuildProgram("water shader", water, 4, mWater.uniforms);
     const char* waterReflection[] = { kVersion, "#define WATER_REFLECTIONS\n", kDepthLib, kWaterPlaneLib, kWaterShader };
@@ -1552,7 +1582,9 @@ void main() { fragColor = texture(uScene, vUv); }
     mShadowApply.id = BuildProgram("shadow apply shader", shadowApply, 3, mShadowApply.uniforms);
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
-    return mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id && mAo.id && mBlur.id &&
+    mShadowFoliage.id = BuildProgramWithVertex("shadow foliage shader", foliageVs, 2, foliageFs, 2,
+                                               mShadowFoliage.uniforms);
+    return mShadowFoliage.id && mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id && mAo.id && mBlur.id &&
            mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id && mShadowDepth.id && mShaftMarch.id &&
            mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id && mWaterReflectionApply.id;
 }
@@ -2140,6 +2172,23 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertexCount * 3 * sizeof(float), positions, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
     CheckError("shadow map render");
+
+    if (mFoliageBatchCount > 0 && mFoliageVerts != nullptr) {
+        // Cut-out casters: same light matrix and depth state, fragment-discarded by the texel alpha.
+        Use(mShadowFoliage);
+        glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+        glUniform1i(Loc("uTex"), kFirstUnit);
+        glBindVertexArray(mFoliageVao);
+        glBindBuffer(GL_ARRAY_BUFFER, mFoliageVbo);
+        const GLsizeiptr floats = (GLsizeiptr)(mFoliageBatches[mFoliageBatchCount - 1].firstVertex +
+                                               mFoliageBatches[mFoliageBatchCount - 1].vertexCount) * 5;
+        glBufferData(GL_ARRAY_BUFFER, floats * sizeof(float), mFoliageVerts, GL_STREAM_DRAW);
+        for (uint32_t i = 0; i < mFoliageBatchCount; i++) {
+            Bind(0, mFoliageBatches[i].textureId);
+            glDrawArrays(GL_TRIANGLES, (GLint)mFoliageBatches[i].firstVertex, (GLsizei)mFoliageBatches[i].vertexCount);
+        }
+        CheckError("shadow foliage render");
+    }
 
     if (debug == 4) {
         static bool mapSampleLogsDone = false;

@@ -37,6 +37,12 @@ struct GfxPerPixelLightingState {
     GfxPerPixelLight lights[MAX_PER_PIXEL_LIGHTS];
 };
 
+struct GfxShadowFoliageBatch {
+    uint32_t textureId; // backend texture id (the id the interpreter's texture cache holds)
+    uint32_t firstVertex;
+    uint32_t vertexCount;
+};
+
 struct GfxClipParameters {
     bool z_is_from_0_to_1;
     bool invertY;
@@ -143,6 +149,10 @@ class GfxRenderingAPI {
     // World-space triangle vertices (3 floats per vertex, 3 vertices per triangle) recorded during the
     // opaque pass. Only OpenGL uses this; other backends ignore it.
     virtual void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) {
+    }
+    // Alpha-tested casters: 5 floats (position, uv) per vertex, one batch per texture. Valid until RunPostFx returns.
+    virtual void SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
+                                          uint32_t batchCount) {
     }
 
     // New Dawn per-pixel lighting. Only implemented for OpenGL; other backends keep the CPU
