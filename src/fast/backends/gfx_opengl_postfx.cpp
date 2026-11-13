@@ -428,10 +428,27 @@ void main() {
     }
     if (uHdr != 0) {
         vec3 x = max(c, vec3(0.0)) * exp2(uExposure);
-        c = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+        // Hue-preserving highlight roll-off: identity below 0.76 (base colours and shadows keep their saturation and
+        // level), above it the peak channel is compressed and the colour eases towards white. This is the compression
+        // half of the Khronos PBR Neutral operator; its dark-end offset is omitted because it strips the minimum
+        // channel and over-saturates shadows.
+        float pk = max(x.r, max(x.g, x.b));
+        if (pk >= 0.76) {
+            const float d = 0.24;
+            float np = 1.0 - d * d / (pk + d - 0.76);
+            x *= np / pk;
+            x = mix(x, vec3(np), 1.0 - 1.0 / (0.15 * (pk - np) + 1.0));
+        }
+        c = clamp(x, 0.0, 1.0);
         c = mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
     }
     if (uUseGrade != 0) {
+        // HDR path only: gentle split tone (cool shadows, warm highlights) for depth. Multiplicative and luminance
+        // keyed, so black stays black and the +-3% tint cannot shift hues noticeably.
+        if (uHdr != 0) {
+            float t = smoothstep(0.2, 0.8, dot(c, vec3(0.2126, 0.7152, 0.0722)));
+            c *= mix(vec3(0.97, 1.0, 1.03), vec3(1.03, 1.0, 0.97), t);
+        }
         // Contrast as a blend towards a smoothstep S-curve (fixes black and white, mid slope equals uContrast).
         vec3 s = c * c * (3.0 - 2.0 * c);
         c = c + (uContrast - 1.0) * 2.0 * (s - c);
