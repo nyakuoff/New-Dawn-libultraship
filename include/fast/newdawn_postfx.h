@@ -8,6 +8,7 @@
  */
 #define NEWDAWN_POSTFX_STAGE_SKY_BEGIN 4 /* explicit skybox colour calibration */
 #define NEWDAWN_POSTFX_STAGE_SKY_END 5
+#define NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY 6 /* after the ordinary skybox, before celestial objects/world */
 #define NEWDAWN_POSTFX_STAGE_WORLD_BEGIN 3 /* linear HDR world, before sky */
 #define NEWDAWN_POSTFX_STAGE_OPAQUE_END 0   /* ambient occlusion / shadows on the opaque geometry drawn so far */
 #define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */
@@ -21,6 +22,11 @@ typedef struct NewDawnPostFxParams {
     int32_t fogNear;
     int32_t fogFar;
     uint32_t flags; /* reserved, 0 */
+
+    /* Read-only normal outdoor sky state. Unknown/scripted skies never emit the physical-sky marker. */
+    float skySunDir[3];
+    float skyFogColor[3];
+    float skyWeather; /* 0 clear, 1 overcast */
 
     /* New Dawn real-time shadows. */
     int32_t shadowEnabled;

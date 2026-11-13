@@ -1577,6 +1577,11 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         }
         return;
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY) {
+        if (HdrWorldActive())
+            mPostFx->RunPhysicalSky(params, mFrameBuffers[gameFbId]);
+        return;
+    }
     if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Debug.Inspect", 0) &&
         mFrameCount % 300 == 0) {

@@ -24,6 +24,7 @@ class PostFxGL {
              const float* shadowPositions, uint32_t shadowVertexCount);
 
     bool BeginHdr(const FramebufferOGL& fb);
+    void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void EndHdr(const FramebufferOGL& fb);
     GLuint HdrSnapshot(const FramebufferOGL& fb);
     GLuint HdrDisplayTexture() const {
@@ -88,6 +89,8 @@ class PostFxGL {
     GLuint mHdrMsaa = 0;
     int mHdrSamples = 0, mHdrWidth = 0, mHdrHeight = 0;
     Program mHdrCopy;
+    Program mPhysicalSky, mSkyApply;
+    Target mSky;
     void RestoreColor(const FramebufferOGL& fb);
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
@@ -111,7 +114,8 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 6;
+    static constexpr int kQueryStages = 7;
+    static constexpr int kSkyTimerStage = 6;
     static constexpr int kShadowTimerStage = 2;
     static constexpr int kShaftTimerStage = 3;
     static constexpr int kWaterTimerStage = 4;

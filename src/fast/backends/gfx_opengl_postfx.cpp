@@ -57,6 +57,90 @@ static float DecodeColor(float c) {
     return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
+// Single scattering in a spherical atmosphere. Distances in km; Rayleigh coefficients at sea level,
+// exponential 8 km / 1.2 km scale heights and a Cornette-Shanks aerosol phase. Original implementation.
+// No sun disc here: Environment_Draw retains the game's sun, stars and Moon in their original order.
+static const char* kPhysicalSkyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform mat4 uInvViewProj;
+uniform float uNdcXScale;
+uniform float uFlipY;
+uniform vec3 uSunDir;
+uniform vec3 uFog;
+uniform float uWeather;
+uniform float uIntensity;
+const float PI = 3.14159265;
+const float Rg = 6360.0;
+const float Ra = 6440.0;
+const vec3 betaR = vec3(0.005802, 0.013558, 0.033100);
+const float betaM = 0.004440;
+float exitDistance(vec3 p, vec3 d) {
+    float b = dot(p, d);
+    return -b + sqrt(max(b*b - dot(p,p) + Ra*Ra, 0.0));
+}
+vec2 density(vec3 p) {
+    float h = max(length(p) - Rg, 0.0);
+    return exp(-h / vec2(8.0, 1.2));
+}
+vec3 sky(vec3 ray) {
+    vec3 origin = vec3(0.0, Rg + 0.2, 0.0);
+    float distance = exitDistance(origin, ray);
+    float ds = distance / 12.0;
+    vec2 optical = vec2(0.0);
+    vec3 sumR = vec3(0.0), sumM = vec3(0.0);
+    float aerosol = mix(1.0, 3.0, uWeather);
+    for (int i = 0; i < 12; ++i) {
+        vec3 p = origin + ray * (float(i) + 0.5) * ds;
+        vec2 local = density(p) * ds;
+        optical += local * 0.5;
+        float sunStep = exitDistance(p, uSunDir) / 4.0;
+        vec2 sunOptical = vec2(0.0);
+        // Planet shadow, smoothed over the solar disc at sunset.
+        float mu = dot(normalize(p), uSunDir);
+        float horizon = -sqrt(max(1.0 - Rg*Rg / dot(p,p), 0.0));
+        float visible = smoothstep(horizon - 0.005, horizon + 0.005, mu);
+        for (int j = 0; j < 4; ++j) {
+            sunOptical += density(p + uSunDir * (float(j) + 0.5) * sunStep) * sunStep;
+        }
+        vec2 total = optical + sunOptical;
+        vec3 transmission = exp(-betaR * total.x - betaM * aerosol * total.y);
+        sumR += transmission * local.x * visible;
+        sumM += transmission * local.y * visible;
+        optical += local * 0.5;
+    }
+    float c = dot(ray, uSunDir);
+    float phaseR = 3.0 / (16.0 * PI) * (1.0 + c*c);
+    float g = 0.76;
+    float phaseM = 3.0 / (8.0 * PI) * ((1.0-g*g)*(1.0+c*c)) /
+                   ((2.0+g*g)*pow(max(1.0+g*g-2.0*g*c, 0.001), 1.5));
+    vec3 radiance = 22.0 * (sumR * betaR * phaseR + sumM * betaM * 0.9 * aerosol * phaseM);
+    float daylight = smoothstep(-0.12, 0.12, uSunDir.y);
+    // Bounded multiple-scattering fill and starlight; the game still draws the visible stars afterwards.
+    radiance += vec3(0.018, 0.035, 0.065) * daylight + vec3(0.0015, 0.0025, 0.006) * (1.0-daylight);
+    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), uWeather * 0.65);
+    return radiance * uIntensity;
+}
+void main() {
+    vec2 ndc = (vUv * 2.0 - 1.0) * vec2(uNdcXScale, uFlipY);
+    vec4 a = uInvViewProj * vec4(ndc, -1.0, 1.0);
+    vec4 b = uInvViewProj * vec4(ndc, 0.999, 1.0);
+    vec3 ray = normalize(b.xyz/b.w - a.xyz/a.w);
+    vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
+    // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
+    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.22, ray.y));
+    oColor = vec4(color, 1.0);
+}
+)GLSL";
+
+static const char* kSkyApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uSky;
+uniform float uStrength;
+void main() { oColor = vec4(texture(uSky, vUv).rgb, uStrength); }
+)GLSL";
+
 static void FogCoefficients(const NewDawnPostFxParams& params, float& fogMul, float& fogOff) {
     if (params.fogNear >= 1000) {
         fogMul = 0.0f;
@@ -1302,6 +1386,11 @@ void PostFxGL::Init() {
 }
 
 bool PostFxGL::BuildPrograms() {
+    const char* physicalSky[] = { kVersion, kPhysicalSkyShader };
+    const char* skyApply[] = { kVersion, kSkyApplyShader };
+    // Sky shaders fail independently; an unavailable optional sky never disables the established HDR path.
+    mPhysicalSky.id = BuildProgram("physical sky", physicalSky, 2, mPhysicalSky.uniforms);
+    mSkyApply.id = BuildProgram("sky upscale", skyApply, 2, mSkyApply.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -1433,12 +1522,13 @@ void PostFxGL::BeginTimer(int stage) {
         mQueryPending[stage][slot] = false;
         mQueryTotalMs[stage] += ns / 1e6;
         if (++mQueryCount[stage] == 300) {
-            const char* label = (stage == 0) ? "opaque end / AO"
+            const char* label = (stage == 0)   ? "opaque end / AO"
                                 : (stage == 1) ? "scene end / bloom+grade"
                                 : (stage == 2) ? "shadows"
                                 : (stage == 3) ? "sun shafts"
                                 : (stage == 4) ? "water"
-                                               : "water opaque copy";
+                                : (stage == 5) ? "water opaque copy"
+                                               : "physical sky";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -1519,6 +1609,49 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     glClear(GL_COLOR_BUFFER_BIT);
     mHdrActive = true;
     return true;
+}
+
+void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if (!mUsable || !mHdrActive || !mPhysicalSky.id || !mSkyApply.id || !params.shadowUseExactProj ||
+        !CvInt("gNewDawn.Sky.Physical", 0)) {
+        return;
+    }
+    GlStateGuard guard;
+    guard.Neutralise();
+    glBindVertexArray(mVao);
+    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    BeginTimer(kSkyTimerStage);
+    // Smooth atmospheric radiance needs no full-resolution raymarch or temporal history. Bilinear
+    // reconstruction is stable under camera motion and cannot ghost at scene cuts or the Moon's edge.
+    EnsureTarget(mSky, (fb.width + 1) / 2, (fb.height + 1) / 2, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    if (!mUsable) {
+        EndTimer(kSkyTimerStage);
+        return;
+    }
+    Use(mPhysicalSky);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform3fv(Loc("uSunDir"), 1, params.skySunDir);
+    float fog[3];
+    for (int i = 0; i < 3; ++i) {
+        fog[i] =
+            DecodeColor(params.skyFogColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
+    }
+    glUniform3fv(Loc("uFog"), 1, fog);
+    glUniform1f(Loc("uWeather"), params.skyWeather);
+    glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
+    Draw(mSky);
+    Use(mSkyApply);
+    Bind(0, mSky.tex);
+    glUniform1i(Loc("uSky"), kFirstUnit);
+    glUniform1f(Loc("uStrength"), std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f));
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    Draw(fb.fbo, fb.width, fb.height);
+    EndTimer(kSkyTimerStage);
+    CheckError("physical sky");
 }
 
 GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
