@@ -30,6 +30,7 @@ typedef struct NewDawnPostFxParams {
     float skyGroundAlbedo[3]; /* bounded representative ground reflectance, linear */
     int32_t skySceneId;       /* cache invalidation only; never used to change game state */
     float skyWeather; /* 0 clear, 1 overcast */
+    float skyOvercast; /* 1: winter Mountain Village's overcast deck (replaces its opaque fog fill) */
 
     /* New Dawn real-time shadows. */
     int32_t shadowEnabled;

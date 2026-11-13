@@ -83,6 +83,7 @@ uniform float uFlipY;
 uniform vec3 uSunDir;
 uniform vec3 uFog;
 uniform float uWeather;
+uniform float uOvercast;
 uniform float uIntensity;
 const float PI = 3.14159265;
 const float Rg = 6360.0;
@@ -102,7 +103,7 @@ vec3 sky(vec3 ray) {
     float distance = exitDistance(origin, ray);
     vec2 optical = vec2(0.0);
     vec3 sumR = vec3(0.0), sumM = vec3(0.0);
-    float aerosol = mix(1.0, 3.0, uWeather);
+    float aerosol = mix(mix(1.0, 3.0, uWeather), 10.0, uOvercast);
     for (int i = 0; i < 12; ++i) {
         float t0 = pow(float(i) / 12.0, 2.0) * distance;
         float t1 = pow(float(i+1) / 12.0, 2.0) * distance;
@@ -137,7 +138,9 @@ vec3 sky(vec3 ray) {
     float daylight = smoothstep(-0.12, 0.12, uSunDir.y);
     // Bounded multiple-scattering fill and starlight; the game still draws the visible stars afterwards.
     radiance += vec3(0.018, 0.035, 0.065) * daylight + vec3(0.0015, 0.0025, 0.006) * (1.0-daylight);
-    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), uWeather * 0.65);
+    // Overcast (winter snow sky): low contrast, mostly the fog's own hue, so the deck meets the snow fog.
+    float haze = max(uWeather * 0.65, uOvercast * 0.8);
+    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), haze);
     return skyPaletteTint(radiance, uSunDir.y) * uIntensity;
 }
 void main() {
@@ -151,7 +154,7 @@ void main() {
 #endif
     vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
     // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
-    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, 0.05, ray.y));
+    vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, mix(0.05, 0.45, uOvercast), ray.y));
 #ifdef SKY_CAPTURE
     color = cubeFinite(color);
 #endif
@@ -178,6 +181,8 @@ uniform float uNdcXScale;
 uniform float uFlipY;
 uniform vec3 uSunDir;
 uniform float uWeather;
+uniform float uOvercast;
+uniform vec3 uFog;
 uniform float uCoverage;
 uniform vec2 uWind;
 uniform float uIntensity;
@@ -257,13 +262,17 @@ void main() {
             vec3 ambient = mix(vec3(0.085,0.11,0.16), vec3(0.20,0.25,0.33), h) * day +
                            vec3(0.0015,0.0025,0.005) * (1.0-day);
             vec3 lighting = ambient + sunColor * phase * sunTrans * (0.8 + 0.2*(1.0-exp(-d*2.0)));
+            // Overcast snow deck: a bright, low-contrast layer lit by the diffuse fog colour. Its base is a
+            // little darker, and thick cores shade softly instead of blackening.
+            vec3 deck = uFog * (0.68 + 0.30*h) * (0.74 + 0.26*sunTrans) * (1.0 - 0.22*smoothstep(0.25, 1.0, d));
+            lighting = mix(lighting, deck, uOvercast); // fog colour already carries the time of day
             float opacity = 1.0-exp(-d*ds*2.8);
             color += trans * opacity * lighting;
             trans *= 1.0-opacity;
             if (trans < 0.015) break;
         }
     }
-    float horizon = smoothstep(0.025, 0.12, ray.y);
+    float horizon = smoothstep(0.025, mix(0.12, 0.45, uOvercast), ray.y);
     oColor = vec4(skyPaletteTint(color, uSunDir.y) * uIntensity, 1.0-trans) * horizon;
 #ifdef SKY_CAPTURE
     oColor *= uCloudStrength;
@@ -1920,8 +1929,10 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     }
     glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
+    glUniform1f(Loc("uOvercast"), params.skyOvercast);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
-    glUniform1f(Loc("uCoverage"), std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f));
+    glUniform1f(Loc("uCoverage"),
+                std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast));
     // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
