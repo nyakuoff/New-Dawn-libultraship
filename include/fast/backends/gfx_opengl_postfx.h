@@ -49,6 +49,8 @@ class PostFxGL {
     static constexpr int kSkyReflectionUnit = 13;
     static constexpr int kFogUnit = 14;
     static constexpr int kFlareUnit = 15;
+    static constexpr int kFlareSpritesUnit = 16;
+    static constexpr int kFlareCloudUnit = 17;
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
     }
@@ -166,6 +168,11 @@ class PostFxGL {
     Program mFlareVisibility, mFlareApply;
     Target mFlareEmitter;
     GLuint mFlareNeutral = 0;
+    GLuint mFlareSprites = 0, mFlareSpritesNeutral = 0, mFlareCloudNeutral = 0;
+    std::string mFlareAssetPath;
+    float mFlareSpriteScale[12] = {};
+    float mFlareCloudOpacity = 0.0f;
+    bool EnsureFlareAssets();
     static constexpr int kMaxBloomLevels = 6;
     Target mBloom[kMaxBloomLevels];
     float mKernel[16 * 3] = {};
