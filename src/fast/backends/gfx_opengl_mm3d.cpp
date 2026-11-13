@@ -193,8 +193,8 @@ void main() {
     vec3 litEnergy=uMaterialAmbient.rgb*uAmbient*(uHDR!=0?uHdrAmbient:1.0)
                   +uDiffuse.rgb*max(irr-uAmbient,0.0)*(uHDR!=0?uHdrSun:1.0)+uEmission.rgb;
     vec3 lightDisplay=uHDR!=0 ? encode(max(litEnergy,vec3(0.0))) : clamp(litEnergy,0.0,1.0);
-    vec3 bakedDisplay=uHDR!=0 ? encode(max(uAmbient*uHdrAmbient+(uLightColor[0]+uLightColor[1])*0.5*uHdrSun,vec3(0.0)))
-                             : bakedTint;
+    // Baked colour already contains the room's lighting; HDR sun/ambient gains apply only to the live 'lit' term.
+    vec3 bakedDisplay=bakedTint;
     vec4 primary=vec4(vColor.rgb*bakedDisplay,vColor.a);
     vec4 lit=vec4(lightDisplay,uDiffuse.a);
     vec4 prev=primary,buffer=vec4(0.0);
