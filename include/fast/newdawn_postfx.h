@@ -6,6 +6,8 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN 7 /* native sun flare draw scope; environment updates still run */
+#define NEWDAWN_POSTFX_STAGE_SUN_FLARE_END 8
 #define NEWDAWN_POSTFX_STAGE_SKY_BEGIN 4 /* explicit skybox colour calibration */
 #define NEWDAWN_POSTFX_STAGE_SKY_END 5
 #define NEWDAWN_POSTFX_STAGE_PHYSICAL_SKY 6 /* after the ordinary skybox, before celestial objects/world */
@@ -32,6 +34,8 @@ typedef struct NewDawnPostFxParams {
     float skyWeather; /* 0 clear, 1 overcast */
     float skyOvercast; /* 1: winter Mountain Village's overcast deck (replaces its opaque fog fill) */
 
+    float flareSunPos[3]; /* native sun position, world space, read-only */
+
     /* New Dawn real-time shadows. */
     int32_t shadowEnabled;
     float shadowStrength;
@@ -53,6 +57,12 @@ typedef struct NewDawnPostFxParams {
     int32_t shaftEnabled;
     float shaftStrength;     /* already multiplied by the sun-height and sun-colour fades */
     float shaftFogColor[3];  /* 0..1, the game's fog colour */
+
+    /* Render-only height fog. Normal outdoor scenes only; native distance fog remains authoritative. */
+    int32_t fogVolumetric;
+    float fogBaseHeight;
+    float fogHeight;
+    float fogDensityScale;
 
     /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
 #define NEWDAWN_MAX_WATER_BOXES 16
