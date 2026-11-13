@@ -127,6 +127,14 @@ vec2 coord(int i) {
     transformed.y=1.0-transformed.y; // CMB UVs address the decoded PICA atlas from its opposite edge.
     return transformed;
 }
+uniform float uKnee, uTop, uGain;
+vec3 highlightKnee(vec3 c) {
+    float knee=uKnee, top=uTop;
+    c*=uGain;
+    float m=max(c.r,max(c.g,c.b));
+    if(m<=knee) return c;
+    return c*((knee+(top-knee)*(1.0-exp(-(m-knee)/(top-knee))))/m);
+}
 vec4 source(int code,vec4 t0,vec4 t1,vec4 t2,vec4 primary,vec4 lit,vec4 prev,vec4 buffer,vec4 constantColor) {
     if(code==0x84C0) return t0;
     if(code==0x84C1) return t1;
@@ -209,7 +217,10 @@ void main() {
         float ab=alphaOperand(source(uStages[b+13],t0,t1,t2,primary,lit,prev,buffer,cc),uStages[b+16]);
         float ac=alphaOperand(source(uStages[b+14],t0,t1,t2,primary,lit,prev,buffer,cc),uStages[b+17]);
         vec3 rgb=max(combine(uStages[b],a,bb,c)*float(uStages[b+2]),vec3(0.0));
-        if(uHDR==0) rgb=min(rgb,vec3(1.0)); // float HDR world keeps source radiance above display white.
+        // PICA stages clamp to white; the x4 vertex-colour stage overshoots heavily, so the last stage rolls off
+        // highlights (hue-preserving, never reaching white) instead of per-channel clipping. Defaults (knee .45,
+        // top .9, gain .95) calibrated so room mean luminance stays within +-15% of the N64 room.
+        rgb = (i==uStageCount-1) ? highlightKnee(rgb) : min(rgb,vec3(1.0));
         vec4 next=vec4(rgb,clamp(combine(uStages[b+1],vec3(aa),vec3(ab),vec3(ac)).r*float(uStages[b+3]),0.0,1.0));
         if(uStages[b+4]==0x8578) buffer.rgb=prev.rgb;
         if(uStages[b+5]==0x8578) buffer.a=prev.a;
@@ -360,6 +371,9 @@ void MM3DGL::Draw(const NewDawnMM3DRoomParams& params,const float* projection,fl
         glUniform3fv(U("uLightColor"),2,&params.lightColor[0][0]);
         glUniform3fv(U("uFogColor"),1,params.fogColor);
         glUniform1i(U("uHDR"),hdr);
+        glUniform1f(U("uKnee"),cvars->GetFloat("gNewDawn.MM3D.Knee",0.45f));
+        glUniform1f(U("uTop"),cvars->GetFloat("gNewDawn.MM3D.Top",0.9f));
+        glUniform1f(U("uGain"),cvars->GetFloat("gNewDawn.MM3D.Gain",0.95f));
         glUniform1i(U("uPerPixel"),cvars->GetInteger("gNewDawn.Lighting.PerPixel",0));
         glUniform1f(U("uHdrAmbient"),std::clamp(cvars->GetFloat("gNewDawn.HDR.AmbientFill",0.4f),0.f,4.f));
         glUniform1f(U("uHdrSun"),std::clamp(cvars->GetFloat("gNewDawn.HDR.SunIntensity",1.8f),0.f,16.f));
