@@ -1322,6 +1322,7 @@ uniform mat4 uViewProj;
 uniform sampler2D uOpaqueColor;
 uniform sampler2D uOpaqueDepth;
 uniform float uReflectionStrength;
+uniform float uSurfaceDetail;
 
 // March uniformly in screen space, interpolating reciprocal clip W for perspective-correct axial depth.
 // Stable deterministic steps: no temporal history, random jitter or feedback from the translucent world.
@@ -1396,12 +1397,13 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) 
             confidence *= 1.0 - smoothstep(thickness * 0.25, thickness, mismatch);
             confidence *= smoothstep(0.002, 0.06, direction.y);
             confidence *= 1.0 - smoothstep(0.75, 1.0, hi);
-            // Small depth-aware cross gather softens the reflection without bleeding across silhouettes.
+            // Restyled water uses a subpixel gather. The legacy 2.5px gather is retained when Restyle is off.
             vec3 color = texture(uOpaqueColor, uv).rgb;
             float weight = 1.0;
             const vec2 taps[4] = vec2[4](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
             for (int j = 0; j < 4; j++) {
-                vec2 tap = uv + taps[j] * 2.5 / vec2(uSize);
+                float sharp = uSurfaceDetail;
+                vec2 tap = uv + taps[j] * mix(2.5, 0.65, sharp) / vec2(uSize);
                 float td = linDepth(texture(uOpaqueDepth, tap).r);
                 float w = exp(-abs(td - depth) / thickness);
                 color += texture(uOpaqueColor, tap).rgb * w;
@@ -1546,11 +1548,225 @@ void main() {
 }
 )GLSL";
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Water surface: shoreline/contact foam, refraction and depth absorption. Runs at the scene-end marker before the glint
+// and reflection pass, on a copy of the scene colour. Thickness is the vertical distance between the water plane and
+// the OPAQUE depth buffer (so a water mesh that wrote depth cannot hide the bed). Everything is a premultiplied
+// overlay: out = src + dst * (1 - foam), with src = foam + (refracted/absorbed - original) * (1 - foam).
+// ---------------------------------------------------------------------------------------------------------------------
+static const char* kWaterSurfaceShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform sampler2D uOpaqueColor;
+uniform sampler2D uVisibleDepth;
+uniform mat4 uViewProj;
+uniform float uTime;
+uniform float uFoam;
+uniform float uRefr;
+uniform float uPixelAngle;
+uniform float uRestyle;
+uniform float uSurfaceVisibility;
+uniform vec3 uScatter;
+uniform vec3 uAbsorb;
+uniform float uFogMul;
+uniform float uFogOff;
+uniform vec3 uFogColor;
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform vec3 uSky;
+
+float hash1(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+float vnoise(vec2 x) {
+    vec2 i = floor(x);
+    vec2 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash1(i), hash1(i + vec2(1.0, 0.0)), f.x), mix(hash1(i + vec2(0.0, 1.0)), hash1(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// Slope of a few warped travelling waves; each is faded out as its wavelength approaches the pixel footprint.
+vec2 refractSlope(vec2 x, float footprint) {
+    const vec2 dirs[6] = vec2[6](vec2(0.8, 0.6), vec2(-0.5, 0.866), vec2(0.2, -0.98), vec2(-0.9, -0.436), vec2(0.95, -0.312), vec2(-0.64, 0.768));
+    const float wl[6] = float[6](70.0, 43.0, 27.0, 17.0, 7.5, 3.4);
+    const float amp[6] = float[6](0.07, 0.06, 0.05, 0.04, 0.025, 0.018);
+    const float spd[6] = float[6](0.8, 1.0, 1.3, 1.7, 2.1, 2.7);
+    float warp = 2.5 * vnoise(x / 60.0);
+    vec2 s = vec2(0.0);
+    for (int i = 0; i < 6; i++) {
+        float k = 6.2831853 / wl[i];
+        float fade = 1.0 - smoothstep(0.15, 0.6, footprint / wl[i]);
+        s += dirs[i] * amp[i] * fade * cos(k * dot(dirs[i], x) + spd[i] * uTime + warp * float(i + 1));
+    }
+    return s;
+}
+
+vec2 projectUv(vec3 w) {
+    vec4 c = uViewProj * vec4(w, 1.0);
+    return vec2(c.x / (c.w * uNdcXScale), c.y / c.w * uFlipY) * 0.5 + 0.5;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    oColor = vec4(0.0);
+    float d = fetchDepth(p); // opaque depth
+    bool sky = d >= 0.99999;
+    vec3 P = worldPos(p, sky ? 0.9999 : d);
+    vec3 ray = P - uEye;
+    float bestT;
+    int bi = waterPlane(P, sky, bestT);
+    if (bi < 0) {
+        return;
+    }
+    // Opaque depth supplies the bed; scene-end depth still protects foreground XLU that writes depth.
+    float planeY = uBoxY[bi];
+    if (!sky && P.y >= planeY) {
+        return;
+    }
+    float visibleDepth = texelFetch(uVisibleDepth, p, 0).r;
+    if (visibleDepth < d && worldPos(p, visibleDepth).y > planeY + 1.5) {
+        return;
+    }
+    bestT = (planeY - uEye.y) / ray.y;
+    vec3 H = uEye + ray * bestT;
+    float dist = bestT * length(ray);
+    vec3 V = normalize(uEye - H);
+    float footprint = dist * uPixelAngle;
+    float depthY = sky ? 1.0e4 : max(planeY - P.y, 0.0);
+
+    vec3 C = texelFetch(uScene, p, 0).rgb;
+    vec3 D = C;
+    float fogH = 0.0;
+    if (uRefr > 0.0 || uRestyle > 0.0) {
+        float s = sky ? 900.0 : min(length(P - H), 900.0);
+        vec3 Bp = texelFetch(uOpaqueColor, p, 0).rgb;
+        vec3 B = Bp; // the bed as seen through the (wobbling) surface
+        if (!sky && uRefr > 0.0) {
+            vec2 slope = refractSlope(H.xz, footprint) * 1.6;
+            vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
+            vec3 Rw = refract(-V, N, 1.0 / 1.33);
+            vec3 Rf = refract(-V, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
+            vec2 off = (Rw.xz / max(-Rw.y, 0.25) - Rf.xz / max(-Rf.y, 0.25)) * min(depthY, 220.0);
+            vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
+            vec2 duv = projectUv(P + vec3(off.x, 0.0, off.y)) - projectUv(P);
+            float len = length(duv);
+            duv *= min(1.0, 0.012 / max(len, 1e-6));
+            vec2 uv2 = uv + duv;
+            // Validate every bilinear footprint texel, including the visible foreground depth. Invalid weight
+            // returns to the unshifted bed instead of pulling a bank, actor or pole into its silhouette.
+            vec2 texel = clamp(uv2 * vec2(uSize) - 0.5, vec2(0.0), vec2(uSize - 1));
+            ivec2 base = ivec2(floor(texel));
+            vec2 frac = fract(texel);
+            vec3 shifted = vec3(0.0);
+            for (int j = 0; j < 2; j++) {
+                for (int i = 0; i < 2; i++) {
+                    ivec2 q = min(base + ivec2(i, j), uSize - 1);
+                    float ds = fetchDepth(q);
+                    vec3 Ps = worldPos(q, ds);
+                    float dv = texelFetch(uVisibleDepth, q, 0).r;
+                    float delta = abs(linDepth(d) - linDepth(ds));
+                    float ok = (ds < 0.99999 && Ps.y < planeY - 0.5 &&
+                                (dv >= ds || worldPos(q, dv).y < planeY)) ?
+                               1.0 - smoothstep(4.0, 4.0 + 0.04 * linDepth(d), delta) : 0.0;
+                    float weight = (i == 0 ? 1.0 - frac.x : frac.x) * (j == 0 ? 1.0 - frac.y : frac.y);
+                    shifted += mix(Bp, texelFetch(uOpaqueColor, q, 0).rgb, ok) * weight;
+                }
+            }
+            float wr = uRefr * smoothstep(3.0, 28.0, depthY) * (1.0 - smoothstep(150.0, 450.0, depthY));
+            B = mix(Bp, shifted, wr);
+        }
+        if (uRestyle > 0.0) {
+            // Physical model: the lit bed is transmitted with per-channel absorption, the rest is in-scatter of the
+            // water body toward the biome's deep colour, plus a sunlit subsurface glow looking toward the light.
+            vec3 T = exp(-s * uAbsorb);
+            vec3 lit = uSky * 0.55 + uLightColor * (0.25 + 0.75 * max(uLightDir.y, 0.0)) * 0.45;
+            float lumLit = dot(lit, vec3(0.2126, 0.7152, 0.0722));
+            float E = clamp(lumLit, 0.45, 1.4);
+            // The water body takes the colour of the light (golden at dusk, cool by moonlight).
+            vec3 tint = mix(vec3(1.0), lit / max(lumLit, 1e-3), 0.3);
+            float sss = pow(max(dot(-V, uLightDir), 0.0), 3.0) * (1.0 - uLightDir.y * 0.5);
+            vec3 body = uScatter * tint * E + uLightColor * uScatter * (0.35 * sss);
+            // The game fogs its own water by the depth of the surface; the replacement colour has to follow it.
+            vec4 ch = uViewProj * vec4(H, 1.0);
+            fogH = clamp(((ch.z / ch.w) * 0.5 + 0.5) * 2.0 - 1.0, -1.0, 1.0) * uFogMul + uFogOff;
+            fogH = clamp(fogH, 0.0, 255.0) / 255.0;
+            vec3 R = B * T + body * (1.0 - T);
+            if (!sky) {
+                // Wave facets facing the light are brighter (a stand-in for the water's own ripple lighting).
+                vec2 ws = refractSlope(H.xz, footprint);
+                R *= 1.0 + clamp(dot(ws, normalize(uLightDir.xz + vec2(1e-3))) * 3.2, -0.3, 0.3);
+            }
+            // Keep the game's animated texture as detail: its high-pass luminance (ripples, caustic lines, splashes).
+            float lc = dot(C, vec3(0.2126, 0.7152, 0.0722));
+            vec3 average = vec3(0.0);
+            const ivec2 taps[4] = ivec2[4](ivec2(-3, 0), ivec2(3, 0), ivec2(0, -3), ivec2(0, 3));
+            for (int i = 0; i < 4; i++) {
+                ivec2 q = clamp(p + taps[i], ivec2(0), uSize - 1);
+                float dq = fetchDepth(q);
+                float dv = texelFetch(uVisibleDepth, q, 0).r;
+                bool sameWater = dq < 0.99999 && worldPos(q, dq).y < planeY &&
+                                 (dv >= dq || worldPos(q, dv).y < planeY);
+                average += sameWater ? texelFetch(uScene, q, 0).rgb : C;
+            }
+            average *= 0.25;
+            float la = dot(average, vec3(0.2126, 0.7152, 0.0722));
+            float hp = lc - la;
+            float fade = 1.0 - smoothstep(4.0, 12.0, footprint);
+            // Preserve bright, chromatic fine XLU details (splashes/particles) as well as the painted ripple pattern.
+            R = R * (1.0 + clamp(hp / max(la, 0.05) * 1.5, -0.35, 0.35) * fade) + max(C - average * 1.3, vec3(0.0)) * fade;
+            // Fog the entire replacement, after wave/detail modulation, including the transmitted bed.
+            R = mix(R, uFogColor, fogH);
+            D = mix(D + (B - Bp) * 0.6, R, uRestyle);
+        } else {
+            D += (B - Bp) * 0.6;
+            // Beer-Lambert absorption of the seen path toward a deeper version of the game's own water colour.
+            float luma = dot(C, vec3(0.2126, 0.7152, 0.0722));
+            vec3 deep = max(mix(vec3(luma), C, 1.3) * 0.72, vec3(0.0));
+            vec3 T = exp(-s * vec3(1.0 / 260.0, 1.0 / 420.0, 1.0 / 520.0));
+            D = mix(D, deep, clamp(uRefr * (1.0 - T), 0.0, 1.0));
+        }
+    }
+
+    float f = 0.0;
+    vec3 foamCol = vec3(0.0);
+    if (uFoam > 0.0 && !sky) {
+        float n1 = vnoise(H.xz / 38.0 + vec2(0.05, -0.03) * uTime);
+        float n2 = vnoise(H.xz / 11.0 + vec2(-0.12, 0.08) * uTime);
+        float n3 = vnoise(H.xz / 3.6 + vec2(0.2, 0.14) * uTime);
+        float fine = mix(0.5, n3, 1.0 - smoothstep(0.5, 1.5, footprint));
+        float bandW = 7.0 * (0.65 + 0.7 * n1);
+        // Convert the vertical thickness into a horizontal distance to the contact line with its screen-space gradient, so a
+        // gently sloping shore gets a band as wide as a steep one and a flat shallow bed gets none.
+        float grad = length(vec2(dFdx(depthY), dFdy(depthY))) / max(footprint, 1e-3);
+        float edge = depthY / clamp(grad, 0.12, 1.0) + (n2 - 0.5) * 7.0;
+        float contact = 1.0 - smoothstep(0.0, bandW, edge);
+        // Wash lines travelling toward the shore.
+        float wash = smoothstep(0.6, 0.95, 0.5 + 0.5 * sin(edge * 0.16 + uTime * 1.1 + n1 * 5.0));
+        wash *= 1.0 - smoothstep(bandW * 0.8, bandW * 2.4, edge);
+        float lace = smoothstep(0.30, 0.62, 0.55 * n2 + 0.45 * fine);
+        float foam = clamp(contact * (0.25 + 0.75 * lace) + wash * lace * 0.75, 0.0, 1.0);
+        foam *= 1.0 - smoothstep(3.0, 9.0, footprint);
+        f = foam * uFoam * 0.65;
+        foamCol = min(0.9 * (uSky * 0.85 + uLightColor * (0.25 + 0.75 * max(uLightDir.y, 0.0))), vec3(2.0));
+        vec4 cf = uViewProj * vec4(H, 1.0);
+        float fogF = clamp(clamp((cf.z / cf.w), -1.0, 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
+        foamCol = mix(foamCol, uFogColor, fogF);
+    }
+    f *= uSurfaceVisibility;
+    D = mix(C, D, uSurfaceVisibility);
+    oColor = vec4(foamCol * f + (D - C) * (1.0 - f), f);
+}
+)GLSL";
+
 static const char* kWaterReflectionApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
 uniform sampler2D uReflection;
 uniform int uDebug;
+uniform float uSurfaceDetail;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float d = fetchDepth(p);
@@ -1575,13 +1791,19 @@ void main() {
     float depthScale = max(4.0, depth * 0.025);
     vec4 color = vec4(0.0);
     float weight = 0.0;
-    for (int y = -1; y <= 2; y++) {
-        for (int x = -1; x <= 2; x++) {
+    bool sharp = uSurfaceDetail > 0.5;
+    // Four depth-aware bilinear taps keep half-res SSR stable without the old 4x4 Gaussian smear.
+    int first = sharp ? 0 : -1;
+    int last = sharp ? 1 : 2;
+    for (int y = first; y <= last; y++) {
+        for (int x = first; x <= last; x++) {
             ivec2 q = clamp(base + ivec2(x, y), ivec2(0), halfSize - 1);
             vec2 delta = vec2(q) - samplePos;
             ivec2 fullQ = clamp(ivec2((vec2(q) + 0.5) / vec2(halfSize) * vec2(uSize)), ivec2(0), uSize - 1);
             float tapDepth = linDepth(fetchDepth(fullQ));
-            float w = exp(-dot(delta, delta) / 3.0 - abs(tapDepth - depth) / depthScale);
+            float spatial = sharp ? max(1.0 - abs(delta.x), 0.0) * max(1.0 - abs(delta.y), 0.0) :
+                                    exp(-dot(delta, delta) / 3.0);
+            float w = spatial * exp(-abs(tapDepth - depth) / depthScale);
             color += texelFetch(uReflection, q, 0) * w;
             weight += w;
         }
@@ -1907,6 +2129,32 @@ void main() { fragColor = texture(uScene, vUv); }
     mWaterReflection.id = BuildProgram("water reflection shader", waterReflection, 5, mWaterReflection.uniforms);
     const char* waterApply[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterReflectionApplyShader };
     mWaterReflectionApply.id = BuildProgram("water reflection upsample", waterApply, 4, mWaterReflectionApply.uniforms);
+    const char* waterSurface[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterSurfaceShader };
+    mWaterSurface.id = BuildProgram("water surface shader", waterSurface, 4, mWaterSurface.uniforms);
+    if (mWaterSurface.id) {
+        // Reuse the four dedicated postfx 2D lanes (8..11). Every sampler is distinct at creation, and each
+        // lane has a complete dummy until a pass supplies its target. Never leave a new sampler on unit 0.
+        GLint previousProgram, previousActive;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+        glUseProgram(mWaterSurface.id);
+        GLuint dummy;
+        glGenTextures(1, &dummy);
+        const uint8_t neutral[4] = { 255, 255, 255, 255 };
+        const char* samplers[] = { "uScene", "uOpaqueColor", "uDepth", "uVisibleDepth" };
+        for (int i = 0; i < 4; ++i) {
+            glActiveTexture(GL_TEXTURE0 + kFirstUnit + i);
+            glBindTexture(GL_TEXTURE_2D, dummy);
+            if (i == 0) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, neutral);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            }
+            glUniform1i(glGetUniformLocation(mWaterSurface.id, samplers[i]), kFirstUnit + i);
+        }
+        glUseProgram(previousProgram);
+        glActiveTexture(previousActive);
+    }
     const char* flareVisibility[] = { kVersion, kDepthLib, kFlareVisibilityShader };
     const char* flareApply[] = { kVersion, kFlareApplyShader };
     mFlareVisibility.id = BuildProgram("sun disc visibility", flareVisibility, 3, mFlareVisibility.uniforms);
@@ -1937,9 +2185,10 @@ void main() { fragColor = texture(uScene, vUv); }
                                              mShadowDepth.uniforms);
     mShadowFoliage.id = BuildProgramWithVertex("shadow foliage shader", foliageVs, 2, foliageFs, 2,
                                                mShadowFoliage.uniforms);
-    return mShadowFoliage.id && mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id && mAo.id && mBlur.id &&
-           mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id && mShadowDepth.id && mShaftMarch.id &&
-           mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id && mWaterReflectionApply.id;
+    return mShadowFoliage.id && mDownHdr.id && mCompositeHdr.id && mCompositeNoDither.id && mShadowApplyHdr.id &&
+           mAo.id && mBlur.id && mApply.id && mDown.id && mUp.id && mComposite.id && mShadowApply.id &&
+           mShadowDepth.id && mShaftMarch.id && mShaftBlur.id && mShaftApply.id && mWater.id && mWaterReflection.id &&
+           mWaterReflectionApply.id && mWaterSurface.id;
 }
 
 void PostFxGL::EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type,
@@ -2479,7 +2728,9 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShadow = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.shadowsOn && params.shadowEnabled != 0 &&
                           shadowPositions != nullptr && shadowVertexCount >= 3;
     const bool doAo = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.postFxOn && s.aoOn;
-    const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterReflections != 0 &&
+    const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END &&
+                              (params.waterReflections != 0 || params.waterFoam > 0.0f ||
+                               params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
@@ -2516,7 +2767,10 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     }
     if (doWater) {
         BeginTimer(kWaterTimerStage);
-        RunWater(params, fb);
+        RunWaterSurface(params, fb);
+        if (params.waterStrength > 0.0f || params.waterReflections != 0) {
+            RunWater(params, fb);
+        }
         EndTimer(kWaterTimerStage);
     }
     if (doShadow) {
@@ -2859,6 +3113,91 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     CheckError("shadow apply");
 }
 
+void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const int w = fb.width, h = fb.height;
+    const float foam = params.waterFoam;
+    const float refraction = mHdrActive ? params.waterRefraction : 0.0f; // the overlay darkens: needs a float target
+    const float restyle = mHdrActive ? params.waterRestyle : 0.0f;
+    if ((foam <= 0.0f && refraction <= 0.0f && restyle <= 0.0f) || params.waterDebug == 1 ||
+        mWaterOpaqueFrame != mSettingsFrame || mWaterOpaqueColor.w != w || mWaterOpaqueColor.h != h) {
+        return;
+    }
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    float rect[NEWDAWN_MAX_WATER_BOXES * 4] = {};
+    float surfaceY[NEWDAWN_MAX_WATER_BOXES] = {};
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 4; j++) {
+            rect[i * 4 + j] = params.waterBoxes[i][j];
+        }
+        surfaceY[i] = params.waterBoxes[i][4];
+    }
+    // Work on a copy of the colour so the game framebuffer is never sampled while bound.
+    glDisable(GL_SCISSOR_TEST);
+    EnsureTarget(mScene, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA, mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE,
+                 false, true);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mScene.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mScene.tex);
+    Bind(1, mWaterOpaqueColor.tex);
+    Bind(2, mWaterOpaqueDepth.tex);
+    Bind(3, mDepth.tex);
+    Use(mWaterSurface);
+    glUniform1i(Loc("uScene"), kFirstUnit + 0);
+    glUniform1i(Loc("uOpaqueColor"), kFirstUnit + 1);
+    glUniform1i(Loc("uDepth"), kFirstUnit + 2);
+    glUniform1i(Loc("uVisibleDepth"), kFirstUnit + 3);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+    glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+    glUniform1i(Loc("uBoxCount"), count);
+    glUniform4fv(Loc("uBoxRect"), count, rect);
+    glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    glUniform1f(Loc("uTime"), params.waterTime);
+    glUniform1f(Loc("uFoam"), foam);
+    glUniform1f(Loc("uRefr"), refraction);
+    glUniform1f(Loc("uRestyle"), restyle);
+    glUniform1f(Loc("uSurfaceVisibility"), params.waterSurfaceVisibility);
+    glUniform3fv(Loc("uScatter"), 1, params.waterScatter);
+    glUniform3fv(Loc("uAbsorb"), 1, params.waterAbsorb);
+    glUniform1f(Loc("uPixelAngle"), 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h);
+    glUniform3fv(Loc("uLightDir"), 1, params.waterLightDir);
+    float light[3], sky[3];
+    for (int i = 0; i < 3; ++i) {
+        light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) *
+                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                              : params.waterLightColor[i];
+        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                            : params.waterSkyColor[i];
+    }
+    glUniform3fv(Loc("uLightColor"), 1, light);
+    glUniform3fv(Loc("uSky"), 1, sky);
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
+    float fogColor[3];
+    for (int i = 0; i < 3; ++i) {
+        fogColor[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                       std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f)
+                                 : params.waterSkyColor[i];
+    }
+    glUniform1f(Loc("uFogMul"), fogMul);
+    glUniform1f(Loc("uFogOff"), fogOff);
+    glUniform3fv(Loc("uFogColor"), 1, fogColor);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    CheckError("water surface");
+}
+
 void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     const int w = fb.width, h = fb.height;
     const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
@@ -2900,6 +3239,7 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
         glUniform1i(Loc("uOpaqueDepth"), kFirstUnit + 2);
         glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
         glUniform1f(Loc("uReflectionStrength"), params.waterReflectionStrength);
+        glUniform1f(Loc("uSurfaceDetail"), mHdrActive ? params.waterRestyle : 0.0f);
     }
     setPlaneUniforms();
     glUniform1i(Loc("uDebug"), params.waterDebug);
@@ -2929,6 +3269,7 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
         Use(mWaterReflectionApply);
         setPlaneUniforms();
         glUniform1i(Loc("uReflection"), kFirstUnit + 0);
+        glUniform1f(Loc("uSurfaceDetail"), mHdrActive ? params.waterRestyle : 0.0f);
         glUniform1i(Loc("uDebug"), params.waterDebug);
     }
     glEnable(GL_BLEND);
