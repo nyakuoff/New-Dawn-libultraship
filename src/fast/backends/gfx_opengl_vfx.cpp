@@ -82,22 +82,23 @@ void main() {
         vec2 perp = vec2(-dir.y, dir.x);
         float len = length(axis);
         vec2 pxc = vec2(aA.y, aA.z) * uSize * 0.5;
-        float jit = (sin(tm * 1.7 + float(k)) * 0.5 + (s2 - 0.5)) * widthPx * (cls == 9 ? 0.9 : 0.5);
-        vec2 pos = pxc + axis * body + perp * jit - dir * (cls == 9 ? fract(tm * 0.15 + s2) * widthPx * 2.0 : 0.0);
-        float r = widthPx * (cls == 9 ? 2.4 : 1.7) * (0.55 + 0.75 * t) * (0.8 + 0.4 * s2);
+        float jit = (sin(tm * 1.7 + float(k)) * 0.5 + (s2 - 0.5)) * widthPx * (cls == 9 ? 0.6 : 0.35);
+        vec2 pos = pxc + axis * body * 0.5 + perp * jit - dir * (cls == 9 ? fract(tm * 0.15 + s2) * widthPx * 2.0 : 0.0);
+        float r = widthPx * (cls == 9 ? 0.9 : 0.95) * (0.55 + 0.75 * t) * (0.8 + 0.4 * s2); // slim: about the native glow width
         float rot = tm * 0.35 + s2 * 6.28;
         int layer = cls == 9 ? (k % 2 == 0 ? 2 : 3) : (cls == 10 ? (k % 2 == 0 ? 5 : 4) : 10);
-        // A near-round model is the arrow's hit burst (the game scales the model up): fill the disc instead of a streak.
-        bool burst = len < widthPx * 1.8;
+        // The arrow's hit burst (the game scales the 3D model up: half-width / half-length, measured in view space by
+        // RecordVfxArrow, is above 0.7; aiming peaks at 0.51 and flight is below 0.2): fill a disc instead of a streak.
+        bool burst = aEnv.w > 0.7;
         if (burst) {
             vec2 sc = vec2(hash(seed + float(k) * 1.3), hash(seed + float(k) * 2.9)) * 2.0 - 1.0;
-            pos = pxc + sc * widthPx * 0.6; r = widthPx * (0.55 + 0.45 * s2);
+            pos = pxc + sc * widthPx * 0.35; r = widthPx * (0.3 + 0.3 * s2);
             if (cls == 11) { layer = k % 2 == 0 ? 8 : 10; r *= layer == 8 ? 2.2 : 0.9; }
             if (cls == 10) { layer = k % 3 == 0 ? 8 : (k % 3 == 1 ? 7 : 4); if (layer != 4) r *= 1.4; }
         }
         if (cls == 11 && role == 0) { if (k % 2 == 0) { layer = 8; r *= 1.9; } else { layer = 10; r *= 0.8; } }
-        if (role == 1) { pos = burst ? pxc : pxc + axis * (0.55 + 0.45 * float(k - 20)); r = burst ? widthPx * 1.4 : max(widthPx * 4.0, len * 0.16); layer = 8; rot = 0.0; }
-        else if (role == 2) { pos = burst ? pxc : pxc + axis * 0.9; r = burst ? widthPx * 2.2 : max(widthPx * 9.0, len * 0.55); layer = cls == 11 ? 9 : 10; rot = 0.0; }
+        if (role == 1) { pos = burst ? pxc : pxc + axis * (0.4 + 0.3 * float(k - 20)); r = burst ? widthPx * 0.35 : max(widthPx * 1.3, len * 0.05); layer = 8; rot = 0.0; }
+        else if (role == 2) { pos = burst ? pxc : pxc + axis * 0.6; r = burst ? widthPx * 0.55 : max(widthPx * 3.0, len * 0.22); layer = cls == 11 ? 9 : 10; rot = 0.0; }
         else if (role == 3) { r = 0.0; } // reserved (the native EffectBlure ribbon already draws the streak)
         vec2 qq = q;
         if (role == 3) { qq = vec2(q.x, q.y * 0.07); }
@@ -216,7 +217,7 @@ void main() {
             c = (cls == 9 ? mix(vec3(1.6, 0.35, 0.05), vec3(7.0, 3.2, 0.7), vSeed) : base * mix(1.2, 3.0, vSeed) + vec3(0.2, 0.35, 0.5) * 0.4) * (0.7 + 0.6 * t.r);
             al = v4 * (cls == 9 ? 0.55 : (cls == 11 ? 0.6 : 0.8)) * vAlpha * (0.4 + 0.6 * vSeed);
         } else if (role == 1) {  // tip star
-            c = mix(base, vec3(1.0), 0.35) * 5.0 * tw;
+            c = mix(base, vec3(1.0), 0.35) * 3.0 * tw;
             al = v4 * vAlpha;
         } else if (role == 2) {  // halo
             c = base * (cls == 9 ? vec3(3.2, 1.3, 0.3) : vec3(1.3)) * 1.1;
@@ -510,6 +511,8 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     if (!arrows.empty()) {
         if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0))
             SPDLOG_INFO("VFXDBG arrows={} ndc={:.3f},{:.3f} half={:.3f},{:.3f} wid={:.3f} w={:.0f}", arrows.size() / NEWDAWN_VFX_FLOATS, arrows[1], arrows[2], arrows[5], arrows[6], arrows[15], arrows[4]);
+        if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0))
+            SPDLOG_INFO("VFXDBG arrow ratio3d={:.3f} cls={:.0f}", arrows[19], arrows[0]);
         glBufferData(GL_ARRAY_BUFFER, arrows.size() * sizeof(float), arrows.data(), GL_STREAM_DRAW);
         glUniform1i(Loc("uMode"), 4);
         for (int i = 0; i < 5; ++i)
