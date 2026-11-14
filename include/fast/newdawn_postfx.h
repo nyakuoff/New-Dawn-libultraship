@@ -144,6 +144,5 @@ typedef struct NewDawnPostFxParams {
     float localLights[NEWDAWN_LOCAL_LIGHTS][4];      /* world position, game radius */
     float localColors[NEWDAWN_LOCAL_LIGHTS][3];      /* the light's own colour, 0..1 */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
-    int32_t localPlayerValid;
-    float localPlayer[3];    /* the player's position: a soft readability exemption from the darkening */
+    float localGain;         /* light intensity multiplier (interiors are lit harder) */
 } NewDawnPostFxParams;
