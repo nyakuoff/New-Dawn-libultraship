@@ -1032,7 +1032,8 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
 enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7,
        VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */,
-       VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */ };
+       VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */,
+       VFX_WATER_SPLASH = 12, VFX_WATER_RIPPLE = 13 /* native draw kept, only dimmed (see mVfxDim) */ };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1058,6 +1059,10 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gEffHitmarkRed", VFX_HIT },
         { "gEffHitmarkWhiteMetal", VFX_HIT },
         { "gElectricSpark", VFX_SPARK },
+        // Water splashes/ripples (EffectSsGSplash/GRipple) are opaque-white native quads that read blown out in HDR; they are
+        // not replaced, only dimmed at draw time. Kept out of the dust class (frame digits) on purpose.
+        { "gEffWaterSplash", VFX_WATER_SPLASH },
+        { "gEffWaterRipple", VFX_WATER_RIPPLE },
         { "gFireArrow", VFX_ARROW_FIRE }, // Tex and MaskTex: the 43-vertex glow model
         { "gIceArrow", VFX_ARROW_ICE },
         { "gLightArrow", VFX_ARROW_LIGHT },
@@ -1073,7 +1078,7 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         }
         cls = c;
         const size_t digit = pos + name.size();
-        if (c >= VFX_DUST && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
+        if (c >= VFX_DUST && c < VFX_WATER_SPLASH && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
             cls |= (uint8_t)((path[digit] - '1') << 4);
         }
         break;
@@ -2787,6 +2792,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         rejected = true;
     }
 
+    mVfxDim = 1.0f;
     if (mVfx && !is_rect) {
         mVfxTriSerial++;
         const uint32_t t0 = mRdp->first_tile_index;
@@ -2823,6 +2829,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (mRapi->VfxReplacing()) {
                 return;
             }
+        } else if (cls == VFX_WATER_SPLASH || cls == VFX_WATER_RIPPLE) {
+            mVfxDim = cls == VFX_WATER_SPLASH ? 0.5f : 0.8f;
         } else if (cls != VFX_NONE) {
             const bool candle = cls == VFX_CANDLE;
             RecordVfxTriangle(v_arr, candle ? (uint8_t)VFX_FLAME : cls, frame);
@@ -3443,16 +3451,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
+                    const float dim = color == &mRdp->prim_color ? mVfxDim : 1.0f;
+                    mBufVbo[mBufVboLen++] = color->r / 255.0f * dim;
+                    mBufVbo[mBufVboLen++] = color->g / 255.0f * dim;
+                    mBufVbo[mBufVboLen++] = color->b / 255.0f * dim;
                 } else {
                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for standard fog, blend color mode preserves
                         // it since fog alpha is the blend factor
                         mBufVbo[mBufVboLen++] = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        mBufVbo[mBufVboLen++] = color->a / 255.0f * (color == &mRdp->prim_color ? mVfxDim : 1.0f);
                     }
                 }
             }
@@ -5462,8 +5471,11 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             gfx->SubmitShadowCasters();
             gfx->SubmitGrass();
             gfx->mGrass = false;
-        } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) {
-            gfx->SubmitVfx();
+        } else if ((stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) ||
+                   (stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && effective.waterEnabled != 0)) {
+            if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+                gfx->SubmitVfx();
+            }
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
             // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
             gfx->FillShadowCameraParams(effective);
