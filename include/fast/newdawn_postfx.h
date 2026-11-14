@@ -40,6 +40,10 @@ typedef struct NewDawnPostFxParams {
     int32_t skySceneId;       /* cache invalidation only; never used to change game state */
     float skyWeather; /* 0 clear, 1 overcast */
     float skyOvercast; /* 1: winter Mountain Village's overcast deck (replaces its opaque fog fill) */
+    /* gNewDawn.Sky.Special variants, all read-only: 0 normal, 1 winter overcast, 2 final day, 3 cursed Ikana,
+       4 poisoned swamp. skyMood is the final day's 0..1 intensity derived from the game clock. */
+    int32_t skyVariant;
+    float skyMood;
 
     float flareSunPos[3]; /* native sun position, world space, read-only */
     float screenShaftStrength; /* HDR radial rays; independent of shadows and volumetric fog */

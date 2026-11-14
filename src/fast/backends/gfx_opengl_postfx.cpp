@@ -89,6 +89,12 @@ uniform vec3 uFog;
 uniform float uWeather;
 uniform float uOvercast;
 uniform float uIntensity;
+// Special-sky look (defaults reproduce the normal sky): haze target, haze/grey mix, and a warm horizon glow.
+uniform vec3 uHaze;
+uniform float uHazeGrey;
+uniform vec3 uGlow;
+uniform float uGlowAmt;
+uniform float uGlowFall;
 const float PI = 3.14159265;
 const float Rg = 6360.0;
 const float Ra = 6440.0;
@@ -144,7 +150,8 @@ vec3 sky(vec3 ray) {
     radiance += vec3(0.018, 0.035, 0.065) * daylight + vec3(0.0015, 0.0025, 0.006) * (1.0-daylight);
     // Overcast (winter snow sky): low contrast, mostly the fog's own hue, so the deck meets the snow fog.
     float haze = max(uWeather * 0.65, uOvercast * 0.8);
-    radiance = mix(radiance, mix(uFog, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), 0.65), haze);
+    radiance = mix(radiance, mix(uHaze, vec3(dot(radiance, vec3(0.2126,0.7152,0.0722))), uHazeGrey), haze);
+    radiance += uGlow * uGlowAmt * exp(-ray.y * uGlowFall); // apocalyptic/toxic horizon band, independent of the sun
     return skyPaletteTint(radiance, uSunDir.y) * uIntensity;
 }
 void main() {
@@ -190,6 +197,14 @@ uniform vec3 uFog;
 uniform float uCoverage;
 uniform vec2 uWind;
 uniform float uIntensity;
+// Special-sky look (defaults reproduce the normal cumulus): slab base/thickness in km, wind shear, domain
+// turbulence, deck colour, and the warm light from below.
+uniform vec2 uLayer;
+uniform float uShear;
+uniform float uTurb;
+uniform vec3 uDeck;
+uniform vec3 uGlow;
+uniform float uGlowAmt;
 #ifdef SKY_CAPTURE
 uniform float uCloudStrength;
 #endif
@@ -197,9 +212,10 @@ float noise3(vec3 p, float lod) {
     return textureLod(uNoise, p / 64.0, lod).r;
 }
 float density(vec3 p, float lod) {
-    float h = (p.y - 1.6) / 1.8;
+    float h = (p.y - uLayer.x) / uLayer.y;
     if (h <= 0.0 || h >= 1.0) return 0.0;
-    p.xz += uWind;
+    p.xz += uWind * (1.0 + uShear * h);
+    if (uTurb > 0.0) p.xz += uTurb * (noise3(vec3(p.x * 0.7, p.y * 3.0 + 7.0, p.z * 0.7), lod + 1.0) - 0.5);
     // Weather cells span tens of km; the density octaves span km down to hundreds of metres.
     float weather = noise3(vec3(p.x / 16.0, 3.0, p.z / 16.0), 0.0);
     float cover = clamp(uCoverage + (weather - 0.5) * 0.65 + uWeather * 0.25, 0.0, 1.0);
@@ -210,9 +226,9 @@ float density(vec3 p, float lod) {
     return smoothstep(threshold, threshold + 0.10, shape) * profile;
 }
 float lightDensity(vec3 p) {
-    float h = (p.y - 1.6) / 1.8;
+    float h = (p.y - uLayer.x) / uLayer.y;
     if (h <= 0.0 || h >= 1.0) return 0.0;
-    p.xz += uWind;
+    p.xz += uWind * (1.0 + uShear * h);
     float weather = noise3(vec3(p.x / 16.0, 3.0, p.z / 16.0), 0.0);
     float cover = clamp(uCoverage + (weather - 0.5) * 0.65 + uWeather * 0.25, 0.0, 1.0);
     float profile = smoothstep(0.0, 0.15, h) * (1.0 - smoothstep(0.45, 1.0, h));
@@ -239,8 +255,8 @@ void main() {
     vec3 origin = a.xyz/a.w * 0.00002;
 #endif
     origin.y = clamp(origin.y, -0.5, 1.2);
-    float start = max((1.6-origin.y)/ray.y, 0.0);
-    float end = min((3.4-origin.y)/ray.y, start + 45.0);
+    float start = max((uLayer.x-origin.y)/ray.y, 0.0);
+    float end = min((uLayer.x+uLayer.y-origin.y)/ray.y, start + 45.0);
     float ds = (end-start)/40.0;
     float lod = clamp(log2(max(ds * 0.75, 0.001)), -4.0, 3.0);
     // A spatial, world-direction-anchored offset breaks up marching bands without frame-varying noise.
@@ -262,13 +278,17 @@ void main() {
             float tau = lightDensity(p + light*0.25)*0.45 + lightDensity(p + light*0.85)*0.85 +
                         lightDensity(p + light*1.8)*1.2;
             float sunTrans = exp(-tau * 2.2);
-            float h = clamp((p.y-1.6)/1.8, 0.0, 1.0);
+            float h = clamp((p.y-uLayer.x)/uLayer.y, 0.0, 1.0);
             vec3 ambient = mix(vec3(0.085,0.11,0.16), vec3(0.20,0.25,0.33), h) * day +
                            vec3(0.0015,0.0025,0.005) * (1.0-day);
             vec3 lighting = ambient + sunColor * phase * sunTrans * (0.8 + 0.2*(1.0-exp(-d*2.0)));
             // Overcast snow deck: a bright, low-contrast layer lit by the diffuse fog colour. Its base is a
             // little darker, and thick cores shade softly instead of blackening.
-            vec3 deck = uFog * (0.68 + 0.30*h) * (0.74 + 0.26*sunTrans) * (1.0 - 0.22*smoothstep(0.25, 1.0, d));
+            vec3 deck = uDeck * (0.68 + 0.30*h) * (0.74 + 0.26*sunTrans) * (1.0 - 0.22*smoothstep(0.25, 1.0, d));
+            // Light from below: the horizon glow reaches cloud bases and thin edges, thick cores stay dark.
+            // Thin edges and gaps glow, thick cores stay dark, so the deck reads as a silhouette against the glow.
+            deck += uGlow * uGlowAmt * (0.9 * (1.0 - smoothstep(0.05, 0.55, d)) * (0.45 + 0.55*(1.0-h)) +
+                                        0.25 * pow(1.0-h, 2.0) * exp(-d*2.0));
             lighting = mix(lighting, deck, uOvercast); // fog colour already carries the time of day
             float opacity = 1.0-exp(-d*ds*2.8);
             color += trans * opacity * lighting;
@@ -3366,6 +3386,96 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     return true;
 }
 
+// Parameter sets of the gNewDawn.Sky.Special variants (skyVariant). Pure function of read-only game state; the
+// normal and winter rows reproduce the previous behaviour exactly. Colours are linear.
+struct SkyLook {
+    float overcast, coverage, hazeGrey, glowAmt, glowFall, layerBase, layerThick, windMul, shear, turb;
+    float haze[3], deck[3], glow[3];
+};
+
+static void ComputeSkyLook(const NewDawnPostFxParams& params, const float fog[3], SkyLook& l) {
+    const float luma = fog[0] * 0.2126f + fog[1] * 0.7152f + fog[2] * 0.0722f;
+    const float m = std::clamp(params.skyMood, 0.0f, 1.0f);
+    l = {};
+    l.overcast = params.skyOvercast;
+    l.coverage = std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast);
+    l.hazeGrey = 0.65f;
+    l.layerBase = 1.6f;
+    l.layerThick = 1.8f;
+    l.windMul = 1.0f;
+    l.glowFall = 3.5f;
+    for (int i = 0; i < 3; ++i)
+        l.haze[i] = l.deck[i] = fog[i];
+    auto tinted = [&](const float t[3], float greyMix, float out[3]) {
+        for (int i = 0; i < 3; ++i)
+            out[i] = (fog[i] + (luma - fog[i]) * greyMix) * t[i];
+    };
+    switch (params.skyVariant) {
+        case 2: { // final day: low, fast storm deck lit from below; the native sickly yellow-green turns red-orange
+            l.overcast = 0.55f + 0.40f * m;
+            l.coverage = 0.74f + 0.10f * m;
+            l.hazeGrey = 0.0f;
+            l.layerBase = 0.9f;
+            l.layerThick = 1.1f;
+            l.windMul = 2.0f + 3.0f * m;
+            l.shear = 0.6f;
+            l.turb = 0.35f + 0.5f * m;
+            l.glowFall = 2.2f;
+            const float dark = 1.0f - 0.45f * m;
+            const float red = std::clamp((m - 0.45f) / 0.4f, 0.0f, 1.0f);
+            const float peak = std::max({ fog[0], fog[1], fog[2], 0.001f });
+            const float apoc[3] = { 1.0f, 0.26f, 0.05f };
+            const float rs = red * red * (3.0f - 2.0f * red);
+            for (int i = 0; i < 3; ++i) {
+                const float native = std::pow(fog[i] / peak, 1.6f); // the game's own final-day hue, kept saturated
+                const float hue = native + (apoc[i] - native) * rs;
+                l.glow[i] = hue;
+                l.haze[i] = hue * 0.085f * dark;
+                l.deck[i] = hue * 0.030f * dark;
+            }
+            l.glowAmt = 0.75f + 0.55f * m;
+            break;
+        }
+        case 3: { // cursed Ikana: desaturated violet-grey, thin, nearly still
+            const float hz[3] = { 1.10f, 0.98f, 1.32f }, dk[3] = { 0.76f, 0.66f, 0.92f };
+            l.overcast = 1.0f;
+            l.coverage = 0.72f;
+            l.hazeGrey = 0.8f;
+            l.layerBase = 1.5f;
+            l.layerThick = 1.1f;
+            l.windMul = 0.12f;
+            tinted(hz, 0.55f, l.haze);
+            tinted(dk, 0.55f, l.deck);
+            for (int i = 0; i < 3; ++i) { // a faint violet sky even when the night fog is nearly black
+                l.haze[i] = std::max(l.haze[i], hz[i] * 0.060f);
+                l.deck[i] = std::max(l.deck[i], dk[i] * 0.035f);
+            }
+            break;
+        }
+        case 4: { // poisoned swamp: sickly green haze under a purple deck, matching the poison water palette
+            const float hz[3] = { 0.62f, 0.95f, 0.30f }, dk[3] = { 0.78f, 0.50f, 0.98f };
+            l.overcast = 0.95f;
+            l.coverage = 0.80f;
+            l.hazeGrey = 0.15f;
+            l.layerBase = 1.3f;
+            l.layerThick = 1.2f;
+            l.windMul = 0.5f;
+            l.glowFall = 2.5f;
+            tinted(hz, 0.5f, l.haze);
+            tinted(dk, 0.5f, l.deck);
+            for (int i = 0; i < 3; ++i) { // keep a toxic minimum brightness even when the game's fog is dark
+                l.haze[i] = std::max(l.haze[i], hz[i] * 0.10f);
+                l.deck[i] = std::max(l.deck[i], dk[i] * 0.07f);
+            }
+            l.glow[0] = 0.35f; l.glow[1] = 0.70f; l.glow[2] = 0.10f;
+            l.glowAmt = 0.22f;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
     glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
@@ -3377,24 +3487,34 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
             DecodeColor(params.skyFogColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
     }
     glUniform3fv(Loc("uFog"), 1, fog);
+    SkyLook look;
+    ComputeSkyLook(params, fog, look);
+    glUniform3fv(Loc("uHaze"), 1, look.haze);
+    glUniform1f(Loc("uHazeGrey"), look.hazeGrey);
+    glUniform3fv(Loc("uGlow"), 1, look.glow);
+    glUniform1f(Loc("uGlowAmt"), look.glowAmt);
+    glUniform1f(Loc("uGlowFall"), look.glowFall);
+    glUniform3fv(Loc("uDeck"), 1, look.deck);
+    glUniform2f(Loc("uLayer"), look.layerBase, look.layerThick);
+    glUniform1f(Loc("uShear"), look.shear);
+    glUniform1f(Loc("uTurb"), look.turb);
     float palette[3];
     for (int i = 0; i < 3; ++i) {
         palette[i] = DecodeColor(params.skyPaletteColor[i]) * 0.8f + DecodeColor(params.skyFogColor[i]) * 0.2f;
     }
     glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
-    glUniform1f(Loc("uOvercast"), params.skyOvercast);
+    glUniform1f(Loc("uOvercast"), look.overcast);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
-    glUniform1f(Loc("uCoverage"),
-                std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast));
+    glUniform1f(Loc("uCoverage"), look.coverage);
     // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
     // Density samples world + offset, so negative travel advects clouds along the positive foliage/particle wind.
     const double drift = CvInt("gNewDawn.Atmos.Wind", 0) ? -NewDawnWindTravel(NewDawnWindSeconds()) : seconds;
-    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018, 1024.0)),
-                static_cast<float>(std::fmod(drift * 0.009, 1024.0)));
+    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018 * look.windMul, 1024.0)),
+                static_cast<float>(std::fmod(drift * 0.009 * look.windMul, 1024.0)));
 }
 
 void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
@@ -3564,6 +3684,7 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
     const bool refresh = !mSkyAmbientCacheValid || mSkyFrame - mSkyLastEligible != 1 ||
                          mSkyCachedScene != params.skySceneId || mSkyFrame - mSkyLastRefresh >= 8 ||
                          sunDot < 0.9998477f || std::abs(params.skyWeather - mSkyCachedWeather) > 0.01f ||
+                         params.skyVariant != mSkyCachedVariant || std::abs(params.skyMood - mSkyCachedMood) > 0.01f ||
                          settingsChanged;
     mSkyLastEligible = mSkyFrame;
     // Exact interpolated near-centre point; its near-plane offset is negligible at sky distances.
@@ -3679,6 +3800,8 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
     mSkyLastRefresh = mSkyFrame;
     mSkyCachedScene = params.skySceneId;
     mSkyCachedWeather = params.skyWeather;
+    mSkyCachedVariant = params.skyVariant;
+    mSkyCachedMood = params.skyMood;
     std::copy(params.skySunDir, params.skySunDir + 3, mSkyCachedSun);
     std::copy(settings, settings + 7, mSkyCachedSettings);
     EndTimer(kSkyAmbientTimerStage);

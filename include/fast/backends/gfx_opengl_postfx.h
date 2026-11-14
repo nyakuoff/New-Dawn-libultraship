@@ -250,6 +250,8 @@ class PostFxGL {
     uint32_t mSkyFrame = 0, mSkyLastEligible = UINT32_MAX, mSkyLastRefresh = 0;
     int32_t mSkyCachedScene = -1;
     float mSkyCachedSun[3] = {}, mSkyCachedWeather = 0.0f;
+    int mSkyCachedVariant = 0;
+    float mSkyCachedMood = 0.0f;
     float mSkyCachedSettings[7] = {};
     void RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RestoreColor(const FramebufferOGL& fb);
