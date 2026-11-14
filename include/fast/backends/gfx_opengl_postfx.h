@@ -8,6 +8,60 @@
 
 namespace Fast {
 
+// Cascaded sun shadows (gNewDawn.Shadows.Cascades > 1): the shadow map texture is an atlas of equal tiles, one per
+// cascade, and every cascade matrix maps world space straight to atlas uv, so consumers keep their existing sampler.
+// The consumer defines csmTap(): visibility (0..1) of a biased reference depth at an atlas uv, with its own filter.
+// csmLit() returns that visibility, or -1 when the position is beyond the last cascade (treat as lit).
+inline constexpr const char* kNewDawnCsmLib = R"GLSL(
+uniform int uCsmCount;
+uniform mat4 uCsmVP[4];
+uniform vec4 uCsmRect[4];
+uniform vec4 uCsmSplit;
+uniform vec4 uCsmBiasScale;
+uniform vec4 uCsmTexelScale;
+uniform float uCsmBlend;
+uniform vec3 uCsmEye;
+uniform vec3 uCsmFwd;
+float csmViewDepth(vec3 pos) { return dot(pos - uCsmEye, uCsmFwd); }
+float csmTap(vec3 uvz);
+float csmFetch(int c, vec3 pos, vec3 N, float nBias, float bias) {
+    vec4 lc = uCsmVP[c] * vec4(pos + N * (nBias * uCsmTexelScale[c]), 1.0);
+    vec3 ndc = lc.xyz / lc.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float ref = ndc.z * 0.5 + 0.5;
+    vec4 r = uCsmRect[c];
+    if (any(lessThan(uv, r.xy)) || any(greaterThan(uv, r.zw)) || ref >= 1.0) return -1.0;
+    return csmTap(vec3(uv, ref - bias * uCsmBiasScale[c]));
+}
+int csmIndex(float vz) {
+    int c = 0;
+    for (int i = 0; i < 3; i++) {
+        if (i + 1 < uCsmCount && vz > uCsmSplit[i]) c = i + 1;
+    }
+    return c;
+}
+float csmLit(vec3 pos, vec3 N, float vz, float nBias, float bias) {
+    float last = uCsmSplit[uCsmCount - 1];
+    if (vz > last) return -1.0;
+    int c = csmIndex(vz);
+    float lit = csmFetch(c, pos, N, nBias, bias);
+    if (lit < 0.0 && c + 1 < uCsmCount) {
+        c++;
+        lit = csmFetch(c, pos, N, nBias, bias);
+    }
+    if (lit < 0.0) return -1.0;
+    if (c + 1 < uCsmCount) {
+        float s = uCsmSplit[c];
+        float t = smoothstep(s * (1.0 - uCsmBlend), s, vz);
+        if (t > 0.0) {
+            float next = csmFetch(c + 1, pos, N, nBias, bias);
+            if (next >= 0.0) lit = mix(lit, next, t);
+        }
+    }
+    return mix(lit, 1.0, smoothstep(last * 0.9, last, vz));
+}
+)GLSL";
+
 // New Dawn scene post-processing for the OpenGL backend: ambient occlusion on the opaque geometry, then bloom,
 // colour grade and dithering of the finished world. It works on private copies of the game framebuffer's depth and
 // colour, writes its result back into the game framebuffer and leaves all GL state exactly as it found it, so the
@@ -125,7 +179,7 @@ class PostFxGL {
     uint32_t mWeatherLastFrame = UINT32_MAX;
     void RunAtmos(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* lightMatrix,
                   bool shadowReady);
-    Program mAtmos;
+    Program mAtmos, mAtmosCsm;
     const float* mVfxData = nullptr;
     uint32_t mVfxCount = 0;
     bool mAtmosAttempted = false;
@@ -192,6 +246,7 @@ class PostFxGL {
     Program mAo, mBlur, mApply, mDown, mUp, mComposite;
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
     Program mShadowDepth, mShadowApply, mShadowFoliage;
+    Program mShadowApplyCsm, mShadowApplyHdrCsm, mShaftMarchCsm, mFogMarchCsm, mGiGatherCsm; // CSM variants
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply, mWaterSurface;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
@@ -216,6 +271,20 @@ class PostFxGL {
     Target mWaterReflectionRaw; // half-resolution premultiplied colour and reflection coverage
     uint32_t mWaterOpaqueFrame = UINT32_MAX;
     Target mShadowMap;
+    // Cascaded sun shadows, rebuilt by RunShadows each frame (count 1 = the legacy single map, nothing else is used).
+    struct Cascades {
+        int count = 1;
+        int tile = 0;
+        float vp[4][16] = {};       // world -> atlas clip
+        float rect[4][4] = {};      // atlas uv bounds that are safe to filter in, per cascade
+        float split[4] = {};        // far end of each cascade along the view axis
+        float biasScale[4] = {};    // depth bias relative to the legacy map
+        float texelScale[4] = {};   // texel size relative to the legacy map (scales the normal offset)
+        float blend = 0.0f;
+        float eye[3] = {}, fwd[3] = {}; // camera origin and view axis, for the view-axis distance
+    } mCsm;
+    void BuildCascades(const NewDawnPostFxParams& params, int atlasSize);
+    void SetCascadeUniforms();
     Target mShaftA, mShaftB; // half resolution
     bool mRaySkyReady = false;
     Program mRayMask, mRayRadial, mRayApply;
