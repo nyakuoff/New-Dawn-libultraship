@@ -159,6 +159,7 @@ typedef struct NewDawnPostFxParams {
     int32_t localCount;
     float localLights[NEWDAWN_LOCAL_LIGHTS][4];      /* world position, game radius */
     float localColors[NEWDAWN_LOCAL_LIGHTS][3];      /* the light's own colour, 0..1 */
+    float localBoost[NEWDAWN_LOCAL_LIGHTS];          /* per-light intensity multiplier (1; below 1 for fairies) */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
     float localGain;         /* light intensity multiplier (interiors are lit harder) */
     /* New Dawn grass: render-only instanced tufts on grass-textured ground, drawn at the opaque-end marker. Needs HDR. */
