@@ -124,7 +124,8 @@ class PostFxGL {
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
-    void RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
+    void RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
+                              bool sunShadow);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);

@@ -557,6 +557,13 @@ static const char* kGiGatherShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
 uniform sampler2D uScene;
+uniform sampler2DShadow uGiShadow;
+uniform mat4 uLightViewProj;
+uniform vec3 uSunDir;
+uniform float uNormalBias;
+uniform int uSunShadow;
+uniform int uFrame;
+float giIgn(vec2 p) { return fract(52.9829189*fract(dot(p,vec2(0.06711056,0.00583715)))); }
 void main() {
     ivec2 p = min(ivec2(vUv*vec2(uSize)),uSize-1);
     float d = fetchDepth(p);
@@ -568,12 +575,24 @@ void main() {
     // 140 units is about two Link heights. Project through the exact interpolated camera.
     vec3 side = giPosition(uv+vec2(1.0/float(uSize.x),0.0),d)-P;
     float radius = min(160.0,140.0/max(length(side),0.001));
+    // Direct sun visibility from the sun shadow map: bounce is mostly a shade effect.
+    float shade = 1.0;
+    if (uSunShadow != 0) {
+        shade = dot(N,uSunDir) <= 0.0 ? 1.0 : 0.0;
+        if (shade == 0.0) {
+            vec4 lc = uLightViewProj*vec4(P+N*uNormalBias,1.0);
+            vec3 sc = lc.xyz/lc.w*0.5+0.5;
+            if (all(greaterThan(sc.xy,vec2(0.0))) && all(lessThan(sc.xy,vec2(1.0))) && sc.z<1.0)
+                shade = 1.0-texture(uGiShadow,vec3(sc.xy,sc.z-0.004));
+        }
+    }
     vec3 sum = vec3(0.0);
-    // Fixed low discrepancy disk: temporal filtering never depends on changing RNG/game state.
-    float rotation = fract(dot(floor(gl_FragCoord.xy),vec2(0.75487766,0.56984029)))*6.2831853;
+    // Interleaved gradient noise, re-seeded every frame: the temporal filter integrates the pattern away.
+    vec2 jp = gl_FragCoord.xy+5.588238*float(uFrame&63);
+    float rotation = giIgn(jp)*6.2831853, jr = giIgn(jp.yx+17.0);
     for (int i=0;i<16;++i) {
         float a = float(i)*2.39996323+rotation;
-        float r = sqrt((float(i)+0.5)/16.0);
+        float r = sqrt((float(i)+jr)/16.0);
         vec2 qUv = uv+vec2(cos(a),sin(a))*radius*r/vec2(uSize);
         if (any(lessThan(qUv,vec2(0.0))) || any(greaterThanEqual(qUv,vec2(1.0)))) continue;
         ivec2 q = ivec2(qUv*vec2(uSize));
@@ -598,10 +617,10 @@ void main() {
         float weight = receive*emit*pow(1.0-dist/140.0,2.0)*edge;
         vec3 c = max(texelFetch(uScene,q,0).rgb,vec3(0.0));
         // Luminance-preserving firefly limit, before gathering: retain coloured wall/grass hue.
-        c *= min(1.0,0.5/max(dot(c,giLuma),0.0001));
+        c *= min(1.0,0.6/max(dot(c,giLuma),0.0001));
         sum += c*weight;
     }
-    oColor.rgb = sum*(28.0/16.0)*smoothstep(1.5,5.0,radius);
+    oColor.rgb = sum*(40.0/16.0)*smoothstep(1.5,5.0,radius)*mix(0.12,1.0,shade);
 }
 )GLSL";
 
@@ -637,12 +656,23 @@ void main() {
     vec3 ndc=clip.xyz/max(clip.w,0.0001);
     vec2 prevUv=ndc.xy/uPreviousScale*0.5+0.5;
     if (uHistoryValid!=0 && clip.w>0.0 && all(greaterThan(prevUv,vec2(0.0))) && all(lessThan(prevUv,vec2(1.0)))) {
-        vec4 old=texelFetch(uGiHistory,clamp(ivec2(prevUv*vec2(hs)),ivec2(0),hs-1),0);
+        // Bilinear reprojection, each tap rejected by depth error; history is clamped to the (widened) current
+        // neighbourhood so moving actors and changing lights cannot leave trails.
+        vec2 hp=prevUv*vec2(hs)-0.5;
+        ivec2 b=ivec2(floor(hp));vec2 f=fract(hp);
         float expected=linDepth(ndc.z*0.5+0.5);
-        float error=abs(linDepth(old.a)-expected);
-        float confidence=1.0-smoothstep(max(1.0,expected*0.002),max(3.0,expected*0.008),error);
-        // Clamp history to this frame's neighbourhood; moving actors and changing lights cannot leave long trails.
-        current=mix(current,clamp(old.rgb,lo,hi),0.6*confidence);
+        vec3 acc=vec3(0.0);float wsum=0.0;
+        for (int y=0;y<2;++y) for (int x=0;x<2;++x) {
+            vec4 old=texelFetch(uGiHistory,clamp(b+ivec2(x,y),ivec2(0),hs-1),0);
+            float bw=mix(1.0-f.x,f.x,float(x))*mix(1.0-f.y,f.y,float(y));
+            float error=abs(linDepth(old.a)-expected);
+            bw*=1.0-smoothstep(max(1.0,expected*0.002),max(3.0,expected*0.008),error);
+            acc+=old.rgb*bw;wsum+=bw;
+        }
+        if (wsum>0.0001) {
+            vec3 hist=clamp(acc/wsum,lo*0.75,hi*1.3+0.002);
+            current=mix(current,hist,0.9*min(wsum,1.0));
+        }
     }
     oColor.rgb=current;
 }
@@ -677,8 +707,8 @@ void main() {
     // Albedo is unavailable: bounded lit-colour proxy preserves receiver hue and extinguishes crushed blacks.
     vec3 receiver=clamp(scene.rgb/max(Y,0.01),vec3(0.0),vec3(2.0));
     vec3 bounce=sum/max(ws,0.0001)*mix(vec3(1.0),receiver,0.5)*uStrength;
-    bounce*=smoothstep(0.002,0.025,Y)*(1.0-smoothstep(0.35,1.1,Y));
-    bounce*=min(1.0,0.6*Y/max(dot(bounce,giLuma),0.00001));
+    bounce*=smoothstep(0.002,0.025,Y)*(1.0-smoothstep(0.5,1.4,Y));
+    bounce*=min(1.0,0.9*Y/max(dot(bounce,giLuma),0.00001));
     oColor.rgb=bounce*uDebug;
 }
 )GLSL";
@@ -2177,7 +2207,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
                           { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
-                          { "uGiRaw", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
+                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -3147,7 +3177,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     }
     if (doGi) {
         BeginTimer(kGiTimerStage);
-        RunGlobalIllumination(params, fb, frameIndex);
+        RunGlobalIllumination(params, fb, frameIndex, doShadow);
         EndTimer(kGiTimerStage);
     }
     if (doShafts) {
@@ -3999,9 +4029,9 @@ void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const Framebuffer
 }
 
 void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb,
-                                    uint32_t frameIndex) {
+                                    uint32_t frameIndex, bool sunShadow) {
     const int w = fb.width, h = fb.height;
-    const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+    const int hw = (w + 3) / 4, hh = (h + 3) / 4; // quarter resolution: bounce light is low-frequency
     bool valid = mGiValid && mGiFrame + 1 == frameIndex && mGiScene == params.giSceneId &&
                  mGiSource.w == w && mGiSource.h == h && mGiNdcXScale == params.shadowNdcXScale &&
                  mGiFlipY == params.shadowFlipY;
@@ -4040,7 +4070,11 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     Bind(0, mGiSource.tex);
     Bind(1, mDepth.tex);
-    Bind(2, mGiRaw.tex);
+    // The gather samples the sun shadow map on unit 10 (depth-compare); the filter samples the raw buffer there.
+    float lightViewProj[16] = {};
+    if (sunShadow) BuildLightViewProj(params, lightViewProj);
+    Bind(2, sunShadow ? mShadowMap.tex : mDepth.tex);
+    glBindSampler(kFirstUnit + 2, mCmpSampler);
     Bind(3, mGiHistory[mGiRead].tex);
     auto geometry = [&]() {
         glUniform2i(Loc("uSize"), w, h);
@@ -4052,7 +4086,14 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     };
     Use(mGiGather);
     geometry();
+    glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+    glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
+    glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)std::max(params.shadowMapSize, 1) * 4.0f);
+    glUniform1i(Loc("uSunShadow"), sunShadow ? 1 : 0);
+    glUniform1i(Loc("uFrame"), (int)(frameIndex & 63u));
     Draw(mGiRaw);
+    glBindSampler(kFirstUnit + 2, 0);
+    Bind(2, mGiRaw.tex);
     const int write = 1 - mGiRead;
     Use(mGiFilter);
     geometry();
