@@ -108,7 +108,7 @@ class PostFxGL {
     void RunVfx(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     Program mVfx;
     bool mVfxAttempted = false;
-    GLuint mVfxSprites = 0, mVfxVao = 0, mVfxVbo = 0;
+    GLuint mVfxSprites = 0, mVfxFlip = 0, mVfxVao = 0, mVfxVbo = 0;
     bool BuildAtmosShader(Program& program, const char* vertex, const char* fragment);
     bool BuildWeatherPrograms();
     void RunWeather(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* roofMatrix,

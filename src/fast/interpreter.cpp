@@ -1030,7 +1030,7 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 
 // ---- New Dawn VFX: native effect sprites are recognised by texture path, recorded in clip space and drawn again by the
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
-enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARK = 7 };
+enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7 };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1052,6 +1052,7 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gEffHitmarkRed", VFX_HIT },
         { "gEffHitmarkWhiteMetal", VFX_HIT },
         { "gElectricSpark", VFX_SPARK },
+        { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
     };
     uint8_t cls = VFX_NONE;
     for (const auto& [name, c] : kTable) {

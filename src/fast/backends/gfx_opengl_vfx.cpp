@@ -15,13 +15,15 @@
 
 namespace Fast {
 namespace {
-constexpr int kSpriteUnit = 25, kDepthUnit = 26;
+constexpr int kSpriteUnit = 25, kDepthUnit = 26, kFlipUnit = 27;
+// fire_flipbook_8x8.png: 64 frames in an 8x8 grid of 160x256 cells (authored offline, see tools/newdawn/vfx-flipbook).
+constexpr int kFlipCols = 8, kFlipFrames = 64, kFlipW = 160, kFlipH = 256;
 constexpr int kDim = 512;
 // Layer order of the sprite array; files live in <asset root>/vfx/.
 const char* kFiles[] = { "flame_05", "flame_06", "fire_01", "fire_02", "smoke_01", "smoke_04",
                          "smoke_07", "spark_01", "star_01", "light_01", "circle_05", "magic_02" };
 constexpr int kLayers = sizeof(kFiles) / sizeof(kFiles[0]);
-constexpr int kFlameLayers = 4, kEmberCount = 10;
+constexpr int kFlameLayers = 2, kEmberCount = 10;
 
 const char* kVertex = R"GLSL(#version 330 core
 layout(location=0) in vec4 aA; // cls, ndc x, ndc y, ndc z
@@ -48,35 +50,22 @@ void main() {
     float H = aB.z * w / uProjection.y; // world half-height of the native sprite
     vec2 u01 = q * 0.5 + 0.5;
     if (uMode == 0) {
-        int l = gl_InstanceID % 4;
+        // Flipbook flame: the native quad's footprint and bottom anchor (not enlarged). Two layers: the main flame
+        // and a mirrored, offset, fainter one so the internal structure never repeats in lock-step.
+        int l = gl_InstanceID % 2;
         vLayerKind = float(l);
-        float t = uTime;
-        float flutter = sin(t * (7.0 + hash(seed) * 3.0) + float(l) * 1.7 + seed) + 0.5 * sin(t * 13.0 + seed * 3.0 + float(l));
         float hh = aB.z;
         float aspect = uSize.y / uSize.x;
-        // Flame glyphs occupy a sub-rectangle of their 512px sprites; the quad maps to that rectangle (v flipped).
-        vec2 size, centre;
-        vLayer = 0;
-        if (l == 3) { // soft halo
-            vLayer = 10;
-            size = vec2(hh * 9.0 * aspect, hh * 9.0);
-            centre = vec2(aA.y, aA.z + hh * 0.1);
-            vUv = vec2(u01.x, 1.0 - u01.y);
-        } else {
-            float h = hh * (l == 2 ? 1.4 : 2.3);
-            if (l == 1) { vLayer = 1; h *= 1.0 + 0.08 * sin(t * 6.0 + seed); }
-            size = vec2(h * 0.4 * aspect, h);
-            centre = vec2(aA.y, aA.z - hh * 0.95 + h * 0.5);
-            vUv = (l == 1) ? vec2(0.38 + u01.x * 0.26, 0.14 + (1.0 - u01.y) * 0.62)
-                           : vec2(0.40 + u01.x * 0.22, 0.20 + (1.0 - u01.y) * 0.55);
-        }
-        vec2 offset = vec2(q.x * size.x * 0.5, q.y * size.y * 0.5 * (1.0 + 0.07 * flutter * float(l != 3)));
-        if (l != 3) offset.x += flutter * size.x * 0.13 * u01.y * u01.y; // tip sways, base stays put
-        vec2 ndc = centre + offset;
+        float hgt = hh * (l == 0 ? 1.3 : 1.15); // the flame body fills ~75% of its cell, so this matches the native size
+        float hwid = hh * 0.625 * aspect * (l == 0 ? 0.95 : 0.88);
+        vec2 centre = vec2(aA.y, aA.z - hh + hgt);
+        vec2 ndc = centre + vec2(q.x * hwid, q.y * hgt);
+        vUv = vec2(l == 1 ? 1.0 - u01.x : u01.x, 1.0 - u01.y);
+        vSeed = mod(uTime * 22.0 + hash(seed) * 64.0 + (l == 1 ? 29.0 : 0.0), 64.0); // frame position
         gl_Position = vec4(ndc.x * w, ndc.y * uFlipY * w, 0.0, w);
         vViewZ = w;
         vSize = H;
-        vAlpha = aPrim.a;
+        vAlpha = aPrim.a * (l == 1 ? 0.55 : 1.0);
         return;
     }
     if (uMode == 3) { // puffs: dust, bomb fireball/smoke, hit sparks, electric sparks (2 layers per recorded quad)
@@ -86,13 +75,13 @@ void main() {
         vLayerKind = float(cls * 10 + l);
         vSeed = p;
         float rot = seed * 6.2831 + float(l) * 1.9 + p * (cls == 3 ? 0.5 : 0.25) * (0.5 + hash(seed));
-        float scale = cls == 3 ? 0.95 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : 1.0);
+        float scale = cls == 3 ? 0.95 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 1.7 : 2.4) : 1.0));
         vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
         float r = max(hp.x, hp.y) * scale;
         vec2 local = vec2(cos(rot) * q.x - sin(rot) * q.y, sin(rot) * q.x + cos(rot) * q.y) * r;
         vec2 ndc = vec2(aA.y, aA.z) + local / (uSize * 0.5);
         vUv = vec2(u01.x, 1.0 - u01.y);
-        vLayer = cls == 3 ? (l == 0 ? 5 : 6) : (cls == 4 ? (hash(seed) < 0.5 ? (l == 0 ? 2 : 4) : (l == 0 ? 3 : 4)) : (l == 0 ? 7 : 8));
+        vLayer = cls == 3 ? (l == 0 ? 5 : 6) : (cls == 4 ? (hash(seed) < 0.5 ? (l == 0 ? 2 : 4) : (l == 0 ? 3 : 4)) : (cls == 6 ? (l == 0 ? 8 : 10) : (l == 0 ? 7 : 8)));
         gl_Position = vec4(ndc.x * w, ndc.y * uFlipY * w, 0.0, w);
         vViewZ = w;
         vSize = H;
@@ -144,7 +133,7 @@ in float vViewZ, vAlpha, vLayerKind, vSeed, vSize;
 flat in int vLayer;
 in vec4 vPrim, vEnv;
 out vec4 oColor;
-uniform sampler2DArray uSprite;
+uniform sampler2DArray uSprite, uFlip;
 uniform sampler2D uDepth;
 uniform vec2 uSize, uNearFar;
 uniform float uStrength;
@@ -158,7 +147,13 @@ void main() {
     float scene = linearDepth(texture(uDepth, gl_FragCoord.xy / uSize).r);
     // Geometry nearer than the flame hides it; the sprite is allowed to sit slightly inside its own holder.
     float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + (uMode == 3 ? 0.35 : 0.6), 0.0, 1.0);
-    vec4 t = texture(uSprite, vec3(vUv, float(vLayer)));
+    vec4 t;
+    if (uMode == 0) {
+        float f0 = floor(vSeed);
+        t = mix(texture(uFlip, vec3(vUv, f0)), texture(uFlip, vec3(vUv, mod(f0 + 1.0, 64.0))), fract(vSeed));
+    } else {
+        t = texture(uSprite, vec3(vUv, float(vLayer)));
+    }
     float v = t.r * t.a;
     vec3 rgb;
     float a;
@@ -183,6 +178,10 @@ void main() {
         if (cls == 4) { // bomb fireball, white-hot to deep orange
             c = mix(vec3(7.0, 4.0, 1.4), vec3(2.2, 0.5, 0.08), smoothstep(0.0, 0.8, p)) * (1.0 - 0.6 * p);
             al = t.a * (0.4 + 0.6 * t.r) * (1.0 - smoothstep(0.55, 1.0, p));
+        } else if (cls == 6) { // sparkle: crisp HDR star with a soft halo
+            float tw = 0.75 + 0.25 * sin(p * 30.0 + vLayerKind);
+            c = l == 0 ? mix(vPrim.rgb, vec3(1.0), 0.35) * 4.0 * tw : mix(vEnv.rgb, vPrim.rgb, 0.5) * 1.8;
+            al = l == 0 ? t.a * t.r * vAlpha : pow(t.a * t.r, 1.5) * vAlpha * 0.5;
         } else if (cls == 5) { // hit spark
             c = max(vPrim.rgb, vec3(0.2)) * 5.0 * (1.0 - 0.6 * p);
             al = t.a * t.r * vAlpha * (l == 0 ? 0.9 : 0.6);
@@ -195,21 +194,18 @@ void main() {
     }
     if (uMode == 2) {
         rgb = vPrim.rgb * vec3(2.2, 1.9, 1.5);
-        a = pow(t.a * t.r, 1.8) * vAlpha * 1.1;
+        a = pow(t.a * t.r, 1.8) * vAlpha * 0.8;
     } else if (uMode == 1) {
         rgb = vec3(7.0, 2.4, 0.45) * mix(0.6, 1.4, fract(vSeed * 91.7));
         a = t.a * t.r * vAlpha;
-    } else if (vLayerKind > 2.5) {
-        // Halo: orange light feel, additive and faint.
-        rgb = mix(vEnv.rgb, vPrim.rgb, 0.55) * vec3(1.6, 0.9, 0.35);
-        a = pow(t.a * t.r, 1.5) * vAlpha * 0.10;
     } else {
-        // Game colours keep per-flame hues (yellow/red torch, blue and green variants); HDR gain is added on top.
-        vec3 cool = max(vEnv.rgb, vec3(0.05)) * 1.4;
-        vec3 hot = mix(vPrim.rgb, vEnv.rgb + vec3(0.15), 0.45) * 3.2;
-        rgb = mix(cool, hot, smoothstep(0.12, 0.62, v));
-        rgb += mix(vec3(1.0), normalize(hot + 0.05) * 1.7, 0.6) * smoothstep(0.75, 1.0, v) * (vLayerKind > 1.5 ? 1.4 : 0.7);
-        a = clamp(t.a * (vLayerKind > 1.5 ? 0.8 : 0.62), 0.0, 1.0) * vAlpha;
+        // Flipbook flame: R = heat, A = coverage. Edges take the game's env colour, the body its prim colour; bright but
+        // not clipped (peak about 2) so the gradient stays readable and bloom carries the glow. Partly transparent.
+        vec3 cool = max(vEnv.rgb, vec3(0.05)) * 1.3;
+        vec3 hot = mix(vPrim.rgb, vEnv.rgb + vec3(0.15), 0.25) * 2.3;
+        float v = t.r;
+        rgb = mix(cool, hot, smoothstep(0.05, 0.6, v)) * (0.65 + 1.0 * v);
+        a = clamp(t.a * 1.25, 0.0, 1.0) * vAlpha * (vLayerKind > 0.5 ? 0.6 : 0.95);
     }
     a *= soft * uStrength;
     if (uDebug == 1) { oColor = vec4(t.rgb * t.a * 3.0, 0.0); return; }
@@ -275,6 +271,7 @@ bool PostFxGL::BuildVfxProgram() {
     Use(mVfx);
     glUniform1i(Loc("uSprite"), kSpriteUnit);
     glUniform1i(Loc("uDepth"), kDepthUnit);
+    glUniform1i(Loc("uFlip"), kFlipUnit);
 
     // Sprite array from the downloaded CC0 pack; any missing file disables the whole feature (no procedural fallback).
     const std::string root = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString(
@@ -307,6 +304,38 @@ bool PostFxGL::BuildVfxProgram() {
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
 
+    {
+        std::filesystem::path path = std::filesystem::path(root) / "vfx" / "fire_flipbook_8x8.png";
+        if (!path.is_absolute())
+            path = Ship::Context::LocateFileAcrossAppDirs(path.string());
+        int w = 0, h = 0, n = 0;
+        auto* sheet = stbi_load(path.string().c_str(), &w, &h, &n, 4);
+        if (!sheet || w != kFlipCols * kFlipW || h != (kFlipFrames / kFlipCols) * kFlipH) {
+            SPDLOG_WARN("NewDawnVfx: missing/unsupported fire flipbook {}", path.string());
+            stbi_image_free(sheet);
+            glDeleteProgram(mVfx.id);
+            mVfx.id = 0;
+            return false;
+        }
+        std::vector<uint8_t> layers((size_t)kFlipW * kFlipH * kFlipFrames * 4);
+        for (int f = 0; f < kFlipFrames; ++f) {
+            for (int row = 0; row < kFlipH; ++row) {
+                const uint8_t* src = sheet + ((size_t)((f / kFlipCols) * kFlipH + row) * w + (f % kFlipCols) * kFlipW) * 4;
+                std::memcpy(layers.data() + ((size_t)f * kFlipH + row) * kFlipW * 4, src, (size_t)kFlipW * 4);
+            }
+        }
+        stbi_image_free(sheet);
+        glActiveTexture(GL_TEXTURE0 + kFlipUnit);
+        glGenTextures(1, &mVfxFlip);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, mVfxFlip);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, kFlipW, kFlipH, kFlipFrames, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     layers.data());
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    }
     glGenVertexArrays(1, &mVfxVao);
     glGenBuffers(1, &mVfxVbo);
     glBindVertexArray(mVfxVao);
@@ -330,6 +359,9 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glActiveTexture(GL_TEXTURE0 + kSpriteUnit);
     glBindTexture(GL_TEXTURE_2D_ARRAY, mVfxSprites);
     glBindSampler(kSpriteUnit, 0);
+    glActiveTexture(GL_TEXTURE0 + kFlipUnit);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, mVfxFlip);
+    glBindSampler(kFlipUnit, 0);
     glActiveTexture(GL_TEXTURE0 + kDepthUnit);
     glBindTexture(GL_TEXTURE_2D, mDepth.tex);
     glBindSampler(kDepthUnit, 0);
@@ -362,7 +394,7 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     if (p.shadowEnabled) {
         float lit[3];
         for (int i = 0; i < 3; ++i)
-            lit[i] = std::clamp(p.shadowAmbient[i] + 0.6f * p.shadowDirColor[i], 0.1f, 1.4f);
+            lit[i] = 0.55f + 0.45f * std::clamp(p.shadowAmbient[i] + 0.6f * p.shadowDirColor[i], 0.0f, 1.0f); // dust stays pale, as natively
         glUniform3f(Loc("uLit"), lit[0], lit[1], lit[2]);
     } else {
         glUniform3f(Loc("uLit"), 1.0f, 1.0f, 1.0f);
