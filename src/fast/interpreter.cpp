@@ -1080,7 +1080,9 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
     }
     if (mVfxDebug) {
         static std::unordered_set<std::string> seen;
-        if (path.find("gEff") != std::string_view::npos && seen.insert(std::string(path)).second) {
+        // Vfx.DebugAll=1 logs every texture path (misclassification hunting); otherwise only gEff* ones.
+        static const bool all = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.DebugAll", 0);
+        if ((all || path.find("gEff") != std::string_view::npos) && seen.insert(std::string(path)).second) {
             SPDLOG_INFO("VFXDBG texture {} class {}", path, cls);
         }
     }
@@ -1207,6 +1209,48 @@ void Interpreter::RecordVfxArrow(const LoadedVertex* const v[3], uint8_t cls) {
     inst[7] = fmodf(floorf(inst[12] / 4.0f) * 12.9898f + floorf(inst[13] / 4.0f) * 78.233f +
                         floorf(inst[14] / 4.0f) * 37.719f, 1000.0f);
     inst[15] = wid;
+    // Burst test in 3D (view space): the screen-space axis is foreshortened whenever the arrow points at or away from the
+    // camera (aiming), which used to look like the impact's near-round model. Store half-width / half-length of the 3D
+    // point cloud in env.a: flight/aim stay thin (< 0.5), the game's impact scale-up (x/z up to 64 vs y 8) is >> 1.
+    {
+        double c[3] = { 0, 0, 0 };
+        for (size_t i = 0; i < count; i++)
+            for (int k = 0; k < 3; k++)
+                c[k] += mVfxArrowPts[i * 7 + 4 + k] / count;
+        double cov[3][3] = {};
+        for (size_t i = 0; i < count; i++) {
+            double d[3];
+            for (int k = 0; k < 3; k++)
+                d[k] = mVfxArrowPts[i * 7 + 4 + k] - c[k];
+            for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 3; b++)
+                    cov[a][b] += d[a] * d[b];
+        }
+        double ax3[3] = { 1, 0.7, 0.3 };
+        for (int it = 0; it < 12; it++) {
+            double n[3];
+            double len = 0;
+            for (int a = 0; a < 3; a++) {
+                n[a] = cov[a][0] * ax3[0] + cov[a][1] * ax3[1] + cov[a][2] * ax3[2];
+                len += n[a] * n[a];
+            }
+            len = sqrt(len) + 1e-12;
+            for (int a = 0; a < 3; a++)
+                ax3[a] = n[a] / len;
+        }
+        double along3 = 0, across3 = 0;
+        for (size_t i = 0; i < count; i++) {
+            double d[3], proj = 0, r2 = 0;
+            for (int k = 0; k < 3; k++) {
+                d[k] = mVfxArrowPts[i * 7 + 4 + k] - c[k];
+                proj += d[k] * ax3[k];
+            }
+            for (int k = 0; k < 3; k++)
+                r2 += (d[k] - proj * ax3[k]) * (d[k] - proj * ax3[k]);
+            along3 = std::max(along3, fabs(proj)), across3 = std::max(across3, sqrt(r2));
+        }
+        inst[19] = (float)(across3 / std::max(along3, 1e-3));
+    }
 }
 
 void Interpreter::SubmitVfx() {
