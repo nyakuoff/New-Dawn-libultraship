@@ -4,6 +4,7 @@
 #include "fast/newdawn_wind.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <stb_image.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -721,6 +723,20 @@ vec3 giNormal(ivec2 p, vec3 P) {
     vec3 n = cross(dx,dy)*uFlipY;
     return n/max(length(n),1e-6);
 }
+// Same, over a footprint of k pixels each way (smooths faceted low-poly shapes); the smaller one-sided step still
+// keeps silhouettes from blending with the background.
+vec3 giNormalWide(ivec2 p, vec3 P, int k) {
+    ivec2 l = max(p-ivec2(k,0),ivec2(0)), r = min(p+ivec2(k,0),uSize-1);
+    ivec2 b = max(p-ivec2(0,k),ivec2(0)), t = min(p+ivec2(0,k),uSize-1);
+    vec3 L = giPosition((vec2(l)+0.5)/vec2(uSize),fetchDepth(l));
+    vec3 R = giPosition((vec2(r)+0.5)/vec2(uSize),fetchDepth(r));
+    vec3 B = giPosition((vec2(b)+0.5)/vec2(uSize),fetchDepth(b));
+    vec3 T = giPosition((vec2(t)+0.5)/vec2(uSize),fetchDepth(t));
+    vec3 dx = dot(R-P,R-P)<dot(P-L,P-L) ? R-P : P-L;
+    vec3 dy = dot(T-P,T-P)<dot(P-B,P-B) ? T-P : P-B;
+    vec3 n = cross(dx,dy)*uFlipY;
+    return n/max(length(n),1e-6);
+}
 // One-sided normal for emitters: the hemisphere test tolerates silhouette error, and it costs half as much.
 vec3 giNormalFast(ivec2 p, vec3 P) {
     vec3 R = giPosition((vec2(p+ivec2(1,0))+0.5)/vec2(uSize),fetchDepth(p+ivec2(1,0)));
@@ -913,6 +929,7 @@ uniform float uDebug;
 uniform float uDarken;
 uniform float uFogMul;
 uniform float uFogOff;
+uniform float uSoft; // 1 for the stencil-marked characters: their low-poly depth normals are smoothed
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 // Screen-space contact shadow along the segment to the light, from the opaque depth buffer: walls and actors between
 // the surface and the flame occlude it. Samples outside the screen count as visible.
@@ -941,6 +958,13 @@ void main() {
     if (d >= 0.99999) return;
     vec3 P = giPosition((vec2(p) + 0.5) / vec2(uSize), d);
     vec3 N = giNormal(p, P);
+    if (uSoft > 0.0) {
+        // Characters are low-poly: the 1-pixel depth normal is faceted. Average it with wide-footprint normals so the
+        // light rolls over the body instead of snapping between triangles.
+        vec3 wide = N;
+        for (int k = 1; k <= 2; ++k) wide += giNormalWide(p, P, 3 * k);
+        N = normalize(wide);
+    }
     float jitter = ign(gl_FragCoord.xy);
     vec3 E = vec3(0.0);
     for (int i = 0; i < uLightCount; ++i) {
@@ -954,7 +978,8 @@ void main() {
         float core = R * 0.2;
         float atten = window * window * core * core / (d2 + core * core);
         // Wrapped Lambert: the depth-derived normal is faceted, so the terminator is softened.
-        float diffuse = clamp((dot(N, L) + 0.3) / 1.3, 0.0, 1.0);
+        float wrap = mix(0.3, 0.7, uSoft);
+        float diffuse = clamp((dot(N, L) + wrap) / (1.0 + wrap), 0.0, 1.0);
         float lit = atten * diffuse;
         if (lit < 0.002) continue;
         E += uLightRgb[i] * (lit * localVisibility(P, uLight[i].xyz, jitter));
@@ -1982,8 +2007,9 @@ uniform float uSurfaceDetail;
 
 // March uniformly in screen space, interpolating reciprocal clip W for perspective-correct axial depth.
 // Stable deterministic steps: no temporal history, random jitter or feedback from the translucent world.
-vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) {
+vec4 traceReflection(vec3 origin, vec3 direction, float planeY, float roughness, out int status, out float hitDist) {
     status = 0; // 0: sky/miss, 1: accepted hit, 2: rejected candidate
+    hitDist = 0.0;
     if (direction.y <= 0.002) {
         status = 2;
         return vec4(0.0);
@@ -2053,15 +2079,23 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) 
             confidence *= 1.0 - smoothstep(thickness * 0.25, thickness, mismatch);
             confidence *= smoothstep(0.002, 0.06, direction.y);
             confidence *= 1.0 - smoothstep(0.75, 1.0, hi);
+            // Real water is not a mirror: the reflected image softens with the distance between the reflected point and
+            // the waterline (a rough surface integrates a cone of directions) and smears along the vertical, since wave
+            // slopes tilt the reflection mostly up and down the screen. Radius is in full-resolution pixels.
+            hitDist = length(hit - origin);
+            float angular = hitDist * roughness / max(depth, 1.0);
+            float radius = clamp(angular / max(uPixelAngle * 0.5, 1e-5), 0.65, 9.0);
             // Restyled water uses a subpixel gather. The legacy 2.5px gather is retained when Restyle is off.
+            radius = max(radius, mix(2.5, 0.65, uSurfaceDetail));
             vec3 color = texture(uOpaqueColor, uv).rgb;
             float weight = 1.0;
-            const vec2 taps[4] = vec2[4](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
-            for (int j = 0; j < 4; j++) {
-                float sharp = uSurfaceDetail;
-                vec2 tap = uv + taps[j] * mix(2.5, 0.65, sharp) / vec2(uSize);
+            const float golden = 2.39996323;
+            for (int j = 0; j < 12; j++) {
+                float a = float(j) * golden;
+                float r = sqrt((float(j) + 0.5) / 12.0);
+                vec2 tap = uv + vec2(cos(a), sin(a) * 1.8) * r * radius / vec2(uSize);
                 float td = linDepth(texture(uOpaqueDepth, tap).r);
-                float w = exp(-abs(td - depth) / thickness);
+                float w = exp(-abs(td - depth) / (thickness * 2.0)) * (1.0 - 0.5 * r);
                 color += texture(uOpaqueColor, tap).rgb * w;
                 weight += w;
             }
@@ -2110,6 +2144,19 @@ vec2 waterSlope(vec2 pos, float footprint) {
     s += 0.55 * f2 * noised(pos / wl2 + vec2(-0.043, 0.081) * uTime + 7.3).yz / wl2 * 9.0;
     return s;
 }
+
+#ifdef WATER_REFLECTIONS
+// Normal that bends the reflection: the glint slope plus two finer travelling octaves, each faded out as the pixel footprint
+// reaches its wavelength. This is what makes a reflected tower wobble and shear instead of staying a perfect copy.
+vec2 reflectionSlope(vec2 pos, float footprint) {
+    float f3 = 1.0 - smoothstep(0.12, 0.5, footprint / 17.0);
+    float f4 = 1.0 - smoothstep(0.12, 0.5, footprint / 6.5);
+    vec2 s = waterSlope(pos, footprint) * 0.6;
+    s += 0.9 * f3 * noised(pos / 17.0 + vec2(0.17, -0.11) * uTime + 3.7).yz / 17.0 * 2.6;
+    s += 0.6 * f4 * noised(pos / 6.5 + vec2(-0.31, 0.23) * uTime + 11.9).yz / 6.5 * 1.1;
+    return s;
+}
+#endif
 
 void main() {
 #ifdef WATER_REFLECTIONS
@@ -2170,11 +2217,16 @@ void main() {
     vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
 #ifdef WATER_REFLECTIONS
     // A filtered, gently distorted reflection normal; retain the original glint slope separately.
-    vec3 reflectionNormal = normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25));
+    vec2 reflSlope = reflectionSlope(H.xz, footprint);
+    vec3 reflectionNormal = normalize(vec3(-reflSlope.x, 1.0, -reflSlope.y));
     int hitStatus;
+    float hitDist;
+    // Wave steepness roughens the reflection further.
+    float roughness = 0.012 + 0.12 * length(reflSlope);
     // Use the exact plane even when a water mesh's own depth was accepted within the mask's 1.5-unit tolerance.
     vec3 reflectionH = uEye + ray * ((uBoxY[bi] - uEye.y) / ray.y);
-    vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], hitStatus);
+    vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], roughness,
+                               hitStatus, hitDist);
     if (uDebug == 2) {
         oColor = vec4(hitStatus == 1 ? vec3(0.0, 1.0, 0.0) :
                       (hitStatus == 2 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0)), 1.0);
@@ -2184,12 +2236,18 @@ void main() {
     // erased dark reflected objects. Lift the Fresnel response perceptually while retaining its view-angle falloff.
     if (uSkyReflectionsEnabled) {
         vec3 R = reflect(-V, reflectionNormal);
-        vec3 environment = textureLod(uSkySpecular, R, 0.4 + clamp(footprint * 0.02, 0.0, 1.1)).rgb;
+        R.y = max(R.y, 0.02);
+        vec3 environment = textureLod(uSkySpecular, normalize(R), 0.8 + clamp(footprint * 0.02, 0.0, 1.1) + roughness * 6.0).rgb;
         // Retain the established perceptual visibility for confident geometry hits. The cube uses
         // physical water Schlick (F0=0.02), so a miss cannot increase reflection strength or wash out
         // mid-angle turquoise. Confidence crossfades the two premultiplied contributions.
-        float ssrWeight = uReflectionStrength * sqrt(fres) * shore * hit.a;
-        float skyWeight = 0.4 * uReflectionStrength * fres * shore * (1.0-hit.a);
+        // Imperfect on purpose (a mirror reads as fake): Fresnel is the physical F raised to 0.62 rather than the old square
+        // root, so steep views reflect clearly less; the reflection never reaches full opacity, thins with the distance the
+        // light travelled, and breaks up slightly where the surface is rougher.
+        float breakup = 1.0 - 0.3 * smoothstep(0.35, 0.85, 0.5 + 0.5 * noised(H.xz / 23.0 + vec2(0.05, 0.04) * uTime).x * 1.4);
+        float travel = 1.0 - 0.45 * smoothstep(200.0, 3500.0, hitDist);
+        float ssrWeight = uReflectionStrength * min(pow(fres, 0.62), 0.85) * shore * hit.a * breakup * travel;
+        float skyWeight = 0.4 * uReflectionStrength * fres * shore * (1.0-hit.a) * breakup;
         float weight = ssrWeight + skyWeight;
         vec3 glints = max(add - refl * 0.6 * uStrength * shore, vec3(0.0));
         oColor = vec4(environment * skyWeight + hit.rgb * ssrWeight + glints * (1.0-weight), weight);
@@ -3880,7 +3938,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                               (params.waterReflections != 0 || params.waterFoam > 0.0f ||
                                params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
-    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
+    // The water surface runs before the soft-sprite effects (NEWDAWN_POSTFX_STAGE_WATER_XLU) so splashes and ripples draw above it
+    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
     const bool doWeather = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosWeather &&
                            params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
@@ -3958,7 +4017,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         RunUnderwater(params, fb);
         EndTimer(kUnderwaterTimerStage);
     }
-    if (doWater && !(doUnderwater && params.waterUnderwaterState >= 1.0f)) {
+    // Fully submerged cameras use the underwater pass (scene end) instead of the surface
+    if (doWater && !(params.waterUnderwater > 0.0f && params.waterUnderwaterState >= 1.0f && mUnderwater.id)) {
         BeginTimer(kWaterTimerStage);
         RunWaterSurface(params, fb);
         if (params.waterStrength > 0.0f || params.waterReflections != 0) {
@@ -5163,9 +5223,33 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         static_cast<float>(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
     // Render-only flicker: a slow drift plus two faster, weaker terms (all under ~5 Hz), keyed on the light's quantised
     // position and the wall clock. Warm (fire) lights flicker up to ~18%, neutral lamps barely. No game data changes.
-    auto add = [&](const float* p, float radius, const float* col, float boost) {
+    // The game re-rolls some lights every tick (a torch sets its intensity to 128 + rand * 127 at 20 Hz): white noise of
+    // up to +-33% that read as strobing on every surface and character the light reaches. Low-pass each light's
+    // colour and radius over ~0.6 s of wall-clock time, keyed on its position, before the designed flicker below.
+    static std::unordered_map<uint64_t, std::array<float, 5>> smoothed; // r, g, b, radius, last seen
+    static double lastNow = 0.0;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const bool smoothLights = CvInt("gNewDawn.Lighting.LocalSmooth", 1) != 0; // 0: the unfiltered game values (A/B)
+    const float blend =
+        smoothLights ? 1.0f - std::exp(-static_cast<float>(std::clamp(now - lastNow, 0.0, 0.5)) / 0.6f) : 1.0f;
+    lastNow = now;
+    auto add = [&](const float* p, float radiusIn, const float* colIn, float boost) {
         if (count >= kMax)
             return;
+        const uint64_t key = (static_cast<uint64_t>(static_cast<int32_t>(std::floor(p[0] / 8.0f))) & 0xFFFFF) |
+                             ((static_cast<uint64_t>(static_cast<int32_t>(std::floor(p[1] / 8.0f))) & 0xFFFFF) << 20) |
+                             ((static_cast<uint64_t>(static_cast<int32_t>(std::floor(p[2] / 8.0f))) & 0xFFFFF) << 40);
+        auto& st = smoothed[key];
+        if (now - st[4] > 1.0) { // new, or gone for a while: start at the current value
+            st = { colIn[0], colIn[1], colIn[2], radiusIn, 0.0f };
+        } else {
+            for (int i = 0; i < 3; ++i)
+                st[i] += (colIn[i] - st[i]) * blend;
+            st[3] += (radiusIn - st[3]) * blend;
+        }
+        st[4] = static_cast<float>(now);
+        const float radius = st[3];
+        const float col[3] = { st[0], st[1], st[2] };
         const float m = std::max(col[0], std::max(col[1], col[2]));
         if (m <= 0.0f)
             return;
@@ -5181,10 +5265,10 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         const float seed = std::fmod(std::floor(p[0] / 4.0f) * 12.9898f + std::floor(p[1] / 4.0f) * 78.233f +
                                          std::floor(p[2] / 4.0f) * 37.719f,
                                      1000.0f);
-        const float amp = std::clamp(params.localFlicker, 0.0f, 1.0f) * (0.03f + 0.15f * warm);
-        const float f = 1.0f + amp * (0.55f * std::sin(seconds * 8.2f + seed) +
+        const float amp = std::clamp(params.localFlicker, 0.0f, 1.0f) * (smoothLights ? 0.02f + 0.10f * warm : 0.03f + 0.15f * warm);
+        const float f = 1.0f + amp * (0.60f * std::sin(seconds * 8.2f + seed) +
                                       0.30f * std::sin(seconds * 18.2f + seed * 1.7f + 1.0f) +
-                                      0.15f * std::sin(seconds * 32.0f + seed * 2.3f + 2.0f));
+                                      0.10f * std::sin(seconds * 32.0f + seed * 2.3f + 2.0f));
         pos[count][0] = p[0], pos[count][1] = p[1], pos[count][2] = p[2];
         pos[count][3] = std::clamp(radius * 1.3f, 90.0f, 700.0f);
         for (int i = 0; i < 3; ++i)
@@ -5236,6 +5320,8 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
             add(fl.f + 12, 150.0f, col, 1.0f);
         }
     }
+    for (auto it = smoothed.begin(); it != smoothed.end();)
+        it = (now - it->second[4] > 2.0) ? smoothed.erase(it) : std::next(it);
     if (count == 0 && params.localDarken <= 0.0f)
         return;
     if (!mUsable)
@@ -5279,9 +5365,11 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glUniform1f(Loc("uDarken"), darken);
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
+    glUniform1f(Loc("uSoft"), 0.0f);
     Draw(fb.fbo, w, h);
     glStencilFunc(GL_EQUAL, 1, 0xFF);
     glUniform1f(Loc("uDarken"), darken * 0.4f);
+    glUniform1f(Loc("uSoft"), smoothLights ? 1.0f : 0.0f);
     Draw(fb.fbo, w, h);
     glStencilMask(0xFF);
     glDisable(GL_STENCIL_TEST);

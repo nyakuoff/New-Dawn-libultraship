@@ -1032,7 +1032,8 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
 enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7,
        VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */,
-       VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */ };
+       VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */,
+       VFX_WATER_SPLASH = 12, VFX_WATER_RIPPLE = 13 /* native draw kept, only dimmed (see mVfxDim) */ };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1058,6 +1059,10 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gEffHitmarkRed", VFX_HIT },
         { "gEffHitmarkWhiteMetal", VFX_HIT },
         { "gElectricSpark", VFX_SPARK },
+        // Water splashes/ripples (EffectSsGSplash/GRipple) are opaque-white native quads that read blown out in HDR; they are
+        // not replaced, only dimmed at draw time. Kept out of the dust class (frame digits) on purpose.
+        { "gEffWaterSplash", VFX_WATER_SPLASH },
+        { "gEffWaterRipple", VFX_WATER_RIPPLE },
         { "gFireArrow", VFX_ARROW_FIRE }, // Tex and MaskTex: the 43-vertex glow model
         { "gIceArrow", VFX_ARROW_ICE },
         { "gLightArrow", VFX_ARROW_LIGHT },
@@ -1073,7 +1078,7 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         }
         cls = c;
         const size_t digit = pos + name.size();
-        if (c >= VFX_DUST && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
+        if (c >= VFX_DUST && c < VFX_WATER_SPLASH && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
             cls |= (uint8_t)((path[digit] - '1') << 4);
         }
         break;
@@ -1232,6 +1237,9 @@ namespace {
 const char* const kGrassTextures[] = {
 #include "fast/newdawn_grass_textures.inc"
 };
+const char* const kSwayTextures[] = {
+#include "fast/newdawn_sway_textures.inc"
+};
 } // namespace
 
 void Interpreter::BeginGrassRecording(bool enabled) {
@@ -1253,6 +1261,26 @@ uint16_t Interpreter::GrassClassify(std::string_view path) {
     return found == table.end() ? 0 : found->second;
 }
 
+// Only upright geometry sways: floors, lawns and near-level cut-outs are never displaced (room geometry: |n.y| >= 0.75,
+// within about 41 degrees of level; foliage actors, whose drooping leaf cards are tilted: |n.y| >= 0.95), so ground
+// triangles that share edges with plants cannot open cracks.
+static bool WindTriangleUpright(const LoadedVertex* const v[3], float maxNormalY) {
+    const float* a = v[0]->view_pos;
+    const float* b = v[1]->view_pos;
+    const float* c = v[2]->view_pos;
+    const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+    const float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    const float ext = std::max({ a[1], b[1], c[1] }) - std::min({ a[1], b[1], c[1] });
+    return len >= 1e-3f && std::fabs(n[1]) < maxNormalY * len && ext > 0.5f;
+}
+
+bool Interpreter::SwayClassify(std::string_view path) {
+    static const std::unordered_set<std::string_view> table(std::begin(kSwayTextures), std::end(kSwayTextures));
+    const size_t slash = path.rfind('/');
+    return table.count(slash == std::string_view::npos ? path : path.substr(slash + 1)) != 0;
+}
+
 void Interpreter::RecordGrassTriangle(const LoadedVertex* const v[3]) {
     constexpr size_t kMaxGrassTriangles = 200000;
     if (mGrassTris.size() >= kMaxGrassTriangles * NEWDAWN_GRASS_TRI_FLOATS) {
@@ -1264,8 +1292,8 @@ void Interpreter::RecordGrassTriangle(const LoadedVertex* const v[3]) {
     const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
     const float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
     const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    // Ground only: walls, steep banks and degenerate slivers get no grass.
-    if (len < 1e-3f || std::fabs(n[1]) < 0.6f * len) {
+    // Ground only: walls, banks and degenerate slivers get no grass (|n.y| >= 0.85: within about 32 degrees of level).
+    if (len < 1e-3f || std::fabs(n[1]) < 0.85f * len) {
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -2764,6 +2792,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         rejected = true;
     }
 
+    mVfxDim = 1.0f;
     if (mVfx && !is_rect) {
         mVfxTriSerial++;
         const uint32_t t0 = mRdp->first_tile_index;
@@ -2800,6 +2829,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (mRapi->VfxReplacing()) {
                 return;
             }
+        } else if (cls == VFX_WATER_SPLASH || cls == VFX_WATER_RIPPLE) {
+            mVfxDim = cls == VFX_WATER_SPLASH ? 0.5f : 0.8f;
         } else if (cls != VFX_NONE) {
             const bool candle = cls == VFX_CANDLE;
             RecordVfxTriangle(v_arr, candle ? (uint8_t)VFX_FLAME : cls, frame);
@@ -3114,11 +3145,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // are untouched: the loaded vertices themselves are never modified.
     LoadedVertex swayed[3];
     if (mWindSway && !is_rect && comb->usedTextures[0] && mRenderingState.mTextures[0] != nullptr && tex_height[0] > 0 &&
-        (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA && (mRdp->other_mode_l & G_ZS_PRIM) == 0) {
+        (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA && (mRdp->other_mode_l & G_ZS_PRIM) == 0 &&
+        (!mWindRoom || mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].swayPlant) &&
+        WindTriangleUpright(v_arr, mWindRoom ? 0.75f : 0.95f)) {
         const auto cpuStart = mWindProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto& wind = mWindState;
         const float windT = mWindT;
         const float(*P)[4] = mRsp->P_matrix;
+        const float minY = std::min({ v_arr[0]->view_pos[1], v_arr[1]->view_pos[1], v_arr[2]->view_pos[1] });
+        const float maxY = std::max({ v_arr[0]->view_pos[1], v_arr[1]->view_pos[1], v_arr[2]->view_pos[1] });
         for (int i = 0; i < 3; i++) {
             swayed[i] = *v_arr[i];
             float t = v_arr[i]->v / 32.0f;
@@ -3129,8 +3164,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             t = (t - mRdp->texture_tile[effective_tile[0]].ult / 4.0f) / tex_height[0];
             t = (t > -0.02f && t < 1.02f) ? Ship::Math::clamp(t, 0.0f, 1.0f) : t - floorf(t);
             // Tips (top of the cut-out) move, bases stay planted.
-            const float weight = (1.0f - t) * (1.0f - t);
+            // ...and only above the triangle's own lowest vertex, so bases shared with neighbours stay welded.
             const float* p = v_arr[i]->view_pos;
+            const float weight = (1.0f - t) * (1.0f - t) * std::clamp((p[1] - minY) / (maxY - minY), 0.0f, 1.0f);
             const float phase = (p[0] * wind.dirX + p[2] * wind.dirZ) * 0.015f - windT * 1.7f;
             const float wave = std::sin(phase) * 0.7f + std::sin(phase * 2.9f + p[1] * 0.05f) * 0.3f;
             const float amount = (0.55f + wave * 0.45f) * wind.gust * 3.5f * mWindScale * weight;
@@ -3415,16 +3451,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
+                    const float dim = color == &mRdp->prim_color ? mVfxDim : 1.0f;
+                    mBufVbo[mBufVboLen++] = color->r / 255.0f * dim;
+                    mBufVbo[mBufVboLen++] = color->g / 255.0f * dim;
+                    mBufVbo[mBufVboLen++] = color->b / 255.0f * dim;
                 } else {
                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for standard fog, blend color mode preserves
                         // it since fog alpha is the blend factor
                         mBufVbo[mBufVboLen++] = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        mBufVbo[mBufVboLen++] = color->a / 255.0f * (color == &mRdp->prim_color ? mVfxDim : 1.0f);
                     }
                 }
             }
@@ -3809,6 +3846,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].swayPlant = mWindSway && mWindRoom && SwayClassify(texPath);
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -3886,6 +3924,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].swayPlant = mWindSway && mWindRoom && SwayClassify(texPath);
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -5393,6 +5432,7 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     if (stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN || stage == NEWDAWN_POSTFX_STAGE_WIND_END) {
         // Only changes how later triangles are built: no batch flush needed, so per-actor scopes stay cheap.
         gfx->mWindSway = stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN && gfx->mPostFxActive;
+        gfx->mWindRoom = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_ROOM_SHIFT) & 1);
         return false;
     }
     gfx->Flush();
@@ -5431,8 +5471,11 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             gfx->SubmitShadowCasters();
             gfx->SubmitGrass();
             gfx->mGrass = false;
-        } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) {
-            gfx->SubmitVfx();
+        } else if ((stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) ||
+                   (stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && effective.waterEnabled != 0)) {
+            if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+                gfx->SubmitVfx();
+            }
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
             // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
             gfx->FillShadowCameraParams(effective);
