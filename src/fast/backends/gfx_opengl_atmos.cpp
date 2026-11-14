@@ -23,7 +23,7 @@ uniform float uNdcXScale, uFlipY;
 uniform int uKind, uBiome;
 out vec2 vUv;
 out vec3 vWorld;
-out float vFade, vViewZ;
+out float vFade, vViewZ, vNear;
 flat out float vSeed;
 uint hash(uint n) { n ^= n >> 16u; n *= 0x7feb352du; n ^= n >> 15u; n *= 0x846ca68bu; return n ^ (n >> 16u); }
 float random(uint n) { return float(hash(n) & 0xffffffu)/16777216.0; }
@@ -31,23 +31,29 @@ void main() {
     uint id = uint(gl_InstanceID) + uint(uKind)*8192u;
     vec3 seed = vec3(random(id*3u+1u), random(id*3u+2u), random(id*3u+3u));
     float phase = seed.x*6.2831853;
-    float extent = uBiome == 4 ? 220.0 : (uKind == 2 ? 420.0 : (uKind == 3 ? 400.0 : 560.0));
+    float extent = uBiome == 4 ? 220.0 : (uKind == 2 ? 260.0 : (uKind == 3 ? 400.0 : 380.0));
     vec3 p = (seed-0.5)*extent*2.0;
-    p.xz += uWindOffset * (uBiome == 4 ? 0.08 : (uKind == 2 ? 0.25 : 1.0));
-    p += vec3(sin(uTime*0.38+phase)*7.0, sin(uTime*0.29+phase)*10.0, cos(uTime*0.33+phase)*6.0);
-    p.y += uTime * (uKind == 3 ? -9.0 : (uKind == 1 ? -1.8 : 0.6));
+    p.xz += uWindOffset * (uBiome == 4 ? 0.08 : (uKind == 2 ? 0.1 : (uKind == 3 ? 1.0 : 0.45)));
+    // Slow meandering hover (no steady rise or fall) for dust, pollen and fireflies; leaves fall.
+    p += vec3(sin(uTime*0.23+phase)*16.0+sin(uTime*0.51+phase*2.0)*5.0, sin(uTime*0.17+phase*1.7)*12.0+sin(uTime*0.43+phase)*4.0,
+              cos(uTime*0.19+phase)*14.0+cos(uTime*0.47+phase*3.0)*5.0);
+    if (uKind == 3) p.y += uTime * -9.0;
     // Fixed world seeds and camera-relative periodic images. Outer shell fades before wrapping.
     vec3 relative = mod(p-uEye+extent, extent*2.0)-extent;
     p = uEye + relative;
+    if (uKind == 2) relative.y = (seed.y-0.5)*90.0 - 28.0 + sin(uTime*0.3+phase)*8.0; // hover low, near grass and water
+    p = uEye + relative;
     float distance = length(relative);
+    vNear = 1.0 - smoothstep(30.0, 110.0, distance); // near motes are out of focus: bigger and softer
     vFade = smoothstep(18.0, 55.0, distance) * (1.0-smoothstep(extent*0.65, extent*0.94, distance));
-    if (uKind == 2) vFade *= 0.35+0.65*pow(0.5+0.5*sin(uTime*1.6+phase*3.0),2.0);
+    if (uKind == 2) vFade *= 0.12+0.88*pow(0.5+0.5*sin(uTime*(0.9+seed.y*1.2)+phase*3.0),2.0);
     vec2 corners[6] = vec2[6](vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     vec2 q = corners[gl_VertexID];
     vUv = q*0.5+0.5;
-    float radius = mix(1.4,3.8,seed.z);
+    float radius = mix(2.0,5.0,seed.z*seed.z);
+    if (uKind <= 1) radius *= 1.0+vNear*1.6;
     if (uKind == 1) radius *= 1.6;
-    if (uKind == 2) radius = mix(1.2,2.4,seed.z);
+    if (uKind == 2) radius = mix(3.2,6.5,seed.z);
     if (uKind == 3) {
         radius = mix(2.5,4.5,seed.z);
         float rotation = uTime*0.7+phase;
@@ -66,8 +72,9 @@ void main() {
 const char* kFragment = R"GLSL(#version 330 core
 in vec2 vUv;
 in vec3 vWorld;
-in float vFade, vViewZ;
+in float vFade, vViewZ, vNear;
 flat in float vSeed;
+uniform float uTime;
 out vec4 oColor;
 uniform sampler2D uAtmosSprite;
 uniform sampler2D uAtmosLeaf;
@@ -102,13 +109,17 @@ void main() {
     float scene = linearDepth(texture(uAtmosDepth,gl_FragCoord.xy/uSize).r);
     float soft = clamp((scene-vViewZ)/6.0,0.0,1.0);
     vec4 sprite = uKind == 3 ? texture(uAtmosLeaf,vUv) : texture(uAtmosSprite,vUv);
-    float alpha = sprite.a*(uKind == 3 ? 1.0 : sprite.r)*vFade*soft*uStrength;
+    float core = uKind == 2 ? mix(sprite.r, sprite.a, 0.7) : sprite.r; // fireflies keep a soft halo
+    float alpha = sprite.a*(uKind == 3 ? 1.0 : core)*vFade*soft*uStrength;
+    float bright = mix(0.45, 1.7, fract(vSeed*13.7));
+    float twinkle = 0.65+0.35*sin(uTime*(0.8+fract(vSeed*5.3)*1.8)+vSeed*40.0);
     vec3 radiance;
     if (uKind == 2) {
-        radiance = mix(vec3(1.1,2.8,0.20), vec3(2.8,2.0,0.15),vSeed)*uNight;
+        radiance = mix(vec3(1.1,2.8,0.20), vec3(2.8,2.0,0.15),vSeed)*uNight*2.2;
     } else {
         float sun = uBiome == 4 ? 0.0 : sunlight()*(1.0-uNight)*(1.0-clamp(uRain,0.0,1.0));
-        radiance = uSunColor*sun*2.0;
+        radiance = uSunColor*sun*3.4*bright*twinkle*vec3(1.0,0.88,0.66);
+        alpha *= mix(1.0, 0.5, vNear); // defocused near motes are dimmer
         if (uKind == 1) radiance *= vec3(0.95,1.0,0.65);
         for (int i=0;i<uLightCount;i++) {
             float distance = length(vWorld-uLights[i].xyz);
@@ -289,7 +300,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUniform1i(Loc("uKind"), 0);
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 4096);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 3200);
     if (p.atmosBiome == 2 || p.atmosBiome == 3) {
         if (p.atmosNight < 1.0f) {
             glUniform1i(Loc("uKind"), 1);
@@ -297,7 +308,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
         }
         if (p.atmosNight > 0.0f) {
             glUniform1i(Loc("uKind"), 2);
-            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 3 ? 160 : 96);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 3 ? 320 : 220);
         }
     }
     if (p.atmosBiome == 3) {
