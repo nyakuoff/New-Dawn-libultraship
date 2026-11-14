@@ -150,6 +150,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
                                   uint32_t batchCount) override;
     void SetVfxSprites(const float* data, uint32_t count) override;
+    void SetGrassTriangles(const float* data, uint32_t count) override;
     bool VfxReplacing() const override;
     bool SupportsAlphaToCoverage() const override {
         return true;
@@ -222,6 +223,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     const GfxShadowFoliageBatch* mShadowFoliageBatches = nullptr;
     uint32_t mShadowFoliageBatchCount = 0;
     const float* mVfxSprites = nullptr;
+    const float* mGrassTriangles = nullptr;
+    uint32_t mGrassTriangleCount = 0;
     uint32_t mVfxSpriteCount = 0;
 
 #ifndef USE_OPENGLES
