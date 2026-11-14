@@ -20,6 +20,9 @@
 #define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */
 #define NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN 2 /* start recording opaque shadow casters */
 
+/* One recorded VFX sprite: cls, ndcX, ndcY, ndcZ, viewDepth, halfW, halfH, seed, primRGBA(4), world xyz, unused, envRGBA(4). */
+#define NEWDAWN_VFX_FLOATS 20
+
 typedef struct NewDawnPostFxParams {
     float zNear;
     float zFar;
@@ -115,4 +118,9 @@ typedef struct NewDawnPostFxParams {
     float artShadowTint[3]; /* added, weighted towards the shadows */
     float artHighTint[3];   /* added, weighted towards the highlights */
     float artGreen[2];      /* green hue range: shift towards yellow (+) or teal (-), saturation multiplier */
+    /* New Dawn VFX replacement: native fire/smoke/spark sprites are recorded by the interpreter (render-side only) and
+       redrawn as HD HDR sprites at the scene-end marker. Needs HDR. */
+    int32_t vfxEnabled;
+    float vfxStrength;  /* HDR emission multiplier */
+    float vfxEmbers;    /* ember density 0..2 */
 } NewDawnPostFxParams;

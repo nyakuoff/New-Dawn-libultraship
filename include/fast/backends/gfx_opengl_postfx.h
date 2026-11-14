@@ -30,6 +30,16 @@ class PostFxGL {
         mFoliageBatchCount = batchCount;
     }
 
+    // New Dawn VFX sprites for the next Run (NEWDAWN_VFX_FLOATS floats each).
+    void SetVfxSprites(const float* data, uint32_t count) {
+        mVfxData = data;
+        mVfxCount = count;
+    }
+
+    bool VfxUsable() const {
+        return mUsable && (!mVfxAttempted || mVfx.id != 0);
+    }
+
     bool BeginHdr(const FramebufferOGL& fb);
     void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void RunSunFlare(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
@@ -94,6 +104,11 @@ class PostFxGL {
     void RunSkyAmbient(const NewDawnPostFxParams& params);
     bool BuildPrograms();
     bool BuildAtmosProgram();
+    bool BuildVfxProgram();
+    void RunVfx(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    Program mVfx;
+    bool mVfxAttempted = false;
+    GLuint mVfxSprites = 0, mVfxVao = 0, mVfxVbo = 0;
     bool BuildAtmosShader(Program& program, const char* vertex, const char* fragment);
     bool BuildWeatherPrograms();
     void RunWeather(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* roofMatrix,
@@ -111,6 +126,8 @@ class PostFxGL {
     void RunAtmos(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* lightMatrix,
                   bool shadowReady);
     Program mAtmos;
+    const float* mVfxData = nullptr;
+    uint32_t mVfxCount = 0;
     bool mAtmosAttempted = false;
     GLuint mAtmosSprite = 0, mAtmosLeaf = 0, mAtmosNeutralDepth = 0;
     void EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type, bool depthStencil,
@@ -206,9 +223,10 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 14;
+    static constexpr int kQueryStages = 15;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;
+    static constexpr int kVfxTimerStage = 14;
     static constexpr int kSkyTimerStage = 6;
     static constexpr int kCloudTimerStage = 7;
     static constexpr int kSkyAmbientTimerStage = 8;

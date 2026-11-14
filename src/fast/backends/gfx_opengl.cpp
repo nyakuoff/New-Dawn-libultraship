@@ -1600,6 +1600,15 @@ void GfxRenderingAPIOGL::SetShadowFoliageGeometry(const float* verts, const GfxS
     mShadowFoliageBatchCount = batchCount;
 }
 
+bool GfxRenderingAPIOGL::VfxReplacing() const {
+    return HdrWorldActive() && mPostFx != nullptr && mPostFx->VfxUsable();
+}
+
+void GfxRenderingAPIOGL::SetVfxSprites(const float* data, uint32_t count) {
+    mVfxSprites = data;
+    mVfxSpriteCount = count;
+}
+
 bool GfxRenderingAPIOGL::HdrWorldActive() const {
 #ifndef USE_OPENGLES
     return mPostFx && mPostFx->HdrActive() && mCurrentFrameBuffer == mHdrGameFb;
@@ -1705,6 +1714,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
     }
     if (mPostFx != nullptr && gameFbId > 0 && gameFbId < (int)mFrameBuffers.size()) {
         mPostFx->SetFoliageCasters(mShadowFoliageVerts, mShadowFoliageBatches, mShadowFoliageBatchCount);
+        mPostFx->SetVfxSprites(mVfxSprites, mVfxSpriteCount);
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
     }
@@ -1715,6 +1725,8 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
     mShadowFoliageVerts = nullptr;
     mShadowFoliageBatches = nullptr;
     mShadowFoliageBatchCount = 0;
+    mVfxSprites = nullptr;
+    mVfxSpriteCount = 0;
 #endif
 }
 } // namespace Fast

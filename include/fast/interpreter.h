@@ -314,6 +314,7 @@ struct RDP {
         struct RawTexMetadata raw_tex_metadata;
         bool masked;
         bool blended;
+        uint8_t vfxClass; // New Dawn VFX: classification of the loaded texture's path (0 = none)
     } loaded_texture[2];
     struct {
         uint8_t fmt;
@@ -469,6 +470,10 @@ class Interpreter {
     void PumpMaterialLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void BeginVfxRecording(bool enabled);
+    uint8_t VfxClassify(std::string_view path);
+    void RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, uint32_t tile);
+    void SubmitVfx();
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
@@ -632,6 +637,12 @@ class Interpreter {
     std::vector<float> mShadowVertices;
     // Alpha-tested casters (gNewDawn.Shadows.Foliage): x,y,z,u,v per vertex, grouped by GL texture id.
     bool mShadowFoliage = false;
+    // New Dawn VFX recording (render-side only).
+    bool mVfx = false, mVfxDebug = false;
+    uint32_t mVfxTriSerial = 0, mVfxLastTri = 0;
+    uint8_t mVfxLastClass = 0, mVfxLastCount = 0;
+    const LoadedVertex* mVfxLastVerts[3] = {};
+    std::vector<float> mVfxInst;
     // Debug.Stats profiles only displacement work (including timer overhead), averaged over 300 frames.
     bool mWindProfile = false;
     uint32_t mWindProfileFrames = 0;

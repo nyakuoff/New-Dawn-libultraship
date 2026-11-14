@@ -2350,6 +2350,7 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 11) ? "ambient particles"
                                 : (stage == 12) ? "wet surfaces and rain shelter"
                                 : (stage == 13) ? "rain and snow"
+                                : (stage == 14) ? "VFX sprites"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -2825,12 +2826,14 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doFog = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && (doShadow || params.fogVolumetric == 2) &&
                        mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doVfx = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrActive && params.vfxEnabled && mVfxCount > 0 &&
+                       params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doShafts = !doFog && doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
-    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather) {
+    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doVfx) {
         return;
     }
 
@@ -2851,7 +2854,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather) {
+    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doVfx) {
         PrepareDepth(fb);
     }
     if (doWater) {
@@ -2929,6 +2932,12 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(11);
         RunAtmos(params, fb, lightMatrix, doShadow);
         EndTimer(11);
+    }
+
+ if (doVfx) {
+        BeginTimer(kVfxTimerStage);
+        RunVfx(params, fb);
+        EndTimer(kVfxTimerStage);
     }
 
     CheckError(doShadow ? "shadow stage" : (stage == 0 ? "opaque end stage" : "scene end stage"));
