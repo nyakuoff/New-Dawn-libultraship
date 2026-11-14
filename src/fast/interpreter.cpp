@@ -2556,7 +2556,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         const uint32_t t0 = mRdp->first_tile_index;
         const auto& lt0 = mRdp->loaded_texture[mRdp->texture_tile[t0].tmem_index];
         const auto& lt1 = mRdp->loaded_texture[mRdp->texture_tile[t0 + 1 < 8 ? t0 + 1 : t0].tmem_index];
-        const uint8_t cls = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
+        uint8_t cls = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
+        if (cls == VFX_GLOW && mRdp->prim_color.a > 80) {
+            cls = VFX_NONE; // only Lights_DrawGlow's alpha-50 discs; other users of the texture keep their draw
+        }
         if (mVfxDebug) {
             static std::unordered_set<std::string> seenDraws;
             const auto name = [](const auto& lt) {

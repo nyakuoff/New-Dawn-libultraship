@@ -63,7 +63,7 @@ void main() {
             centre = vec2(aA.y, aA.z + hh * 0.1);
             vUv = vec2(u01.x, 1.0 - u01.y);
         } else {
-            float h = hh * (l == 2 ? 1.75 : 2.9);
+            float h = hh * (l == 2 ? 1.4 : 2.3);
             if (l == 1) { vLayer = 1; h *= 1.0 + 0.08 * sin(t * 6.0 + seed); }
             size = vec2(h * 0.4 * aspect, h);
             centre = vec2(aA.y, aA.z - hh * 0.95 + h * 0.5);
@@ -154,9 +154,9 @@ void main() {
     } else {
         // Game colours keep per-flame hues (yellow/red torch, blue and green variants); HDR gain is added on top.
         vec3 cool = max(vEnv.rgb, vec3(0.05)) * 1.4;
-        vec3 hot = vPrim.rgb * vec3(3.2, 1.9, 0.9) + vec3(0.55, 0.22, 0.0);
+        vec3 hot = vPrim.rgb * vec3(3.3, 2.5, 3.3);
         rgb = mix(cool, hot, smoothstep(0.12, 0.62, v));
-        rgb += vec3(2.2, 1.6, 0.9) * smoothstep(0.75, 1.0, v) * (vLayerKind > 1.5 ? 1.5 : 0.8);
+        rgb += mix(vec3(1.0), normalize(hot + 0.05) * 1.7, 0.6) * smoothstep(0.75, 1.0, v) * (vLayerKind > 1.5 ? 1.4 : 0.7);
         a = clamp(t.a * (vLayerKind > 1.5 ? 0.9 : 0.75), 0.0, 1.0) * vAlpha;
     }
     a *= soft * uStrength;
