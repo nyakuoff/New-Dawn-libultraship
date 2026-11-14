@@ -1180,6 +1180,90 @@ void main() {
 }
 )GLSL";
 
+// GPU Gems 3, chapter 13 style radial light transport. The mask contains only sky coverage;
+// geometry never emits. All noise is spatially fixed, with no history or frame-dependent jitter.
+// Depth alone misses the game's depthless foliage. Compare its HDR colour against this frame's
+// sky/cloud radiance as well; dark leaves block rays even when they did not write Z.
+static const char* kRaySkyMaskLib = R"GLSL(
+uniform sampler2D uScene;
+uniform sampler2D uRaySky;
+uniform sampler2D uFlareClouds;
+uniform float uCloudOpacity;
+float raySkyCoverage(ivec2 p) {
+    if (fetchDepth(p) < 0.99999) return 0.0;
+    vec2 uv = (vec2(p)+0.5)/vec2(uSize);
+    vec3 sky = texture(uRaySky,uv).rgb;
+    if (uCloudOpacity > 0.0) {
+        vec2 texel = 0.75/vec2(textureSize(uFlareClouds,0));
+        vec4 c = texture(uFlareClouds,uv)*0.5;
+        c += texture(uFlareClouds,uv+texel)*0.125;
+        c += texture(uFlareClouds,uv-texel)*0.125;
+        c += texture(uFlareClouds,uv+texel*vec2(-1,1))*0.125;
+        c += texture(uFlareClouds,uv+texel*vec2(1,-1))*0.125;
+        c *= uCloudOpacity;
+        sky = sky*(1.0-c.a)+c.rgb;
+    }
+    const vec3 luma = vec3(0.2126,0.7152,0.0722);
+    float ratio = dot(texelFetch(uScene,p,0).rgb,luma)/max(dot(sky,luma),0.01);
+    return smoothstep(0.65,0.95,ratio);
+}
+)GLSL";
+
+static const char* kRayMaskShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform vec2 uSunUv;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy)*2;
+    float sky = 0.0;
+    for (int y=0; y<2; ++y)
+        for (int x=0; x<2; ++x)
+            sky += raySkyCoverage(min(p+ivec2(x,y),uSize-1))*0.25;
+    vec2 delta = (vUv-uSunUv)*vec2(float(uSize.x)/float(uSize.y),1.0);
+    float source = exp(-dot(delta,delta)/0.10);
+    oColor = vec4(sky*source,0.0,0.0,1.0);
+}
+)GLSL";
+
+static const char* kRayRadialShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uRayMask;
+uniform vec2 uSunUv;
+void main() {
+    const int steps = 48;
+    float jitter = fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+    vec2 delta = uSunUv-vUv;
+    float sum = 0.0, weights = 0.0;
+    for (int i=0; i<steps; ++i) {
+        float t = (float(i)+jitter)/float(steps);
+        float weight = exp(-0.5*t);
+        sum += texture(uRayMask,vUv+delta*t).r*weight;
+        weights += weight;
+    }
+    oColor = vec4(sum/weights,0.0,0.0,1.0);
+}
+)GLSL";
+
+static const char* kRayApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uRays;
+uniform sampler2D uFlareEmitter;
+uniform vec2 uSunUv;
+uniform vec3 uColor;
+uniform float uStrength;
+void main() {
+    float visible = texelFetch(uFlareEmitter,ivec2(0),0).a;
+    float border = min(min(uSunUv.x,1.0-uSunUv.x),min(uSunUv.y,1.0-uSunUv.y));
+    float fade = smoothstep(0.0,0.10,border)*smoothstep(0.0,0.6,visible);
+    // Keep foreground silhouettes crisp; a screen-space ray cannot locate participating fog in front of them.
+    float coverage = raySkyCoverage(ivec2(gl_FragCoord.xy));
+    float ray = texture(uRays,vUv).r;
+    oColor = vec4(uColor*(ray*ray*uStrength*6.0*fade*coverage),0.0);
+}
+)GLSL";
+
 static const char* kFlareApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -1931,7 +2015,8 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFogVolume", PostFxGL::kFogUnit },
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
-                          { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 }, { "uShadowCmp", 11 } }) {
+                          { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
+                          { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -2224,6 +2309,12 @@ void main() { fragColor = texture(uScene, vUv); }
     const char* flareApply[] = { kVersion, kFlareApplyShader };
     mFlareVisibility.id = BuildProgram("sun disc visibility", flareVisibility, 3, mFlareVisibility.uniforms);
     mFlareApply.id = BuildProgram("textured sun flare", flareApply, 2, mFlareApply.uniforms);
+    const char* rayMask[] = { kVersion, kDepthLib, kRaySkyMaskLib, kRayMaskShader };
+    const char* rayRadial[] = { kVersion, kRayRadialShader };
+    const char* rayApply[] = { kVersion, kDepthLib, kRaySkyMaskLib, kRayApplyShader };
+    mRayMask.id = BuildProgram("sun ray sky mask", rayMask, 4, mRayMask.uniforms);
+    mRayRadial.id = BuildProgram("sun ray radial integration", rayRadial, 2, mRayRadial.uniforms);
+    mRayApply.id = BuildProgram("sun ray HDR apply", rayApply, 4, mRayApply.uniforms);
     const char* fogMarch[] = { kVersion, kDepthLib, kSkyAmbientLightingLib, kFogMarchShader };
     const char* fogApply[] = { kVersion, kDepthLib, kFogApplyShader };
     // Optional: fog shader failure must not disable the existing renderer.
@@ -2384,6 +2475,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     mSkyAmbientReady = false;
     mSkyReflectionsReady = false;
     mFlareCloudOpacity = 0.0f;
+    mRaySkyReady = false;
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -2502,6 +2594,7 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     EndTimer(kSkyTimerStage);
     CheckError("physical sky");
     RunClouds(params, fb);
+    mRaySkyReady = CvFloat("gNewDawn.Sky.Strength", 1.0f) >= 0.999f;
     RunSkyAmbient(params);
 }
 
@@ -2825,7 +2918,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doFog = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && (doShadow || params.fogVolumetric == 2) &&
                        mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
-    const bool doShafts = !doFog && doShadow && params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
+    const bool doShafts = CvInt("gNewDawn.SunShafts.Mode", 0) == 0 && !doFog && doShadow &&
+                          params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
@@ -3461,7 +3555,9 @@ void PostFxGL::RunSunFlare(const NewDawnPostFxParams& params, const FramebufferO
     GlStateGuard guard;
     guard.Neutralise();
     glBindVertexArray(mVao);
-    if (!EnsureFlareAssets())
+    const bool flare = CvInt("gNewDawn.Sky.Flare", 0) && EnsureFlareAssets();
+    const bool rays = mRaySkyReady && params.screenShaftStrength > 0.0f && mRayMask.id && mRayRadial.id && mRayApply.id;
+    if (!flare && !rays)
         return;
     BeginTimer(kFlareTimerStage);
     const int w = fb.width, h = fb.height;
@@ -3489,23 +3585,77 @@ void PostFxGL::RunSunFlare(const NewDawnPostFxParams& params, const FramebufferO
     glBindTexture(GL_TEXTURE_2D, mFlareCloudNeutral);
     glActiveTexture(GL_TEXTURE0 + kFlareUnit);
     glBindTexture(GL_TEXTURE_2D, mFlareEmitter.tex);
-    glActiveTexture(GL_TEXTURE0 + kFlareSpritesUnit);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, mFlareSprites);
-    Use(mFlareApply);
-    glUniform2fv(Loc("uSpriteScale"), 6, mFlareSpriteScale);
-    glUniform2fv(Loc("uSunUv"), 1, uv);
-    glUniform2f(Loc("uScreenSize"), (float)w, (float)h);
+    if (flare) {
+        glActiveTexture(GL_TEXTURE0 + kFlareSpritesUnit);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, mFlareSprites);
+        Use(mFlareApply);
+        glUniform2fv(Loc("uSpriteScale"), 6, mFlareSpriteScale);
+        glUniform2fv(Loc("uSunUv"), 1, uv);
+        glUniform2f(Loc("uScreenSize"), (float)w, (float)h);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE);
+        Draw(fb.fbo, w, h);
+        glDisable(GL_BLEND);
+        glActiveTexture(GL_TEXTURE0 + kFlareSpritesUnit);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, mFlareSpritesNeutral);
+    }
+    EndTimer(kFlareTimerStage);
+    if (rays) {
+        BeginTimer(kShaftTimerStage);
+        RunScreenShafts(params, fb, uv);
+        EndTimer(kShaftTimerStage);
+    }
+    glActiveTexture(GL_TEXTURE0 + kFlareUnit);
+    glBindTexture(GL_TEXTURE_2D, mFlareNeutral);
+    CheckError("textured sun flare");
+}
+
+void PostFxGL::RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb,
+                                const float sunUv[2]) {
+    const int w = fb.width, h = fb.height;
+    const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+    EnsureTarget(mRayMaskTarget, hw, hh, GL_R16F, GL_RED, GL_FLOAT, false, true);
+    EnsureTarget(mRayTarget, hw, hh, GL_R16F, GL_RED, GL_FLOAT, false, true);
+    if (!mUsable)
+        return;
+    glDisable(GL_BLEND);
+    Bind(0, mScene.tex);
+    Bind(1, mDepth.tex);
+    Bind(2, mSky.tex);
+    glActiveTexture(GL_TEXTURE0 + kFlareCloudUnit);
+    glBindTexture(GL_TEXTURE_2D, mFlareCloudOpacity > 0.0f ? mClouds.tex : mFlareCloudNeutral);
+    Use(mRayMask);
+    glUniform1f(Loc("uCloudOpacity"), mFlareCloudOpacity);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform2fv(Loc("uSunUv"), 1, sunUv);
+    Draw(mRayMaskTarget);
+    Bind(0, mRayMaskTarget.tex);
+    Use(mRayRadial);
+    glUniform2fv(Loc("uSunUv"), 1, sunUv);
+    Draw(mRayTarget);
+    Bind(0, mScene.tex);
+    Bind(3, mRayTarget.tex);
+    Use(mRayApply);
+    glUniform1f(Loc("uCloudOpacity"), mFlareCloudOpacity);
+    float color[3];
+    for (int i = 0; i < 3; ++i)
+        color[i] = DecodeColor(params.screenShaftColor[i]);
+    const float luminance = std::max(0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2], 0.01f);
+    for (float& channel : color)
+        channel = 0.65f + 0.35f * channel / luminance;
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform3fv(Loc("uColor"), 1, color);
+    glUniform2fv(Loc("uSunUv"), 1, sunUv);
+    glUniform1f(Loc("uStrength"), params.screenShaftStrength);
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE);
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
-    glActiveTexture(GL_TEXTURE0 + kFlareUnit);
-    glBindTexture(GL_TEXTURE_2D, mFlareNeutral);
-    glActiveTexture(GL_TEXTURE0 + kFlareSpritesUnit);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, mFlareSpritesNeutral);
-    EndTimer(kFlareTimerStage);
-    CheckError("textured sun flare");
+    glActiveTexture(GL_TEXTURE0 + kFlareCloudUnit);
+    glBindTexture(GL_TEXTURE_2D, mFlareCloudNeutral);
+    CheckError("screen-space sun rays");
 }
 
 void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
