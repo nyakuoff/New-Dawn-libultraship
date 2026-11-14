@@ -3122,15 +3122,15 @@ static void ComputeSkyLook(const NewDawnPostFxParams& params, const float fog[3]
             const float red = std::clamp((m - 0.45f) / 0.4f, 0.0f, 1.0f);
             const float peak = std::max({ fog[0], fog[1], fog[2], 0.001f });
             const float apoc[3] = { 1.0f, 0.26f, 0.05f };
+            const float rs = red * red * (3.0f - 2.0f * red);
             for (int i = 0; i < 3; ++i) {
-                const float native = fog[i] / peak; // game's own final-day hue, normalised
-                l.glow[i] = native + (apoc[i] - native) * red * red * (3.0f - 2.0f * red);
+                const float native = std::pow(fog[i] / peak, 1.6f); // the game's own final-day hue, kept saturated
+                const float hue = native + (apoc[i] - native) * rs;
+                l.glow[i] = hue;
+                l.haze[i] = hue * 0.085f * dark;
+                l.deck[i] = hue * 0.030f * dark;
             }
-            const float haze[3] = { 0.050f * dark, 0.011f * dark, 0.012f * dark };
-            const float deck[3] = { 0.034f * dark, 0.012f * dark, 0.012f * dark };
-            std::copy(haze, haze + 3, l.haze);
-            std::copy(deck, deck + 3, l.deck);
-            l.glowAmt = 0.45f + 0.75f * m;
+            l.glowAmt = 0.75f + 0.55f * m;
             break;
         }
         case 3: { // cursed Ikana: desaturated violet-grey, thin, nearly still
