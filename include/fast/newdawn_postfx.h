@@ -104,4 +104,15 @@ typedef struct NewDawnPostFxParams {
     float waterRestyle;           /* 0..1: replace the painted water colour with the absorption/scattering model */
     float waterScatter[3];        /* linear in-scatter colour of deep water (lit by the scene's light) */
     float waterAbsorb[3];         /* per-channel absorption coefficient, 1/world units */
+    /* New Dawn art-directed grade, applied in display space after the base grade at the scene-end marker. The game
+       computes the final (time-of-day interpolated, scene cross-faded, strength-scaled) look; 0 = skipped entirely. */
+    int32_t artEnabled;
+    float artSlope[3];      /* per-channel gain (warmth/tint folded in) */
+    float artOffset;        /* black lift, added before the power */
+    float artPower;         /* gamma exponent (>1 darkens mid-tones) */
+    float artContrast;      /* extra S-curve, 0 = none */
+    float artSat;           /* overall saturation multiplier */
+    float artShadowTint[3]; /* added, weighted towards the shadows */
+    float artHighTint[3];   /* added, weighted towards the highlights */
+    float artGreen[2];      /* green hue range: shift towards yellow (+) or teal (-), saturation multiplier */
 } NewDawnPostFxParams;

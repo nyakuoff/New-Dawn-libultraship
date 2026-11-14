@@ -748,6 +748,16 @@ const int uHdr = 0;
 #endif
 uniform float uExposure;
 uniform int uDither;
+// Art-directed grade (game-side look, already interpolated over time of day and scene changes); skipped when off.
+uniform int uArtOn;
+uniform vec3 uArtSlope;
+uniform float uArtOffset;
+uniform float uArtPower;
+uniform float uArtContrast;
+uniform float uArtSat;
+uniform vec3 uArtShadow;
+uniform vec3 uArtHigh;
+uniform vec2 uArtGreen;
 
 float ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
@@ -791,6 +801,25 @@ void main() {
         c = c + (uContrast - 1.0) * 2.0 * (s - c);
         float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
         c = mix(vec3(l), c, uSaturation);
+    }
+    if (uArtOn != 0) {
+        const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+        // Green hue range: foliage greens drift towards yellow (+) or teal (-) and get their own saturation.
+        float gw = smoothstep(0.0, 0.15, c.g - max(c.r, c.b));
+        if (uArtGreen.x >= 0.0) c.r = mix(c.r, c.g, gw * uArtGreen.x);
+        else c.b = mix(c.b, c.g, -gw * uArtGreen.x);
+        float gl = dot(c, lw);
+        c = mix(vec3(gl), c, 1.0 + gw * (uArtGreen.y - 1.0));
+        // Slope / offset / power, then an S-curve, split tone and global saturation (all in display space).
+        c = pow(max(c * uArtSlope + uArtOffset, vec3(0.0)), vec3(uArtPower));
+        // Keep the contrast curve monotonic when slope/saturation put a channel above display white.
+        vec3 cc = clamp(c, 0.0, 1.0);
+        vec3 sc = cc * cc * (3.0 - 2.0 * cc);
+        c += 2.0 * uArtContrast * (sc - cc);
+        float al = dot(c, lw);
+        c += uArtShadow * (1.0 - smoothstep(0.0, 0.5, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
+        al = dot(c, lw);
+        c = mix(vec3(al), c, uArtSat);
     }
     // Dither before the 8 bit quantisation. +-half a step leaves unchanged pixels (and pure black) exactly as they were.
     #ifndef NO_DITHER
@@ -2763,6 +2792,17 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     if (!mUsable || fb.width < 8 || fb.height < 8) {
         return;
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+        mArt.on = params.artEnabled != 0;
+        std::copy(params.artSlope, params.artSlope + 3, mArt.slope);
+        mArt.offset = params.artOffset;
+        mArt.power = params.artPower;
+        mArt.contrast = params.artContrast;
+        mArt.sat = params.artSat;
+        std::copy(params.artShadowTint, params.artShadowTint + 3, mArt.shadow);
+        std::copy(params.artHighTint, params.artHighTint + 3, mArt.high);
+        std::copy(params.artGreen, params.artGreen + 2, mArt.green);
+    }
     // Both stages of a frame (and every walk of one game tick's display list is a new frame) share one read
     if (frameIndex != mSettingsFrame) {
         mSettings = ReadSettings();
@@ -2789,7 +2829,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
-                         (s.bloomOn || s.gradeOn);
+                         (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather) {
         return;
     }
@@ -3778,6 +3818,17 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     glUniform1i(Loc("uUseGrade"), s.gradeOn ? 1 : 0);
     glUniform1f(Loc("uContrast"), s.contrast);
     glUniform1f(Loc("uSaturation"), s.saturation);
+    glUniform1i(Loc("uArtOn"), mArt.on && s.postFxOn && s.debugView != 2);
+    if (mArt.on) {
+        glUniform3fv(Loc("uArtSlope"), 1, mArt.slope);
+        glUniform1f(Loc("uArtOffset"), mArt.offset);
+        glUniform1f(Loc("uArtPower"), mArt.power);
+        glUniform1f(Loc("uArtContrast"), mArt.contrast);
+        glUniform1f(Loc("uArtSat"), mArt.sat);
+        glUniform3fv(Loc("uArtShadow"), 1, mArt.shadow);
+        glUniform3fv(Loc("uArtHigh"), 1, mArt.high);
+        glUniform2fv(Loc("uArtGreen"), 1, mArt.green);
+    }
     if (s.debugView == 1 && !mHdrActive) {
         glEnable(GL_SCISSOR_TEST);
         glScissor(w / 2, 0, w - w / 2, h);
