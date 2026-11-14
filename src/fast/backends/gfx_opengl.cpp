@@ -1622,8 +1622,10 @@ void GfxRenderingAPIOGL::FinishWorld() {
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
     if (stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN || stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_END) {
-        mSunFlare = stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN;
-        if (mSunFlare && HdrWorldActive())
+        const bool begin = stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN;
+        mSunFlare = begin &&
+                    Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Sky.Flare", 0);
+        if (begin && HdrWorldActive())
             mPostFx->RunSunFlare(params, mFrameBuffers[gameFbId]);
         return;
     }

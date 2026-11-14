@@ -35,6 +35,8 @@ typedef struct NewDawnPostFxParams {
     float skyOvercast; /* 1: winter Mountain Village's overcast deck (replaces its opaque fog fill) */
 
     float flareSunPos[3]; /* native sun position, world space, read-only */
+    float screenShaftStrength; /* HDR radial rays; independent of shadows and volumetric fog */
+    float screenShaftColor[3]; /* sun/sky tint, sRGB; decoded by the renderer */
 
     /* New Dawn real-time shadows. */
     int32_t shadowEnabled;

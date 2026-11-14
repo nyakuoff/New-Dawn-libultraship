@@ -101,6 +101,7 @@ class PostFxGL {
     void RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);
@@ -162,6 +163,9 @@ class PostFxGL {
     uint32_t mWaterOpaqueFrame = UINT32_MAX;
     Target mShadowMap;
     Target mShaftA, mShaftB; // half resolution
+    bool mRaySkyReady = false;
+    Program mRayMask, mRayRadial, mRayApply;
+    Target mRayMaskTarget, mRayTarget; // half-resolution sky coverage and integrated radiance
     Program mFogMarch, mFogApply;
     Target mFog;
     GLuint mFogNeutral = 0;
