@@ -1031,13 +1031,16 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 // ---- New Dawn VFX: native effect sprites are recognised by texture path, recorded in clip space and drawn again by the
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
 enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7,
-       VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */ };
+       VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */,
+       VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */ };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
     mVfxInst.clear();
     mVfxTriSerial = mVfxLastTri = 0;
     mVfxLastClass = 0;
+    mVfxArrowPts.clear();
+    mVfxArrowInst = -1;
     mVfxDebug = enabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0);
 }
 
@@ -1055,6 +1058,9 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gEffHitmarkRed", VFX_HIT },
         { "gEffHitmarkWhiteMetal", VFX_HIT },
         { "gElectricSpark", VFX_SPARK },
+        { "gFireArrow", VFX_ARROW_FIRE }, // Tex and MaskTex: the 43-vertex glow model
+        { "gIceArrow", VFX_ARROW_ICE },
+        { "gLightArrow", VFX_ARROW_LIGHT },
         { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
     };
     uint8_t cls = VFX_NONE;
@@ -1130,13 +1136,88 @@ void Interpreter::RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls,
     inst[15] = frame;
 }
 
+// A magic arrow is a 3D model, not a quad: every triangle of one draw is folded into a single instance describing the
+// model's screen-space axis. A=[cls, centre xy, z], B=[w, half-length vector xy (NDC), seed], [15] = half-width (NDC y).
+void Interpreter::RecordVfxArrow(const LoadedVertex* const v[3], uint8_t cls) {
+    if (v[0]->w < 1.0f && v[1]->w < 1.0f && v[2]->w < 1.0f) {
+        return;
+    }
+    const uint32_t serial = mVfxTriSerial;
+    const bool fresh = mVfxArrowInst < 0 || serial - mVfxArrowLastTri > 6 ||
+                       mVfxInst[mVfxArrowInst] != (float)cls;
+    if (fresh) {
+        if (mVfxInst.size() / NEWDAWN_VFX_FLOATS >= 2048) {
+            return;
+        }
+        mVfxArrowPts.clear();
+        mVfxArrowInst = (int64_t)mVfxInst.size();
+        mVfxInst.resize(mVfxInst.size() + NEWDAWN_VFX_FLOATS, 0.0f);
+        float* n = &mVfxInst[mVfxArrowInst];
+        n[0] = cls;
+        n[8] = mRdp->prim_color.r / 255.0f, n[9] = mRdp->prim_color.g / 255.0f;
+        n[10] = mRdp->prim_color.b / 255.0f, n[11] = mRdp->prim_color.a / 255.0f;
+        n[16] = mRdp->env_color.r / 255.0f, n[17] = mRdp->env_color.g / 255.0f;
+        n[18] = mRdp->env_color.b / 255.0f, n[19] = mRdp->env_color.a / 255.0f;
+    }
+    mVfxArrowLastTri = serial;
+    float* inst = &mVfxInst[mVfxArrowInst];
+    float zmin = 1e9f;
+    for (int i = 0; i < 3; i++) {
+        if (v[i]->w < 1.0f) {
+            continue; // the part of the model behind the near plane is clipped by the game; keep the visible vertices
+        }
+        mVfxArrowPts.push_back(v[i]->x / v[i]->w);
+        mVfxArrowPts.push_back(v[i]->y / v[i]->w);
+        mVfxArrowPts.push_back(v[i]->z / v[i]->w);
+        mVfxArrowPts.push_back(v[i]->w);
+        mVfxArrowPts.push_back(v[i]->view_pos[0]);
+        mVfxArrowPts.push_back(v[i]->view_pos[1]);
+        mVfxArrowPts.push_back(v[i]->view_pos[2]);
+        zmin = std::min(zmin, v[i]->z / v[i]->w);
+    }
+    // Principal axis of the projected points (the arrow is a long ellipsoid), then extents along and across it.
+    const size_t count = mVfxArrowPts.size() / 7;
+    double mx = 0, my = 0, mw = 0, wx = 0, wy = 0, wz = 0, mz = 0;
+    for (size_t i = 0; i < count; i++) {
+        const float* p = &mVfxArrowPts[i * 7];
+        mx += p[0], my += p[1], mz += p[2], mw += p[3], wx += p[4], wy += p[5], wz += p[6];
+    }
+    mx /= count, my /= count, mz /= count, mw /= count, wx /= count, wy /= count, wz /= count;
+    double sxx = 0, sxy = 0, syy = 0;
+    for (size_t i = 0; i < count; i++) {
+        const float* p = &mVfxArrowPts[i * 7];
+        const double dx = p[0] - mx, dy = p[1] - my;
+        sxx += dx * dx, sxy += dx * dy, syy += dy * dy;
+    }
+    const double ang = 0.5 * atan2(2.0 * sxy, sxx - syy);
+    const float ax = (float)cos(ang), ay = (float)sin(ang);
+    float lo = 1e9f, hi = -1e9f, wid = 0.0f;
+    for (size_t i = 0; i < count; i++) {
+        const float* p = &mVfxArrowPts[i * 7];
+        const float dx = p[0] - (float)mx, dy = p[1] - (float)my;
+        const float along = dx * ax + dy * ay, across = -dx * ay + dy * ax;
+        lo = std::min(lo, along), hi = std::max(hi, along), wid = std::max(wid, fabsf(across));
+    }
+    const float mid = 0.5f * (lo + hi), half = 0.5f * (hi - lo);
+    inst[1] = (float)mx + ax * mid, inst[2] = (float)my + ay * mid, inst[3] = (float)mz;
+    inst[4] = (float)mw, inst[5] = ax * half, inst[6] = ay * half;
+    inst[12] = (float)wx, inst[13] = (float)wy, inst[14] = (float)wz;
+    inst[7] = fmodf(floorf(inst[12] / 4.0f) * 12.9898f + floorf(inst[13] / 4.0f) * 78.233f +
+                        floorf(inst[14] / 4.0f) * 37.719f, 1000.0f);
+    inst[15] = wid;
+}
+
 void Interpreter::SubmitVfx() {
     if (mVfxDebug) {
         static int sLogged = 0;
-        for (size_t i = 0; i + NEWDAWN_VFX_FLOATS <= mVfxInst.size() && sLogged < 60; i += NEWDAWN_VFX_FLOATS, ++sLogged) {
+        const int dbg = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0);
+        for (size_t i = 0; i + NEWDAWN_VFX_FLOATS <= mVfxInst.size() && sLogged < (dbg >= 2 ? 200 : 60); i += NEWDAWN_VFX_FLOATS, ++sLogged) {
             const float* f = &mVfxInst[i];
-            SPDLOG_INFO("VFXDBG inst cls={:.0f} world={:.0f},{:.0f},{:.0f} w={:.0f} half={:.3f},{:.3f} prim={:.2f},{:.2f},{:.2f},{:.2f}",
-                        f[0], f[12], f[13], f[14], f[4], f[5], f[6], f[8], f[9], f[10], f[11]);
+            if (dbg >= 2 && f[0] != 6.0f) {
+                continue; // Debug=2: sparkles only
+            }
+            SPDLOG_INFO("VFXDBG inst cls={:.0f} world={:.0f},{:.0f},{:.0f} w={:.0f} ndc={:.3f},{:.3f} half={:.3f},{:.3f} wid={:.3f} prim={:.2f},{:.2f},{:.2f},{:.2f}",
+                        f[0], f[12], f[13], f[14], f[4], f[1], f[2], f[5], f[6], f[15], f[8], f[9], f[10], f[11]);
         }
     }
     mRapi->SetVfxSprites(mVfxInst.empty() ? nullptr : mVfxInst.data(), (uint32_t)(mVfxInst.size() / NEWDAWN_VFX_FLOATS));
@@ -2614,7 +2695,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                                 mRdp->env_color.g, mRdp->env_color.b, mRdp->env_color.a, v1->w);
             }
         }
-        if (cls != VFX_NONE) {
+        if (cls >= VFX_ARROW_FIRE && cls <= VFX_ARROW_LIGHT) {
+            RecordVfxArrow(v_arr, cls);
+            if (mRapi->VfxReplacing()) {
+                return;
+            }
+        } else if (cls != VFX_NONE) {
             const bool candle = cls == VFX_CANDLE;
             RecordVfxTriangle(v_arr, candle ? (uint8_t)VFX_FLAME : cls, frame);
             if (candle && mVfxLastTri == mVfxTriSerial) {

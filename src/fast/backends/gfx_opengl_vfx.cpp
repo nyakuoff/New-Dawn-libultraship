@@ -68,6 +68,51 @@ void main() {
         vAlpha = aPrim.a * (l == 1 ? 0.55 : 1.0);
         return;
     }
+    if (uMode == 4) { // magic arrow: a chain of sprites along the model's screen-space axis (24 per arrow)
+        int cls = int(aA.x + 0.5);
+        int k = gl_InstanceID % 24;
+        vec2 axis = vec2(aB.y, aB.z) * uSize * 0.5; // centre -> tip, pixels
+        float widthPx = aWorld.w * uSize.y * 0.5;   // half-width of the model, pixels
+        float t = (float(k) + 0.5) / 24.0;          // 0 tail .. 1 tip
+        float s2 = hash(seed + float(k) * 3.17);
+        float tm = uTime * (cls == 9 ? 9.0 : 5.0) + s2 * 40.0;
+        float body = 2.0 * t - 1.0;
+        int role = k < 20 ? 0 : (k < 22 ? 1 : (k < 23 ? 2 : 3)); // body puff, tip star, halo, long streak
+        vec2 dir = normalize(axis + vec2(0.0001));
+        vec2 perp = vec2(-dir.y, dir.x);
+        float len = length(axis);
+        vec2 pxc = vec2(aA.y, aA.z) * uSize * 0.5;
+        float jit = (sin(tm * 1.7 + float(k)) * 0.5 + (s2 - 0.5)) * widthPx * (cls == 9 ? 0.9 : 0.5);
+        vec2 pos = pxc + axis * body + perp * jit - dir * (cls == 9 ? fract(tm * 0.15 + s2) * widthPx * 2.0 : 0.0);
+        float r = widthPx * (cls == 9 ? 2.4 : 1.7) * (0.55 + 0.75 * t) * (0.8 + 0.4 * s2);
+        float rot = tm * 0.35 + s2 * 6.28;
+        int layer = cls == 9 ? (k % 2 == 0 ? 2 : 3) : (cls == 10 ? (k % 2 == 0 ? 5 : 4) : 10);
+        // A near-round model is the arrow's hit burst (the game scales the model up): fill the disc instead of a streak.
+        bool burst = len < widthPx * 1.8;
+        if (burst) {
+            vec2 sc = vec2(hash(seed + float(k) * 1.3), hash(seed + float(k) * 2.9)) * 2.0 - 1.0;
+            pos = pxc + sc * widthPx * 0.6; r = widthPx * (0.55 + 0.45 * s2);
+            if (cls == 11) { layer = k % 2 == 0 ? 8 : 10; r *= layer == 8 ? 2.2 : 0.9; }
+            if (cls == 10) { layer = k % 3 == 0 ? 8 : (k % 3 == 1 ? 7 : 4); if (layer != 4) r *= 1.4; }
+        }
+        if (cls == 11 && role == 0) { if (k % 2 == 0) { layer = 8; r *= 1.9; } else { layer = 10; r *= 0.8; } }
+        if (role == 1) { pos = burst ? pxc : pxc + axis * (0.55 + 0.45 * float(k - 20)); r = burst ? widthPx * 1.4 : max(widthPx * 4.0, len * 0.16); layer = 8; rot = 0.0; }
+        else if (role == 2) { pos = burst ? pxc : pxc + axis * 0.9; r = burst ? widthPx * 2.2 : max(widthPx * 9.0, len * 0.55); layer = cls == 11 ? 9 : 10; rot = 0.0; }
+        else if (role == 3) { r = 0.0; } // reserved (the native EffectBlure ribbon already draws the streak)
+        vec2 qq = q;
+        if (role == 3) { qq = vec2(q.x, q.y * 0.07); }
+        vec2 local = vec2(cos(rot) * qq.x - sin(rot) * qq.y, sin(rot) * qq.x + cos(rot) * qq.y) * r;
+        vec2 ndc = (pos + local) / (uSize * 0.5);
+        vUv = vec2(u01.x, 1.0 - u01.y);
+        vLayer = layer;
+        vLayerKind = float(cls * 10 + role + (burst ? 4 : 0));
+        vSeed = t;
+        gl_Position = vec4(ndc.x * w, ndc.y * uFlipY * w, 0.0, w);
+        vViewZ = w;
+        vSize = max(H, 4.0);
+        vAlpha = aPrim.a;
+        return;
+    }
     if (uMode == 3) { // puffs: dust, bomb fireball/smoke, hit sparks, electric sparks (2 layers per recorded quad)
         int cls = int(aA.x + 0.5);
         int l = gl_InstanceID % 2;
@@ -75,7 +120,7 @@ void main() {
         vLayerKind = float(cls * 10 + l);
         vSeed = p;
         float rot = seed * 6.2831 + float(l) * 1.9 + p * (cls == 3 ? 0.5 : 0.25) * (0.5 + hash(seed));
-        float scale = cls == 3 ? 0.85 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 1.7 : 2.4) : 1.0));
+        float scale = cls == 3 ? 0.85 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 2.2 : 1.2) : 1.0));
         vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
         float r = max(hp.x, hp.y) * scale;
         vec2 local = vec2(cos(rot) * q.x - sin(rot) * q.y, sin(rot) * q.x + cos(rot) * q.y) * r;
@@ -146,7 +191,7 @@ void main() {
     if (vViewZ <= 0.0 || vAlpha < 0.002) discard;
     float scene = linearDepth(texture(uDepth, gl_FragCoord.xy / uSize).r);
     // Geometry nearer than the flame hides it; the sprite is allowed to sit slightly inside its own holder.
-    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + (uMode == 3 ? 0.35 : 0.6), 0.0, 1.0);
+    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + ((uMode == 3 || uMode == 4) ? 0.35 : 0.6), 0.0, 1.0);
     vec4 t;
     if (uMode == 0) {
         float f0 = floor(vSeed);
@@ -157,6 +202,33 @@ void main() {
     float v = t.r * t.a;
     vec3 rgb;
     float a;
+    if (uMode == 4) { // magic arrows: HDR in the arrow's own prim/env colours
+        int cls = int(vLayerKind / 10.0 + 0.01);
+        int role = int(vLayerKind + 0.5) - cls * 10;
+        float burstK = role >= 4 ? (cls == 11 ? (vLayer == 8 ? 0.9 : 0.22) : (cls == 10 ? 0.65 : 0.4)) : 1.0; // burst: many overlapping puffs on a disc, keep the total energy sane
+        if (role >= 4) role -= 4;
+        float v4 = t.a * t.r * burstK;
+        vec3 base = mix(vEnv.rgb, vPrim.rgb, 0.55);
+        vec3 c;
+        float al;
+        float tw = 0.8 + 0.2 * sin(vSeed * 40.0 + vViewZ);
+        if (role == 0) {         // body
+            c = (cls == 9 ? mix(vec3(1.6, 0.35, 0.05), vec3(7.0, 3.2, 0.7), vSeed) : base * mix(1.2, 3.0, vSeed) + vec3(0.2, 0.35, 0.5) * 0.4) * (0.7 + 0.6 * t.r);
+            al = v4 * (cls == 9 ? 0.55 : (cls == 11 ? 0.6 : 0.8)) * vAlpha * (0.4 + 0.6 * vSeed);
+        } else if (role == 1) {  // tip star
+            c = mix(base, vec3(1.0), 0.35) * 5.0 * tw;
+            al = v4 * vAlpha;
+        } else if (role == 2) {  // halo
+            c = base * (cls == 9 ? vec3(3.2, 1.3, 0.3) : vec3(1.3)) * 1.1;
+            al = pow(v4, 1.6) * vAlpha * 0.55;
+        } else {                 // light streak along the axis
+            c = mix(base, vec3(1.0), 0.45) * 5.0;
+            al = v4 * vAlpha * 0.5;
+        }
+        c *= uStrength;
+        oColor = vec4(c * al * soft, 0.0);
+        return;
+    }
     if (uMode == 3) {
         int cls = int(vLayerKind / 10.0 + 0.01);
         int l = int(vLayerKind + 0.5) - cls * 10;
@@ -179,10 +251,10 @@ void main() {
         if (cls == 4) { // bomb fireball, white-hot to deep orange
             c = mix(vec3(7.0, 4.0, 1.4), vec3(2.2, 0.5, 0.08), smoothstep(0.0, 0.8, p)) * (1.0 - 0.6 * p);
             al = t.a * (0.4 + 0.6 * t.r) * (1.0 - smoothstep(0.55, 1.0, p));
-        } else if (cls == 6) { // sparkle: crisp HDR star with a soft halo
-            float tw = 0.75 + 0.25 * sin(p * 30.0 + vLayerKind);
-            c = l == 0 ? mix(vPrim.rgb, vec3(1.0), 0.35) * 4.0 * tw : mix(vEnv.rgb, vPrim.rgb, 0.5) * 1.8;
-            al = l == 0 ? t.a * t.r * vAlpha : pow(t.a * t.r, 1.5) * vAlpha * 0.5;
+        } else if (cls == 6) { // sparkle: crisp HDR 4-point star with a small halo; the game's env alpha is its twinkle
+            float tw = mix(0.3, 1.0, clamp(vEnv.a, 0.0, 1.0));
+            c = l == 0 ? mix(vPrim.rgb, vec3(1.0), 0.15) * 5.0 * tw : mix(vEnv.rgb, vPrim.rgb, 0.3) * 3.0;
+            al = l == 0 ? t.a * t.r * vAlpha * tw : pow(t.a * t.r, 1.5) * vAlpha * 0.35 * tw;
         } else if (cls == 5) { // hit spark
             c = max(vPrim.rgb, vec3(0.2)) * 5.0 * (1.0 - 0.6 * p);
             al = t.a * t.r * vAlpha * (l == 0 ? 0.9 : 0.6);
@@ -380,7 +452,7 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
     glUniform1f(Loc("uTime"), static_cast<float>(std::fmod(seconds, 3600.0)));
 
-    std::vector<float> flames, glows, puffs;
+    std::vector<float> flames, glows, puffs, arrows;
     mFlameLights.clear();
     for (uint32_t i = 0; i < mVfxCount; ++i) {
         const float* f = mVfxData + (size_t)i * NEWDAWN_VFX_FLOATS;
@@ -390,10 +462,12 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
         }
         else if (f[0] == 2.0f)
             glows.insert(glows.end(), f, f + NEWDAWN_VFX_FLOATS);
+        else if (f[0] >= 9.0f)
+            arrows.insert(arrows.end(), f, f + NEWDAWN_VFX_FLOATS);
         else if (f[0] >= 3.0f)
             puffs.insert(puffs.end(), f, f + NEWDAWN_VFX_FLOATS);
     }
-    if (flames.empty() && glows.empty() && puffs.empty())
+    if (flames.empty() && glows.empty() && puffs.empty() && arrows.empty())
         return;
     if (p.shadowEnabled) {
         float lit[3];
@@ -432,6 +506,15 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
         for (int i = 0; i < 5; ++i)
             glVertexAttribDivisor(i, 2);
         glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)(puffs.size() / NEWDAWN_VFX_FLOATS) * 2);
+    }
+    if (!arrows.empty()) {
+        if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0))
+            SPDLOG_INFO("VFXDBG arrows={} ndc={:.3f},{:.3f} half={:.3f},{:.3f} wid={:.3f} w={:.0f}", arrows.size() / NEWDAWN_VFX_FLOATS, arrows[1], arrows[2], arrows[5], arrows[6], arrows[15], arrows[4]);
+        glBufferData(GL_ARRAY_BUFFER, arrows.size() * sizeof(float), arrows.data(), GL_STREAM_DRAW);
+        glUniform1i(Loc("uMode"), 4);
+        for (int i = 0; i < 5; ++i)
+            glVertexAttribDivisor(i, 24);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)(arrows.size() / NEWDAWN_VFX_FLOATS) * 24);
     }
     if (n == 0) {
         for (int i = 0; i < 5; ++i)
