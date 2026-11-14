@@ -2124,7 +2124,49 @@ void Interpreter::UpdatePerPixelLightingState(uint32_t shadeMask) {
     state.shadeMask = static_cast<int32_t>(shadeMask);
     state.pointLightQuality = mPerPixelPointLightQuality;
     UpdateCharacterLightingState(state, mtx);
+    state.cameraPosition[3] = SolveCameraPosition(state.cameraPosition) ? 1.0f : 0.0f;
     state.serial = ++mPerPixelLightSerial;
+}
+
+// The camera position in the world space of the draw's vertices, recovered from the combined view-projection in P:
+// the point whose clip x, y and w are all zero. False when P has no such point (the HUD's orthographic projection).
+bool Interpreter::SolveCameraPosition(float out[3]) {
+    // Solve [e 1] * P = (0, 0, *, 0) for columns 0, 1, 3.
+    static const int cols[3] = { 0, 1, 3 };
+    float a[3][4];
+    for (int i = 0; i < 3; i++) {
+        for (int r = 0; r < 3; r++) {
+            a[i][r] = mRsp->P_matrix[r][cols[i]];
+        }
+        a[i][3] = -mRsp->P_matrix[3][cols[i]];
+    }
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 3; r++) {
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) {
+                pivot = r;
+            }
+        }
+        if (std::fabs(a[pivot][col]) < 1e-9f) {
+            return false;
+        }
+        for (int k = 0; k < 4; k++) {
+            std::swap(a[col][k], a[pivot][k]);
+        }
+        for (int r = 0; r < 3; r++) {
+            if (r == col) {
+                continue;
+            }
+            const float f = a[r][col] / a[col][col];
+            for (int k = col; k < 4; k++) {
+                a[r][k] -= f * a[col][k];
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        out[i] = a[i][3] / a[i][i];
+    }
+    return true;
 }
 
 // New Dawn character lighting: lit draws under a non-identity model-to-world matrix (actor limbs and objects; room
@@ -2150,41 +2192,13 @@ void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, 
     if (identity || mMatrixLoadsSinceLights < 2) {
         return;
     }
-    // Solve [e 1] * P = (0, 0, *, 0) for columns 0, 1, 3.
-    static const int cols[3] = { 0, 1, 3 };
-    float a[3][4];
-    for (int i = 0; i < 3; i++) {
-        for (int r = 0; r < 3; r++) {
-            a[i][r] = mRsp->P_matrix[r][cols[i]];
-        }
-        a[i][3] = -mRsp->P_matrix[3][cols[i]];
+    float eye[3];
+    if (!SolveCameraPosition(eye)) {
+        return;
     }
-    for (int col = 0; col < 3; col++) {
-        int pivot = col;
-        for (int r = col + 1; r < 3; r++) {
-            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) {
-                pivot = r;
-            }
-        }
-        if (std::fabs(a[pivot][col]) < 1e-9f) {
-            return;
-        }
-        for (int k = 0; k < 4; k++) {
-            std::swap(a[col][k], a[pivot][k]);
-        }
-        for (int r = 0; r < 3; r++) {
-            if (r == col) {
-                continue;
-            }
-            const float f = a[r][col] / a[col][col];
-            for (int k = col; k < 4; k++) {
-                a[r][k] -= f * a[col][k];
-            }
-        }
-    }
-    for (int i = 0; i < 3; i++) {
-        state.characterLight[i] = a[i][3] / a[i][i];
-    }
+    state.characterLight[0] = eye[0];
+    state.characterLight[1] = eye[1];
+    state.characterLight[2] = eye[2];
     state.characterLight[3] = mCharacterStrength;
 }
 
