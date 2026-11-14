@@ -4,6 +4,7 @@
 #include "gfx_opengl.h"
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "fast/newdawn_postfx.h"
 
 namespace Fast {
@@ -260,6 +261,13 @@ class PostFxGL {
     Target mDepth;
     Target mAoRaw, mAoBlur;
     Program mGiGather, mGiFilter, mGiApply;
+    // HDR local lighting (gfx_opengl_postfx.cpp RunLocalLights)
+    void RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
+    Program mLocalLight;
+    Target mLocalSource;
+    std::vector<float> mFlameLights; // previous frame's VFX flames: world xyz + warm rgb
+    uint32_t mFlameFrame = 0;
+    int mFlameScene = -1;
     Target mGiSource, mGiRaw, mGiHistory[2];
     bool mGiValid = false;
     int mGiRead = 0, mGiScene = -1;
@@ -305,7 +313,8 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 16;
+    static constexpr int kQueryStages = 17;
+    static constexpr int kLocalTimerStage = 16;
     static constexpr int kGiTimerStage = 14;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;

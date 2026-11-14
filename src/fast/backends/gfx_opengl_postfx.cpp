@@ -879,6 +879,93 @@ void main() {
 }
 )GLSL";
 
+static const char* kLocalLightShader = R"GLSL(
+in vec2 vUv;
+// Dual-source blend (GL_ONE, GL_SRC1_COLOR): result = oColor + framebuffer * oFactor, per MSAA sample.
+layout(location = 0, index = 0) out vec4 oColor;
+layout(location = 0, index = 1) out vec4 oFactor;
+uniform sampler2D uScene;
+uniform mat4 uViewProj;
+uniform int uLightCount;
+uniform vec4 uLight[24];    // world position, range
+uniform vec3 uLightRgb[24]; // HDR radiance (strength and flicker already applied)
+uniform float uDebug;
+uniform float uDarken;
+uniform vec4 uPlayer; // xyz, w = 1 when valid
+float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+// Screen-space contact shadow along the segment to the light, from the opaque depth buffer: walls and actors between
+// the surface and the flame occlude it. Samples outside the screen count as visible.
+float localVisibility(vec3 P, vec3 L, float jitter) {
+    float hits = 0.0;
+    for (int s = 0; s < 8; ++s) {
+        vec3 sp = P + (L - P) * ((float(s) + jitter) * (0.92 / 8.0) + 0.02);
+        vec4 clip = uViewProj * vec4(sp, 1.0);
+        if (clip.w <= 0.0) continue;
+        vec2 uv = (clip.xy / clip.w / vec2(uNdcXScale, uFlipY)) * 0.5 + 0.5;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) continue;
+        float sceneZ = linDepth(fetchDepth(ivec2(uv * vec2(uSize))));
+        float diff = clip.w - sceneZ;
+        hits += step(max(2.0, clip.w * 0.012), diff) * (1.0 - step(70.0, diff));
+    }
+    return 1.0 - min(1.0, hits * 0.5);
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 scene = texelFetch(uScene, p, 0);
+    oColor = vec4(0.0);
+    oFactor = vec4(1.0);
+    float d = fetchDepth(p);
+    if (d >= 0.99999) return;
+    vec3 P = giPosition((vec2(p) + 0.5) / vec2(uSize), d);
+    vec3 N = giNormal(p, P);
+    float jitter = ign(gl_FragCoord.xy);
+    vec3 E = vec3(0.0);
+    for (int i = 0; i < uLightCount; ++i) {
+        vec3 V = uLight[i].xyz - P;
+        float R = uLight[i].w, d2 = dot(V, V);
+        if (d2 >= R * R) continue;
+        float dist = sqrt(d2);
+        vec3 L = V / max(dist, 0.001);
+        // Smooth range window (Karis) over a softened inverse-square core; ~1 at the flame, 0 at the range.
+        float x = dist / R, window = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+        float core = R * 0.2;
+        float atten = window * window * core * core / (d2 + core * core);
+        // Wrapped Lambert: the depth-derived normal is faceted, so the terminator is softened.
+        float diffuse = clamp((dot(N, L) + 0.3) / 1.3, 0.0, 1.0);
+        float lit = atten * diffuse;
+        if (lit < 0.002) continue;
+        E += uLightRgb[i] * (lit * localVisibility(P, uLight[i].xyz, jitter));
+    }
+    // Bounded: walls beside a torch glow without clipping, and the cap is per channel so the hue survives.
+    const float cap = 2.4;
+    E = cap * E / (cap + E);
+    vec3 c = max(scene.rgb, vec3(0.0));
+    float Y = dot(c, giLuma);
+    // The painted scene is the albedo: its square root lifts crushed blacks while keeping hue. A bright, already-lit
+    // surface (daylight) needs the extra light less.
+    vec3 albedo = sqrt(c) * 0.9 + 0.03;
+    float need = 1.0 - 0.75 * smoothstep(0.35, 1.0, Y);
+    // Contrast: pull the unlit scene down (night / interior) so the lights carry it. Surfaces the lights reach keep
+    // their authored brightness; the player gets a soft exemption and nothing drops below a small floor.
+    float D = uDarken;
+    if (uPlayer.w > 0.5) {
+        vec3 q = (P - uPlayer.xyz) / vec3(95.0, 120.0, 95.0);
+        D *= 1.0 - 0.65 * (1.0 - smoothstep(0.35, 1.0, length(q)));
+    }
+    float keep = smoothstep(0.0, 0.45, dot(E, giLuma));
+    vec3 moon = mix(vec3(1.0), vec3(0.90, 0.97, 1.10), min(D * 1.3, 1.0)); // cool, dim fill
+    vec3 base = c * mix(1.0 - D, 1.0, keep) * mix(moon, vec3(1.0), keep);
+    base = max(base, min(c, vec3(0.009)));
+    if (uDebug > 0.0) {
+        oColor = vec4(E * uDebug, 0.0);
+        oFactor = vec4(0.0);
+        return;
+    }
+    oColor = vec4(albedo * E * need, 0.0);
+    oFactor = vec4(clamp(base / max(c, vec3(0.0001)), 0.0, 1.0), 1.0);
+}
+)GLSL";
+
 static const char* kAoShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -2674,6 +2761,9 @@ bool PostFxGL::BuildPrograms() {
     mGiGatherCsm.id = BuildProgram("GI gather (cascades)", giGatherCsm, 6, mGiGatherCsm.uniforms);
     mGiFilter.id = BuildProgram("GI spatial temporal filter", giFilter, 4, mGiFilter.uniforms);
     mGiApply.id = BuildProgram("GI bilateral composite", giApply, 4, mGiApply.uniforms);
+    // Local lights reuse the colour (8) and depth (9) lanes bound to dummies above; no new sampler.
+    const char* localLight[] = { kVersion, kDepthLib, kGiGeometryLib, kLocalLightShader };
+    mLocalLight.id = BuildProgram("local lights", localLight, 4, mLocalLight.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -2877,6 +2967,7 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 13) ? "rain and snow"
                                 : (stage == 14) ? "screen-space GI"
                                 : (stage == 15) ? "VFX sprites"
+                                : (stage == 16) ? "local lights"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -3360,6 +3451,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doVfx = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrActive && params.vfxEnabled && mVfxCount > 0 &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
+                         params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doShafts = CvInt("gNewDawn.SunShafts.Mode", 0) == 0 && !doFog && doShadow &&
                           params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
@@ -3367,7 +3460,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi &&
-        !doVfx) {
+        !doVfx && !doLocal) {
         return;
     }
 
@@ -3388,7 +3481,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx) {
+    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal) {
         PrepareDepth(fb);
     }
     if (doWater) {
@@ -3417,6 +3510,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(kGiTimerStage);
         RunGlobalIllumination(params, fb, frameIndex, doShadow);
         EndTimer(kGiTimerStage);
+    }
+    if (doLocal) {
+        BeginTimer(kLocalTimerStage);
+        RunLocalLights(params, fb, frameIndex);
+        EndTimer(kLocalTimerStage);
     }
     if (doShafts) {
         BeginTimer(kShaftTimerStage);
@@ -3473,7 +3571,9 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(11);
     }
 
- if (doVfx) {
+    if (doVfx) {
+        mFlameFrame = frameIndex;
+        mFlameScene = params.giSceneId;
         BeginTimer(kVfxTimerStage);
         RunVfx(params, fb);
         EndTimer(kVfxTimerStage);
@@ -4401,6 +4501,131 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     std::copy_n(forward, 3, mGiForward);
     mGiValid = true;
     CheckError("screen-space GI");
+}
+
+void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
+    constexpr int kMax = 24;
+    float pos[kMax][4] = {};
+    float rgb[kMax][3] = {};
+    int count = 0;
+    static const auto epoch = std::chrono::steady_clock::now();
+    const float seconds =
+        static_cast<float>(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
+    // Render-only flicker: a slow drift plus two faster, weaker terms (all under ~5 Hz), keyed on the light's quantised
+    // position and the wall clock. Warm (fire) lights flicker up to ~18%, neutral lamps barely. No game data changes.
+    auto add = [&](const float* p, float radius, const float* col, float boost) {
+        if (count >= kMax)
+            return;
+        const float m = std::max(col[0], std::max(col[1], col[2]));
+        if (m <= 0.0f)
+            return;
+        // Keep the light's own hue; compress its brightness so dim game lights still contribute.
+        const float k = (0.5f + 0.5f * m) / m;
+        const float warm = std::clamp((col[0] - col[2]) / std::max(col[0], 0.01f), 0.0f, 1.0f);
+        const float seed = std::fmod(std::floor(p[0] / 4.0f) * 12.9898f + std::floor(p[1] / 4.0f) * 78.233f +
+                                         std::floor(p[2] / 4.0f) * 37.719f,
+                                     1000.0f);
+        const float amp = std::clamp(params.localFlicker, 0.0f, 1.0f) * (0.03f + 0.15f * warm);
+        const float f = 1.0f + amp * (0.55f * std::sin(seconds * 8.2f + seed) +
+                                      0.30f * std::sin(seconds * 18.2f + seed * 1.7f + 1.0f) +
+                                      0.15f * std::sin(seconds * 32.0f + seed * 2.3f + 2.0f));
+        pos[count][0] = p[0], pos[count][1] = p[1], pos[count][2] = p[2];
+        pos[count][3] = std::clamp(radius * 1.3f, 90.0f, 700.0f);
+        for (int i = 0; i < 3; ++i)
+            rgb[count][i] = col[i] * (i == 1 ? 1.0f - 0.3f * warm : 1.0f) * k * f * boost * params.localStrength * 4.0f;
+        ++count;
+    };
+    for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i)
+        add(params.localLights[i], params.localLights[i][3], params.localColors[i], 1.0f);
+    // VFX flames the game gives no light to (recorded last frame): tie a warm light to each, nearest first.
+    if (params.vfxEnabled && mFlameScene == params.giSceneId && frameIndex - mFlameFrame <= 2u) {
+        struct Flame {
+            const float* f;
+            float score;
+        };
+        std::vector<Flame> flames;
+        for (size_t i = 0; i + NEWDAWN_VFX_FLOATS <= mFlameLights.size(); i += NEWDAWN_VFX_FLOATS) {
+            const float* f = &mFlameLights[i];
+            bool covered = false;
+            for (int j = 0; j < params.localCount && !covered; ++j) {
+                float d2 = 0.0f;
+                for (int a = 0; a < 3; ++a)
+                    d2 += (params.localLights[j][a] - f[12 + a]) * (params.localLights[j][a] - f[12 + a]);
+                covered = d2 < 90.0f * 90.0f;
+            }
+            if (covered)
+                continue;
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; ++a)
+                d2 += (params.giCameraEye[a] - f[12 + a]) * (params.giCameraEye[a] - f[12 + a]);
+            flames.push_back({ f, d2 });
+        }
+        std::sort(flames.begin(), flames.end(), [](const Flame& a, const Flame& b) { return a.score < b.score; });
+        for (const Flame& fl : flames) {
+            if (count >= kMax)
+                break;
+            bool dup = false; // a flame drawn as several quads is one light
+            for (int j = params.localCount; j < count && !dup; ++j) {
+                float d2 = 0.0f;
+                for (int a = 0; a < 3; ++a)
+                    d2 += (pos[j][a] - fl.f[12 + a]) * (pos[j][a] - fl.f[12 + a]);
+                dup = d2 < 40.0f * 40.0f;
+            }
+            if (dup)
+                continue;
+            const float warmRgb[3] = { 1.0f, 0.47f, 0.14f };
+            float col[3];
+            for (int a = 0; a < 3; ++a)
+                col[a] = warmRgb[a];
+            add(fl.f + 12, 200.0f, col, 1.0f);
+        }
+    }
+    if (count == 0 && params.localDarken <= 0.0f)
+        return;
+    if (!mUsable)
+        return;
+    const int w = fb.width, h = fb.height;
+    EnsureTarget(mLocalSource, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mLocalSource.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mLocalSource.tex);
+    Bind(1, mDepth.tex);
+    Use(mLocalLight);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform1i(Loc("uLightCount"), count);
+    glUniform4fv(Loc("uLight"), kMax, &pos[0][0]);
+    glUniform3fv(Loc("uLightRgb"), kMax, &rgb[0][0]);
+    const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
+    glUniform1f(Loc("uDebug"), debug);
+    glUniform1f(Loc("uDarken"), std::clamp(params.localDarken, 0.0f, 0.9f));
+    glUniform4f(Loc("uPlayer"), params.localPlayer[0], params.localPlayer[1], params.localPlayer[2],
+                params.localPlayerValid ? 1.0f : 0.0f);
+    // result = light + framebuffer * factor, evaluated per MSAA sample, so edges keep their anti-aliasing.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_SRC1_COLOR);
+    glBlendEquation(GL_FUNC_ADD);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    if (debug > 0.0f) {
+        static int logged = 0;
+        if (logged++ % 400 < 1) {
+            SPDLOG_INFO("NewDawnLocalLights: {} lights ({} game, rest flames)", count, params.localCount);
+            for (int i = 0; i < count; ++i)
+                SPDLOG_INFO("  light {} pos {:.0f},{:.0f},{:.0f} range {:.0f} rgb {:.2f},{:.2f},{:.2f}", i, pos[i][0],
+                            pos[i][1], pos[i][2], pos[i][3], rgb[i][0], rgb[i][1], rgb[i][2]);
+        }
+    }
+    CheckError("local lights");
 }
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
