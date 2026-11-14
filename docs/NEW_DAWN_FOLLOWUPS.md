@@ -85,3 +85,8 @@ The requested canopy result, clean-away comparison, exact cause of SSR specks, a
 water fix remain open. A future investigation needs a genuinely sunlit canopy viewpoint and a
 repeatable current-main water-speck frame before another shader edit. Do not count the rejected
 split as a visual improvement.
+
+## Update — screen-space sun rays
+
+The shadow-march approach above was abandoned. Dusk shafts are now delivered by screen-space crepuscular rays
+(`gNewDawn.SunShafts.Mode = 1`, preset default; 0.17-0.19 ms). See `docs/SUN_RAYS.md` in the superproject.
