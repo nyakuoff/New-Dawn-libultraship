@@ -61,6 +61,10 @@ typedef struct NewDawnPostFxParams {
     float shadowFlipY;
     float shadowViewProj[16];
     float shadowInvViewProj[16];
+    /* Cascaded sun shadows: 1 = the single shadowRadius map, 2..4 = the map is split into that many tiles that cover
+       the view out to shadowDistance (view-axis distance in world units). */
+    int32_t shadowCascades;
+    float shadowDistance;
 
     /* Screen-space diffuse bounce. Camera/scene are read-only history rejection inputs. */
     int32_t giEnabled, giSceneId;

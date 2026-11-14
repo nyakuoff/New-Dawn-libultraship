@@ -489,6 +489,164 @@ static void BuildLightViewProj(const NewDawnPostFxParams& params, float out[16])
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Cascaded sun shadows
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Camera-space point at NDC (x, y, z) through the exact inverse projection (same layout the shaders read).
+static void UnprojectNdc(const NewDawnPostFxParams& p, float x, float y, float z, float out[3]) {
+    const float ndc[4] = { x * p.shadowNdcXScale, y * p.shadowFlipY, z, 1.0f };
+    float w[4] = {};
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            w[j] += ndc[i] * p.shadowInvViewProj[i * 4 + j];
+        }
+    }
+    const float inv = std::fabs(w[3]) > 1e-12f ? 1.0f / w[3] : 1.0f;
+    for (int j = 0; j < 3; j++) {
+        out[j] = w[j] * inv;
+    }
+}
+
+// One tile of the atlas per cascade, fitted to a bounding sphere of the slice of the view frustum it covers. The sphere
+// does not change size when the camera turns and the centre snaps to the texel grid, so shadow edges do not shimmer.
+// Slices overlap by `blend` of the nearer cascade, which is where the two are cross-faded.
+void PostFxGL::BuildCascades(const NewDawnPostFxParams& p, int atlasSize) {
+    mCsm = Cascades{};
+    const int n = std::clamp(p.shadowCascades, 1, 4);
+    if (n <= 1 || !p.shadowUseExactProj || atlasSize < 512 || !mShadowApplyCsm.id || !mShadowApplyHdrCsm.id ||
+        !mShaftMarchCsm.id || !mFogMarchCsm.id || !mGiGatherCsm.id) {
+        return;
+    }
+    constexpr float kGuardTexels = 5.0f;     // PCF radius 2.2 + bilinear + margin, never filtered across a tile edge
+    constexpr float kLegacyTexel = 2.0f * 1500.0f / 4096.0f; // the single map's texel; bias constants are tuned for it
+    constexpr float kLegacyRange = 5000.0f;  // and its depth range
+    constexpr float kLambda = 0.85f;         // practical split scheme: mostly logarithmic
+    mCsm.count = n;
+    mCsm.tile = atlasSize / 2;
+    mCsm.blend = 0.12f;
+
+    float nearC[4][3], farC[4][3], nc[3], fc[3];
+    const float sx[4] = { -1.0f, 1.0f, 1.0f, -1.0f }, sy[4] = { -1.0f, -1.0f, 1.0f, 1.0f };
+    for (int k = 0; k < 4; k++) {
+        UnprojectNdc(p, sx[k], sy[k], -1.0f, nearC[k]);
+        UnprojectNdc(p, sx[k], sy[k], 1.0f, farC[k]);
+    }
+    UnprojectNdc(p, 0.0f, 0.0f, -1.0f, nc);
+    UnprojectNdc(p, 0.0f, 0.0f, 1.0f, fc);
+    float fwd[3] = { fc[0] - nc[0], fc[1] - nc[1], fc[2] - nc[2] };
+    Normalize3(fwd, fwd);
+    const float zNear = std::max(p.zNear, 1.0f), zFar = std::max(p.zFar, zNear + 1.0f);
+    for (int i = 0; i < 3; i++) {
+        mCsm.fwd[i] = fwd[i];
+        mCsm.eye[i] = nc[i] - fwd[i] * zNear;
+    }
+    float off[3] = { farC[0][0] - fc[0], farC[0][1] - fc[1], farC[0][2] - fc[2] };
+    const float h2 = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]) / (zFar * zFar); // tan^2 of the half diagonal
+
+    const float distance = std::clamp(p.shadowDistance, zNear + 100.0f, zFar);
+    const float start = std::max(zNear, 20.0f);
+    for (int i = 0; i < n; i++) {
+        const float f = (float)(i + 1) / (float)n;
+        const float logSplit = start * std::pow(distance / start, f);
+        const float linSplit = start + (distance - start) * f;
+        mCsm.split[i] = (i == n - 1) ? distance : kLambda * logSplit + (1.0f - kLambda) * linSplit;
+    }
+
+    float dir[3] = { p.shadowSunDir[0], p.shadowSunDir[1], p.shadowSunDir[2] };
+    float up[3] = { 0.0f, 1.0f, 0.0f };
+    if (std::fabs(dir[1]) > 0.98f) {
+        up[1] = 0.0f;
+        up[2] = 1.0f;
+    }
+    float forward[3] = { -dir[0], -dir[1], -dir[2] };
+    Normalize3(forward, forward);
+    float right[3], realUp[3];
+    Cross3(forward, up, right);
+    Normalize3(right, right);
+    Cross3(right, forward, realUp);
+
+    const float atlas = (float)atlasSize, tile = (float)mCsm.tile;
+    for (int i = 0; i < n; i++) {
+        const float a = (i == 0) ? zNear : mCsm.split[i - 1] * (1.0f - mCsm.blend);
+        const float b = mCsm.split[i];
+        float pts[8][3];
+        for (int k = 0; k < 4; k++) {
+            const float ta = (a - zNear) / (zFar - zNear), tb = (b - zNear) / (zFar - zNear);
+            for (int j = 0; j < 3; j++) {
+                pts[k][j] = nearC[k][j] + (farC[k][j] - nearC[k][j]) * ta;
+                pts[4 + k][j] = nearC[k][j] + (farC[k][j] - nearC[k][j]) * tb;
+            }
+        }
+        const float z = std::clamp((a + b) * (1.0f + h2) * 0.5f, a, b);
+        float center[3];
+        for (int j = 0; j < 3; j++) {
+            center[j] = mCsm.eye[j] + fwd[j] * z;
+        }
+        float radiusSq = 0.0f;
+        for (auto& q : pts) {
+            const float d[3] = { q[0] - center[0], q[1] - center[1], q[2] - center[2] };
+            radiusSq = std::max(radiusSq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        }
+        const float half = std::sqrt(radiusSq) * tile / (tile - 2.0f * kGuardTexels);
+        const float texel = 2.0f * half / tile;
+        const float cr = center[0] * right[0] + center[1] * right[1] + center[2] * right[2];
+        const float cu = center[0] * realUp[0] + center[1] * realUp[1] + center[2] * realUp[2];
+        const float sr = std::round(cr / texel) * texel - cr, su = std::round(cu / texel) * texel - cu;
+        for (int j = 0; j < 3; j++) {
+            center[j] += right[j] * sr + realUp[j] * su;
+        }
+
+        // Depth range hugs the tile: casters in front of the near plane are kept by depth clamping when drawn.
+        const float eyeDist = half + 100.0f;
+        const float eye[3] = { center[0] + dir[0] * eyeDist, center[1] + dir[1] * eyeDist, center[2] + dir[2] * eyeDist };
+        const float nearZ = 1.0f, farZ = eyeDist + half + 100.0f;
+        const float view[16] = {
+            right[0], realUp[0], -forward[0], 0.0f, right[1], realUp[1], -forward[1], 0.0f,
+            right[2], realUp[2], -forward[2], 0.0f, -right[0] * eye[0] - right[1] * eye[1] - right[2] * eye[2],
+            -realUp[0] * eye[0] - realUp[1] * eye[1] - realUp[2] * eye[2],
+            forward[0] * eye[0] + forward[1] * eye[1] + forward[2] * eye[2], 1.0f,
+        };
+        const float ortho[16] = {
+            1.0f / half, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f / half, 0.0f, 0.0f, 0.0f, 0.0f,
+            -2.0f / (farZ - nearZ), 0.0f, 0.0f, 0.0f, -(farZ + nearZ) / (farZ - nearZ), 1.0f,
+        };
+        float lightVP[16];
+        Mat4Multiply(ortho, view, lightVP);
+        // Clip space of the whole light volume -> this tile of the atlas.
+        const float ox = (float)(i & 1) * tile, oy = (float)(i >> 1) * tile;
+        const float s = tile / atlas;
+        const float atlasXf[16] = { s, 0.0f, 0.0f, 0.0f, 0.0f, s, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                                    2.0f * ox / atlas + s - 1.0f, 2.0f * oy / atlas + s - 1.0f, 0.0f, 1.0f };
+        Mat4Multiply(atlasXf, lightVP, mCsm.vp[i]);
+        mCsm.rect[i][0] = (ox + kGuardTexels) / atlas;
+        mCsm.rect[i][1] = (oy + kGuardTexels) / atlas;
+        mCsm.rect[i][2] = (ox + tile - kGuardTexels) / atlas;
+        mCsm.rect[i][3] = (oy + tile - kGuardTexels) / atlas;
+        mCsm.texelScale[i] = texel / kLegacyTexel;
+        mCsm.biasScale[i] = kLegacyRange * mCsm.texelScale[i] / (farZ - nearZ);
+    }
+}
+
+void PostFxGL::SetCascadeUniforms() {
+    auto loc = [this](const char* name) {
+        GLint l = Loc(name);
+        return l >= 0 ? l : Loc((std::string(name) + "[0]").c_str()); // atmos keeps the array suffix
+    };
+    glUniform1i(Loc("uCsmCount"), mCsm.count);
+    if (mCsm.count <= 1) {
+        return;
+    }
+    glUniformMatrix4fv(loc("uCsmVP"), 4, GL_FALSE, &mCsm.vp[0][0]);
+    glUniform4fv(loc("uCsmRect"), 4, &mCsm.rect[0][0]);
+    glUniform4fv(Loc("uCsmSplit"), 1, mCsm.split);
+    glUniform4fv(Loc("uCsmBiasScale"), 1, mCsm.biasScale);
+    glUniform4fv(Loc("uCsmTexelScale"), 1, mCsm.texelScale);
+    glUniform1f(Loc("uCsmBlend"), mCsm.blend);
+    glUniform3fv(Loc("uCsmEye"), 1, mCsm.eye);
+    glUniform3fv(Loc("uCsmFwd"), 1, mCsm.fwd);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Shaders
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -564,6 +722,9 @@ uniform float uNormalBias;
 uniform int uSunShadow;
 uniform int uFrame;
 float giIgn(vec2 p) { return fract(52.9829189*fract(dot(p,vec2(0.06711056,0.00583715)))); }
+#ifdef CSM
+float csmTap(vec3 uvz) { return texture(uGiShadow,uvz); }
+#endif
 void main() {
     ivec2 p = min(ivec2(vUv*vec2(uSize)),uSize-1);
     float d = fetchDepth(p);
@@ -580,10 +741,15 @@ void main() {
     if (uSunShadow != 0) {
         shade = dot(N,uSunDir) <= 0.0 ? 1.0 : 0.0;
         if (shade == 0.0) {
+#ifdef CSM
+            float s = csmLit(P,N,z,uNormalBias,0.004);
+            if (s >= 0.0) shade = 1.0-s;
+#else
             vec4 lc = uLightViewProj*vec4(P+N*uNormalBias,1.0);
             vec3 sc = lc.xyz/lc.w*0.5+0.5;
             if (all(greaterThan(sc.xy,vec2(0.0))) && all(lessThan(sc.xy,vec2(1.0))) && sc.z<1.0)
                 shade = 1.0-texture(uGiShadow,vec3(sc.xy,sc.z-0.004));
+#endif
         }
     }
     vec3 sum = vec3(0.0);
@@ -1185,6 +1351,19 @@ const vec2 kPoisson[12] = vec2[12](
     vec2(0.962340, -0.194983), vec2(0.473434, -0.480026), vec2(0.519456, 0.767022), vec2(0.185461, -0.893124),
     vec2(0.507431, 0.064425), vec2(0.896420, 0.412458), vec2(-0.321940, -0.932615), vec2(-0.791559, -0.597710));
 
+#ifdef CSM
+vec2 gRot;
+float csmTap(vec3 uvz) {
+    float sum = 0.0;
+    for (int i = 0; i < 12; i++) {
+        vec2 o = kPoisson[i];
+        o = vec2(o.x * gRot.x - o.y * gRot.y, o.x * gRot.y + o.y * gRot.x) * 2.2;
+        sum += texture(uShadowCmp, vec3(uvz.xy + o * uShadowTexel, uvz.z));
+    }
+    return sum / 12.0;
+}
+#endif
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     if (uDebug == 3) {
@@ -1232,6 +1411,14 @@ void main() {
     float ndl = max(dot(N, uSunDir), 0.0);
 
     float lit = 1.0;
+#ifdef CSM
+    // Cascaded: the same rotated Poisson filter, sampled in the atlas tile that covers this pixel's distance.
+    float a = ign(gl_FragCoord.xy) * 6.2831853;
+    gRot = vec2(cos(a), sin(a));
+    float csm = csmLit(P, N, linDepth(d0), uNormalBias, 0.003 + 0.010 * (1.0 - ndl));
+    bool inMap = csm >= 0.0;
+    float sampledLit = inMap ? csm : 1.0;
+#else
     vec4 lc = uLightViewProj * vec4(P + N * uNormalBias, 1.0);
     vec3 ndc = lc.xyz / lc.w;
     vec2 suv = ndc.xy * 0.5 + 0.5;
@@ -1252,6 +1439,7 @@ void main() {
         }
         sampledLit = sum / 12.0;
     }
+#endif
     if (uDebug == 4) {
         oColor = vec4(ndl, 1.0 - sampledLit, inMap ? 1.0 : 0.0, 1.0);
         return;
@@ -1277,7 +1465,15 @@ void main() {
         float coverage = 1.0 - smoothstep(uRadius * 0.8, uRadius, length(P - uCameraEye));
         factor = mix(vec3(1.0), factor, coverage * (1.0 - fog));
     }
-    oColor = vec4(texture(uColor, vUv).rgb * factor, 1.0);
+    vec3 result = texture(uColor, vUv).rgb * factor;
+#ifdef CSM
+    if (uDebug == 5) {
+        // Debug view: tint by cascade (red, green, blue, yellow = nearest to furthest).
+        const vec3 tint[4] = vec3[4](vec3(1.0, 0.35, 0.35), vec3(0.35, 1.0, 0.35), vec3(0.4, 0.5, 1.0), vec3(1.0, 1.0, 0.3));
+        result *= mix(vec3(1.0), tint[csmIndex(linDepth(d0))], 0.55);
+    }
+#endif
+    oColor = vec4(result, 1.0);
 }
 )GLSL";
 
@@ -1314,6 +1510,12 @@ vec3 worldPos(ivec2 p, float d) {
 
 const int kSteps = 20;
 
+#ifdef CSM
+float csmTap(vec3 uvz) {
+    return texture(uShadowCmp, uvz);
+}
+#endif
+
 void main() {
     ivec2 hp = ivec2(gl_FragCoord.xy);
     ivec2 fp = min(hp * 2, uSize - 1);
@@ -1345,9 +1547,14 @@ void main() {
         vec2 suv = ndc.xy * 0.5 + 0.5;
         float ref = ndc.z * 0.5 + 0.5;
         float lit = 1.0;
+#ifdef CSM
+        float s = csmLit(pos, vec3(0.0), csmViewDepth(pos), 0.0, 0.004);
+        if (s >= 0.0) lit = s;
+#else
         if (ref < 1.0 && all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0)))) {
             lit = texture(uShadowCmp, vec3(suv, ref - 0.004));
         }
+#endif
         float w = exp(-uDensity * t);
         acc += lit * w;
         wsum += w;
@@ -1582,6 +1789,11 @@ uniform bool uFogSun;
 uniform int uPointCount;
 uniform vec4 uPointPosRadius[4];
 uniform vec3 uPointColor[4];
+#ifdef CSM
+float csmTap(vec3 uvz) {
+    return texture(uShadowCmp, uvz);
+}
+#endif
 vec3 fogWorld(ivec2 p, float d) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(uSize) * 2.0 - 1.0;
     vec4 w = uInvViewProj * vec4(ndc * vec2(uNdcXScale, uFlipY), d * 2.0 - 1.0, 1.0);
@@ -1611,10 +1823,17 @@ void main() {
         vec4 lc = uLightViewProj * vec4(pos,1.0);
         vec3 sc = lc.xyz/lc.w*0.5+0.5;
         float lit = 1.0;
+#ifdef CSM
+        if (uFogSun) {
+            float s = csmLit(pos, vec3(0.0), csmViewDepth(pos), 0.0, 0.002);
+            if (s >= 0.0) lit = s;
+        }
+#else
         if (uFogSun && all(greaterThan(sc,vec3(0.0))) && all(lessThan(sc,vec3(1.0)))) {
             float edge = smoothstep(0.0,0.04,min(min(sc.x,1.0-sc.x),min(sc.y,1.0-sc.y)));
             lit = mix(1.0,texture(uShadowCmp,vec3(sc.xy,sc.z-0.002)),edge);
         }
+#endif
         vec3 local = vec3(0.0);
         for (int j=0; j<uPointCount; ++j) {
             float d = length(pos-uPointPosRadius[j].xyz)/max(uPointPosRadius[j].w,1.0);
@@ -2525,13 +2744,18 @@ bool PostFxGL::BuildPrograms() {
     mSkyEnvironment.id = BuildProgram("sky radiance cube", skyEnvironment, 5, mSkyEnvironment.uniforms);
     mCloudEnvironment.id = BuildProgram("cloud radiance cube", cloudEnvironment, 5, mCloudEnvironment.uniforms);
     mSkyConvolve.id = BuildProgram("sky diffuse convolution", convolve, 3, mSkyConvolve.uniforms);
+    // Cascaded shadows are separate programs built from the same sources with CSM defined; the originals compile
+    // from the unchanged text, so one cascade is bit-identical to the single shadow map.
+    const char* kCsm = "#define CSM 1\n";
     const char* giGather[] = { kVersion, kDepthLib, kGiGeometryLib, kGiGatherShader };
+    const char* giGatherCsm[] = { kVersion, kCsm, kDepthLib, kGiGeometryLib, kNewDawnCsmLib, kGiGatherShader };
     const char* giFilter[] = { kVersion, kDepthLib, kGiGeometryLib, kGiFilterShader };
     const char* giApply[] = { kVersion, kDepthLib, kGiGeometryLib, kGiApplyShader };
     // Optional GI failures leave the existing rendering path available. Reuse dedicated 2D lanes 8..11;
     // every sampler is assigned at link time and each lane starts with a complete transparent dummy.
     for (int unit = 0; unit < 4; ++unit) Bind(unit, mFogNeutral);
     mGiGather.id = BuildProgram("GI gather", giGather, 4, mGiGather.uniforms);
+    mGiGatherCsm.id = BuildProgram("GI gather (cascades)", giGatherCsm, 6, mGiGatherCsm.uniforms);
     mGiFilter.id = BuildProgram("GI spatial temporal filter", giFilter, 4, mGiFilter.uniforms);
     mGiApply.id = BuildProgram("GI bilateral composite", giApply, 4, mGiApply.uniforms);
     // Local lights reuse the colour (8) and depth (9) lanes bound to dummies above; no new sampler.
@@ -2554,6 +2778,10 @@ void main() { fragColor = texture(uScene, vUv); }
     const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
     const char* compNoDither[] = { kVersion, "#define NO_DITHER\n", kCompositeShader };
     const char* shadowApply[] = { kVersion, kDepthLib, kSkyAmbientLightingLib, kShadowApplyShader };
+    const char* shadowApplyCsm[] = { kVersion, kCsm, kDepthLib, kSkyAmbientLightingLib, kNewDawnCsmLib,
+                                     kShadowApplyShader };
+    const char* shadowApplyHdrCsm[] = { kVersion, kCsm, "#define HDR_SCENE\n", kDepthLib, kSkyAmbientLightingLib,
+                                        kNewDawnCsmLib, kShadowApplyShader };
     const char* shadowApplyHdr[] = { kVersion, "#define HDR_SCENE\n", kDepthLib, kSkyAmbientLightingLib,
                                      kShadowApplyShader };
     const char* shadowDepthVs[] = { kVersion, kShadowDepthVertex };
@@ -2603,14 +2831,18 @@ void main() { fragColor = texture(uScene, vUv); }
     mRayRadial.id = BuildProgram("sun ray radial integration", rayRadial, 2, mRayRadial.uniforms);
     mRayApply.id = BuildProgram("sun ray HDR apply", rayApply, 4, mRayApply.uniforms);
     const char* fogMarch[] = { kVersion, kDepthLib, kSkyAmbientLightingLib, kFogMarchShader };
+    const char* fogMarchCsm[] = { kVersion, kCsm, kDepthLib, kSkyAmbientLightingLib, kNewDawnCsmLib, kFogMarchShader };
     const char* fogApply[] = { kVersion, kDepthLib, kFogApplyShader };
     // Optional: fog shader failure must not disable the existing renderer.
     mFogMarch.id = BuildProgram("volumetric fog march", fogMarch, 4, mFogMarch.uniforms);
+    mFogMarchCsm.id = BuildProgram("volumetric fog march (cascades)", fogMarchCsm, 6, mFogMarchCsm.uniforms);
     mFogApply.id = BuildProgram("volumetric fog apply", fogApply, 3, mFogApply.uniforms);
     const char* shaftMarch[] = { kVersion, kDepthLib, kShaftMarchShader };
+    const char* shaftMarchCsm[] = { kVersion, kCsm, kDepthLib, kNewDawnCsmLib, kShaftMarchShader };
     const char* shaftBlur[] = { kVersion, kShaftBlurShader };
     const char* shaftApply[] = { kVersion, kDepthLib, kShaftApplyShader };
     mShaftMarch.id = BuildProgram("sun shaft march shader", shaftMarch, 3, mShaftMarch.uniforms);
+    mShaftMarchCsm.id = BuildProgram("sun shaft march (cascades)", shaftMarchCsm, 5, mShaftMarchCsm.uniforms);
     mShaftBlur.id = BuildProgram("sun shaft blur shader", shaftBlur, 2, mShaftBlur.uniforms);
     mShaftApply.id = BuildProgram("sun shaft apply shader", shaftApply, 3, mShaftApply.uniforms);
     mAo.id = BuildProgram("AO shader", ao, 3, mAo.uniforms);
@@ -2620,10 +2852,12 @@ void main() { fragColor = texture(uScene, vUv); }
     mCompositeHdr.id = BuildProgram("HDR bloom/display/grade", compHdr, 3, mCompositeHdr.uniforms);
     mCompositeNoDither.id = BuildProgram("LDR composite without dither", compNoDither, 3, mCompositeNoDither.uniforms);
     mShadowApplyHdr.id = BuildProgram("HDR shadow apply", shadowApplyHdr, 5, mShadowApplyHdr.uniforms);
+    mShadowApplyHdrCsm.id = BuildProgram("HDR shadow apply (cascades)", shadowApplyHdrCsm, 7, mShadowApplyHdrCsm.uniforms);
     mDown.id = BuildProgram("bloom downsample shader", down, 2, mDown.uniforms);
     mUp.id = BuildProgram("bloom upsample shader", up, 2, mUp.uniforms);
     mComposite.id = BuildProgram("composite shader", comp, 2, mComposite.uniforms);
     mShadowApply.id = BuildProgram("shadow apply shader", shadowApply, 4, mShadowApply.uniforms);
+    mShadowApplyCsm.id = BuildProgram("shadow apply (cascades)", shadowApplyCsm, 6, mShadowApplyCsm.uniforms);
     mShadowDepth.id = BuildProgramWithVertex("shadow depth shader", shadowDepthVs, 2, shadowDepthFs, 2,
                                              mShadowDepth.uniforms);
     mShadowFoliage.id = BuildProgramWithVertex("shadow foliage shader", foliageVs, 2, foliageFs, 2,
@@ -3401,6 +3635,8 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     if (!mUsable) {
         return;
     }
+    BuildCascades(params, size);
+    const bool csm = mCsm.count > 1;
 
     if (debug != 0) {
         static bool logged = false;
@@ -3514,13 +3750,25 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glBindVertexArray(mShadowVao);
     glBindBuffer(GL_ARRAY_BUFFER, mShadowVbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertexCount * 3 * sizeof(float), positions, GL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
+    if (csm) {
+        // Every cascade draws all casters into its own tile of the atlas. Depth clamp keeps casters that lie in front
+        // of a tile's tight near plane (hills and buildings towards the sun) as depth 0 instead of clipping them.
+        glEnable(GL_DEPTH_CLAMP);
+        glEnable(GL_SCISSOR_TEST);
+        for (int c = 0; c < mCsm.count; c++) {
+            glScissor((c & 1) * mCsm.tile, (c >> 1) * mCsm.tile, mCsm.tile, mCsm.tile);
+            glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, mCsm.vp[c]);
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
+        }
+    } else {
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
+    }
     CheckError("shadow map render");
 
     if (mFoliageBatchCount > 0 && mFoliageVerts != nullptr) {
         // Cut-out casters: same light matrix and depth state, fragment-discarded by the texel alpha.
         Use(mShadowFoliage);
-        glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+        glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, csm ? mCsm.vp[0] : lightViewProj);
         glUniform1i(Loc("uTex"), kFirstUnit);
         glBindVertexArray(mFoliageVao);
         glBindBuffer(GL_ARRAY_BUFFER, mFoliageVbo);
@@ -3529,9 +3777,23 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
         glBufferData(GL_ARRAY_BUFFER, floats * sizeof(float), mFoliageVerts, GL_STREAM_DRAW);
         for (uint32_t i = 0; i < mFoliageBatchCount; i++) {
             Bind(0, mFoliageBatches[i].textureId);
-            glDrawArrays(GL_TRIANGLES, (GLint)mFoliageBatches[i].firstVertex, (GLsizei)mFoliageBatches[i].vertexCount);
+            if (csm) {
+                for (int c = 0; c < mCsm.count; c++) {
+                    glScissor((c & 1) * mCsm.tile, (c >> 1) * mCsm.tile, mCsm.tile, mCsm.tile);
+                    glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, mCsm.vp[c]);
+                    glDrawArrays(GL_TRIANGLES, (GLint)mFoliageBatches[i].firstVertex,
+                                 (GLsizei)mFoliageBatches[i].vertexCount);
+                }
+            } else {
+                glDrawArrays(GL_TRIANGLES, (GLint)mFoliageBatches[i].firstVertex,
+                             (GLsizei)mFoliageBatches[i].vertexCount);
+            }
         }
         CheckError("shadow foliage render");
+    }
+    if (csm) {
+        glDisable(GL_DEPTH_CLAMP);
+        glDisable(GL_SCISSOR_TEST);
     }
 
     if (debug == 4) {
@@ -3606,7 +3868,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     Bind(2, mShadowMap.tex);
     Bind(3, mShadowMap.tex);
     glBindSampler(kFirstUnit + 3, mCmpSampler);
-    Use(mHdrActive ? mShadowApplyHdr : mShadowApply);
+    Use(csm ? (mHdrActive ? mShadowApplyHdrCsm : mShadowApplyCsm) : (mHdrActive ? mShadowApplyHdr : mShadowApply));
     glUniform1i(Loc("uColor"), kFirstUnit + 0);
     glUniform1i(Loc("uDepth"), kFirstUnit + 1);
     glUniform1i(Loc("uShadow"), kFirstUnit + 2);
@@ -3634,13 +3896,15 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);
     glUniform1f(Loc("uMinFactor"), mSettings.shadowFloor);
-    glUniform1f(Loc("uRadius"), params.shadowRadius);
+    glUniform1f(Loc("uRadius"), csm ? mCsm.split[mCsm.count - 1] : params.shadowRadius);
+    SetCascadeUniforms();
     float fogMul, fogOff;
     FogCoefficients(params, fogMul, fogOff);
     glUniform1i(Loc("uHdr"), mHdrActive);
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
-    glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)size * 4.0f);
+    // Cascades scale this per tile by its texel size relative to the legacy map (radius 1500 over 4096).
+    glUniform1f(Loc("uNormalBias"), csm ? 2.0f * 1500.0f / 4096.0f * 4.0f : 2.0f * params.shadowRadius / (float)size * 4.0f);
     glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
     glBindSampler(kFirstUnit + 3, 0);
@@ -4020,7 +4284,8 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     Bind(1, mDepth.tex);
     Bind(3, params.fogVolumetric == 2 ? mDepth.tex : mShadowMap.tex);
     glBindSampler(kFirstUnit + 3, mCmpSampler);
-    Use(mFogMarch);
+    Use(mCsm.count > 1 && params.fogVolumetric == 1 ? mFogMarchCsm : mFogMarch);
+    SetCascadeUniforms();
     glUniform2i(Loc("uSize"), w, h);
     glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
     glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
@@ -4084,7 +4349,8 @@ void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const Framebuffer
     Bind(1, mDepth.tex);
     Bind(3, mShadowMap.tex);
     glBindSampler(kFirstUnit + 3, mCmpSampler);
-    Use(mShaftMarch);
+    Use(mCsm.count > 1 ? mShaftMarchCsm : mShaftMarch);
+    SetCascadeUniforms();
     glUniform1i(Loc("uDepth"), kFirstUnit + 1);
     glUniform1i(Loc("uShadowCmp"), kFirstUnit + 3);
     glUniform2i(Loc("uSize"), w, h);
@@ -4199,11 +4465,14 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
         glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
         glUniform1f(Loc("uFlipY"), params.shadowFlipY);
     };
-    Use(mGiGather);
+    Use(sunShadow && mCsm.count > 1 ? mGiGatherCsm : mGiGather);
     geometry();
     glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
     glUniform3fv(Loc("uSunDir"), 1, params.shadowSunDir);
-    glUniform1f(Loc("uNormalBias"), 2.0f * params.shadowRadius / (float)std::max(params.shadowMapSize, 1) * 4.0f);
+    SetCascadeUniforms();
+    glUniform1f(Loc("uNormalBias"), sunShadow && mCsm.count > 1
+                                        ? 2.0f * 1500.0f / 4096.0f * 4.0f
+                                        : 2.0f * params.shadowRadius / (float)std::max(params.shadowMapSize, 1) * 4.0f);
     glUniform1i(Loc("uSunShadow"), sunShadow ? 1 : 0);
     glUniform1i(Loc("uFrame"), (int)(frameIndex & 63u));
     Draw(mGiRaw);
