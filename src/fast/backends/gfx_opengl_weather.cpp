@@ -96,8 +96,9 @@ in vec2 vUv;
 out vec4 oColor;
 uniform sampler2D uWeatherScene,uWeatherDepth,uWeatherRoof,uWeatherRing;
 uniform samplerCube uWeatherEnvironment;
-uniform mat4 uInvViewProj,uRoofViewProj;
+uniform mat4 uInvViewProj,uRoofViewProj,uViewProj;
 uniform float uNdcXScale,uFlipY,uWetness,uRain,uTime;
+uniform vec2 uNearFar;
 uniform int uBoxCount;
 uniform vec4 uBoxRect[16]; // minX, minZ, maxX, maxZ of the water planes (the water pass owns ripples and foam there)
 uniform float uBoxY[16];
@@ -107,14 +108,65 @@ float noise(vec2 p) {
     vec2 a=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
     return mix(mix(hash(a),hash(a+vec2(1,0)),f.x),mix(hash(a+vec2(0,1)),hash(a+vec2(1)),f.x),f.y);
 }
+float linearDepth(float d) {
+    return 2.0*uNearFar.x*uNearFar.y/max(uNearFar.y+uNearFar.x-(2.0*d-1.0)*(uNearFar.y-uNearFar.x),0.001);
+}
+vec3 worldAt(vec2 uv,float d) {
+    vec2 ndc=(uv*2.0-1.0)*vec2(uNdcXScale,uFlipY);
+    vec4 w=uInvViewProj*vec4(ndc,d*2.0-1.0,1.0);
+    return w.xyz/w.w;
+}
+// Slope of the rain-drop rings of one cell layer: a travelling sine packet inside a gaussian shell, fading with its age.
+// Rings stay inside their cell (centre 0.3..0.7, radius <= 0.3 cell), so no seams. Returns (slope.xy, ring strength).
+vec3 rings(vec2 xz,float cell,float seed,float time) {
+    vec2 id=floor(xz/cell),f=fract(xz/cell);
+    vec2 centre=0.3+0.4*vec2(hash(id+seed),hash(id+seed+3.1));
+    float age=fract(time*0.85+hash(id+seed+7.0));
+    vec2 d=(f-centre)*cell;
+    float r=max(length(d),1e-3);
+    float w=r-age*cell*0.3;
+    float env=exp(-w*w/2.2)*(1.0-age)*(1.0-age);
+    float slope=env*(2.4*cos(2.4*w)-w/1.1*sin(2.4*w));
+    return vec3(d/r*slope,env);
+}
+// Screen-space reflection against the opaque depth and colour: exponential world-space march, crossing test, binary refine.
+vec4 reflectScene(vec3 origin,vec3 dir,float jitter) {
+    float t=2.5+jitter*1.5,prevT=0.0,prevGap=-1.0;
+    for (int i=0;i<44;i++) {
+        vec3 q=origin+dir*t;
+        vec4 c=uViewProj*vec4(q,1.0);
+        if (c.w<=1.0) break;
+        vec2 uv=vec2(c.x/(c.w*uNdcXScale),c.y/c.w*uFlipY)*0.5+0.5;
+        if (any(lessThan(uv,vec2(0.003)))||any(greaterThan(uv,vec2(0.997)))) break;
+        float d=texture(uWeatherDepth,uv).r;
+        float gap=d<0.99999 ? c.w-linearDepth(d) : -1.0;
+        if (gap>0.0 && prevGap<=0.0 && gap<max(12.0,(t-prevT)*2.2)) {
+            float lo=prevT,hi=t;
+            for (int j=0;j<6;j++) {
+                float mid=(lo+hi)*0.5;
+                vec4 cm=uViewProj*vec4(origin+dir*mid,1.0);
+                vec2 um=vec2(cm.x/(cm.w*uNdcXScale),cm.y/cm.w*uFlipY)*0.5+0.5;
+                float dm=texture(uWeatherDepth,um).r;
+                if (dm<0.99999 && cm.w-linearDepth(dm)>0.0) hi=mid; else lo=mid;
+            }
+            vec4 ch=uViewProj*vec4(origin+dir*hi,1.0);
+            uv=vec2(ch.x/(ch.w*uNdcXScale),ch.y/ch.w*uFlipY)*0.5+0.5;
+            vec2 edge=min(uv,1.0-uv);
+            float conf=smoothstep(0.0,0.08,min(edge.x,edge.y))*(1.0-smoothstep(0.6,1.0,float(i)/44.0));
+            return vec4(texture(uWeatherScene,uv).rgb,conf);
+        }
+        prevGap=gap;prevT=t;
+        t+=max(2.5,t*0.12);
+    }
+    return vec4(0.0);
+}
 void main() {
     vec3 color=texture(uWeatherScene,vUv).rgb;
     float depth=texture(uWeatherDepth,vUv).r;
     if (depth>=0.99999) { oColor=vec4(color,1.0);return; }
-    vec2 ndc=vUv*2.0-1.0;ndc*=vec2(uNdcXScale,uFlipY);
-    vec4 world=uInvViewProj*vec4(ndc,depth*2.0-1.0,1.0);
-    vec3 P=world.xyz/world.w;
+    vec3 P=worldAt(vUv,depth);
     vec3 V=normalize(uEye-P);
+    float dist=length(uEye-P);
     vec3 N=normalize(cross(dFdx(P),dFdy(P)));
     if (dot(N,V)<0.0) N=-N;
     vec3 roof=(uRoofViewProj*vec4(P,1.0)).xyz*0.5+0.5;
@@ -126,29 +178,84 @@ void main() {
         if (P.x>=uBoxRect[i].x && P.x<=uBoxRect[i].z && P.z>=uBoxRect[i].y && P.z<=uBoxRect[i].w && P.y<uBoxY[i]+2.0) underWater=1.0;
     exposed*=1.0-underWater;
     float wet=exposed*uWetness;
-    float flatness=smoothstep(0.65,0.95,N.y);
-    float patch=smoothstep(0.34,0.72,noise(P.xz*0.012));
-    float puddle=wet*flatness*patch;
-    color*=1.0-wet*0.20;
-    float fres=0.04+0.96*pow(1.0-max(dot(N,V),0.0),5.0);
-    vec3 environment=textureLod(uWeatherEnvironment,reflect(-V,N),0.8).rgb;
-    color=mix(color,environment,clamp(puddle*(0.12+0.65*fres),0.0,0.7));
-    vec3 H=normalize(V+uSunDir);
-    float roughness=mix(0.16,0.045,patch);
-    float a2=roughness*roughness;
-    float nh=max(dot(N,H),0.0);
-    float den=nh*nh*(a2-1.0)+1.0;
-    float spec=min(a2/(3.14159265*den*den),8.0)*max(dot(N,uSunDir),0.0);
-    color+=uSunColor*spec*wet*0.08;
-    // World-anchored CC0 ring sprites, reprojected onto flatness wet surfaces for splashes/ripples.
-    vec2 cell=floor(P.xz/22.0),f=fract(P.xz/22.0);
-    vec2 centre=vec2(0.2+0.6*hash(cell),0.2+0.6*hash(cell+3.0));
-    float age=fract(uTime*1.8+hash(cell+7.0));
-    vec2 ringUv=(f-centre)*22.0/(0.6+age*5.5)*0.5+0.5;
-    if (all(greaterThanEqual(ringUv,vec2(0.0))) && all(lessThanEqual(ringUv,vec2(1.0)))) {
-        vec4 ring=texture(uWeatherRing,ringUv);
-        float splash=ring.a*ring.r*(1.0-age)*uRain*flatness*exposed;
-        color+=vec3(0.55,0.62,0.70)*splash;
+    if (wet<=0.0) { oColor=vec4(color,1.0);return; }
+    float flatness=smoothstep(0.80,0.97,N.y);
+
+    // Cavity: is this texel lower than its surroundings? Four taps in the depth buffer, validated to be on the same surface.
+    float cavity=0.0;
+    {
+        vec2 px=1.0/vec2(textureSize(uWeatherDepth,0));
+        vec2 off[4]=vec2[4](vec2(7.0,0.0),vec2(-7.0,0.0),vec2(0.0,7.0),vec2(0.0,-7.0));
+        float sum=0.0,count=0.0;
+        for (int i=0;i<4;i++) {
+            vec2 uv=vUv+off[i]*px;
+            float dn=texture(uWeatherDepth,uv).r;
+            if (dn>=0.99999) continue;
+            vec3 Pn=worldAt(uv,dn);
+            float run=length(Pn.xz-P.xz);
+            if (run<1.0 || abs(Pn.y-P.y)>run*0.6) continue;
+            sum+=(Pn.y-P.y)/run;
+            count+=1.0;
+        }
+        cavity=count>0.0 ? clamp(sum/count*6.0,0.0,1.0) : 0.0;
+    }
+    // Standing water gathers in flat, low spots. The level rises with how long and hard it has rained; the shape is a
+    // world-anchored three-octave noise bent by the cavity term.
+    float shape=0.55*noise(P.xz*0.0085)+0.30*noise(P.xz*0.023+7.0)+0.15*noise(P.xz*0.071+3.0)+0.30*cavity;
+    float level=mix(0.82,0.56,clamp(uWetness,0.0,1.0));
+    float pool=smoothstep(level,level+0.045,shape)*flatness*exposed;
+    float damp=smoothstep(level-0.22,level+0.02,shape)*mix(0.45,1.0,flatness)*wet;
+    // Damp surround: darker and more saturated. Everything exposed gets the base darkening.
+    float luma=dot(color,vec3(0.2126,0.7152,0.0722));
+    color=mix(vec3(luma),color,1.0+0.30*damp);
+    color*=1.0-wet*0.16-damp*0.30;
+
+    if (pool>0.003) {
+        // Surface of the puddle: level water with rain-drop rings and a little micro-wobble.
+        float rangeFade=1.0-smoothstep(260.0,900.0,dist);
+        vec3 r1=rings(P.xz,22.0,0.0,uTime),r2=rings(P.xz+13.7,31.0,5.0,uTime*0.8+0.37);
+        vec2 slope=(r1.xy+r2.xy)*0.12*uRain*rangeFade;
+        slope+=(vec2(noise(P.xz*0.15+uTime*0.6),noise(P.xz*0.15+31.0-uTime*0.5))-0.5)*0.015*uRain;
+        vec3 Nw=normalize(vec3(-slope.x,1.0,-slope.y));
+        float ndv=max(dot(Nw,V),0.02);
+        // Water reflects little looking down but a lot at grazing angles; lifted so the pool reads from a high camera.
+        float F=mix(0.16,1.0,pow(1.0-ndv,3.5));
+        vec3 R=reflect(-V,Nw);
+        float jitter=fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+        vec4 hit=reflectScene(P+vec3(0.0,1.5,0.0),R,jitter);
+        vec3 sky=textureLod(uWeatherEnvironment,vec3(R.x,max(R.y,0.02),R.z),0.3).rgb;
+        vec3 reflection=mix(sky,hit.rgb,hit.a);
+        // Dark, wet, slightly cool bed under the film of water.
+        vec3 bed=color*vec3(0.20,0.22,0.26);
+        vec3 water=bed*(1.0-F)+reflection*F;
+        vec3 H=normalize(V+uSunDir);
+        float nh=max(dot(Nw,H),0.0);
+        float a2=0.0016;
+        float den=nh*nh*(a2-1.0)+1.0;
+        water+=uSunColor*min(a2/(3.14159265*den*den),12.0)*max(dot(Nw,uSunDir),0.0)*0.06;
+        // Thin dark rim where the water meets the damp ground, then the water itself.
+        float rim=pool*(1.0-pool)*4.0;
+        water*=1.0-0.35*rim;
+        float ringHi=(r1.z+r2.z)*uRain*rangeFade;
+        // Ring sprite scaled to the same expanding ring: a bright thin crest on top of the normals.
+        vec2 cell=floor(P.xz/22.0),f=fract(P.xz/22.0);
+        vec2 centre=0.3+0.4*vec2(hash(cell),hash(cell+3.1));
+        float age=fract(uTime*0.85+hash(cell+7.0));
+        vec2 ringUv=(f-centre)*22.0/(2.0*(age*6.6+1.5))+0.5;
+        if (all(greaterThanEqual(ringUv,vec2(0.0))) && all(lessThanEqual(ringUv,vec2(1.0)))) {
+            vec4 ring=texture(uWeatherRing,ringUv);
+            water+=(reflection*0.5+vec3(0.10,0.12,0.14))*ring.a*ring.r*(1.0-age)*uRain*rangeFade*0.6;
+        }
+        water+=reflection*ringHi*0.04;
+        color=mix(color,water,pool);
+    }
+    // A little sun glint on the damp surround.
+    {
+        vec3 H=normalize(V+uSunDir);
+        float nh=max(dot(N,H),0.0);
+        float a2=0.0049;
+        float den=nh*nh*(a2-1.0)+1.0;
+        color+=uSunColor*min(a2/(3.14159265*den*den),8.0)*max(dot(N,uSunDir),0.0)*damp*0.02;
     }
     oColor=vec4(color,1.0);
 }
@@ -326,6 +433,8 @@ void PostFxGL::RunWeather(const NewDawnPostFxParams& p, const FramebufferOGL& fb
         Use(mWeatherWet);
         glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, p.shadowInvViewProj);
         glUniformMatrix4fv(Loc("uRoofViewProj"), 1, GL_FALSE, roofMatrix);
+        glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, p.shadowViewProj);
+        glUniform2f(Loc("uNearFar"), p.zNear, p.zFar);
         glUniform1f(Loc("uNdcXScale"), p.shadowNdcXScale);
         glUniform1f(Loc("uFlipY"), p.shadowFlipY);
         glUniform1f(Loc("uWetness"), mWeatherWetness);

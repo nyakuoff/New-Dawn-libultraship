@@ -151,10 +151,11 @@ in vec3 vGround;
 in float vHeight, vTrans, vTipTint, vPatch;
 uniform sampler2D uAtlas;
 uniform int uAlphaToCoverage;
+uniform float uLodBias;
 uniform vec3 uSunColor;
 out vec4 oColor;
 void main() {
-    vec4 t = texture(uAtlas, vUv, -0.5);
+    vec4 t = texture(uAtlas, vUv, uLodBias);
     float a = t.a;
     if (uAlphaToCoverage == 0) {
         if (a < 0.45) discard;
@@ -248,7 +249,7 @@ bool PostFxGL::BuildGrassProgram() {
         path = Ship::Context::LocateFileAcrossAppDirs(path.string());
     int w = 0, h = 0, n = 0;
     auto* data = stbi_load(path.string().c_str(), &w, &h, &n, 4);
-    if (!data || w != 1024 || h != 1024) {
+    if (!data || w != h || w < 256 || w > 4096) { // square 2x2 atlas, any resolution
         SPDLOG_WARN("NewDawnGrass: missing/unsupported tuft atlas {}; set gNewDawn.Assets.Path to the asset root",
                     path.string());
         stbi_image_free(data);
@@ -265,7 +266,9 @@ bool PostFxGL::BuildGrassProgram() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY_EXT */, 1.0f);
+    GLfloat maxAniso = 1.0f;
+    glGetFloatv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT */, &maxAniso);
+    glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY_EXT */, std::min(maxAniso, 16.0f));
     glGenerateMipmap(GL_TEXTURE_2D);
 
     glGenVertexArrays(1, &mGrassVao);
@@ -430,6 +433,8 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
                 (float)std::fmod(t * 6.0, kTwoPi));
     const bool a2c = fb.msaa_level > 1;
     glUniform1i(Loc("uAlphaToCoverage"), a2c);
+    // Alpha-to-coverage hides the shimmer of a sharper mip, so the MSAA path samples finer levels.
+    glUniform1f(Loc("uLodBias"), CvFloat("gNewDawn.Grass.LodBias", a2c ? -1.0f : -0.5f));
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
     glViewport(0, 0, w, h);
