@@ -156,6 +156,13 @@ class GfxRenderingAPI {
     virtual void SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
                                           uint32_t batchCount) {
     }
+    // New Dawn VFX: NEWDAWN_VFX_FLOATS floats per recorded sprite; valid until RunPostFx returns.
+    virtual void SetVfxSprites(const float* data, uint32_t count) {
+    }
+    // True while the renderer will redraw recorded VFX sprites itself (so the native draw may be skipped).
+    virtual bool VfxReplacing() const {
+        return false;
+    }
 
     // New Dawn per-pixel lighting. Only implemented for OpenGL; other backends keep the CPU
     // vertex lighting path. See GfxPerPixelLightingState above.
