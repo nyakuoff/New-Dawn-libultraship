@@ -497,6 +497,7 @@ class Interpreter {
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
     void UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]);
+    bool SolveCameraPosition(float out[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
     // lists carry stable path pointers; off by default.

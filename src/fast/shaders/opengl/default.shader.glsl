@@ -322,7 +322,9 @@
         // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
         // +Y-up normals (texture rows increase down). Keeping the signed determinant handles
         // mirrored islands; repeat/mirror sampling and tile clamp match the albedo sampler.
-        vec3 materialNormal(vec2 uv, vec2 dx, vec2 dy, float weight, out float variance) {
+        // Orthonormal-ish surface frame from screen derivatives: t/b follow +U/+V (raw*det, then
+        // handedness-corrected); det is the signed UV Jacobian determinant.
+        void materialFrame(vec2 dx, vec2 dy, out vec3 n, out vec3 t, out vec3 b, out float det, out float handedness) {
             // Cofactor inverse-transpose also works on this backend's GLSL 1.30 path.
             mat3 cofactor = mat3(cross(uViewMatrix[1], uViewMatrix[2]),
                                  cross(uViewMatrix[2], uViewMatrix[0]),
@@ -330,11 +332,17 @@
             float determinant = dot(uViewMatrix[0], cofactor[0]);
             vec3 transformed = cofactor * vNormal * (determinant < 0.0 ? -1.0 : 1.0);
             vec3 px = dFdx(vViewPos), py = dFdy(vViewPos);
-            vec3 n = transformed / max(length(transformed), 0.0001);
-            float det = dx.x * dy.y - dx.y * dy.x;
-            vec3 t = px * dy.y - py * dx.y;
-            vec3 b = py * dx.x - px * dy.x;
-            float handedness = det < 0.0 ? -1.0 : 1.0;
+            n = transformed / max(length(transformed), 0.0001);
+            det = dx.x * dy.y - dx.y * dy.x;
+            t = px * dy.y - py * dx.y;
+            b = py * dx.x - px * dy.x;
+            handedness = det < 0.0 ? -1.0 : 1.0;
+        }
+
+        vec3 materialNormal(vec2 uv, vec2 dx, vec2 dy, float weight, out float variance) {
+            vec3 n, t, b;
+            float det, handedness;
+            materialFrame(dx, dy, n, t, b, det, handedness);
             t = (t - n * dot(n, t)) * handedness;
             b = (b - n * dot(n, b)) * handedness;
             float t2 = dot(t, t), b2 = dot(b, b);
@@ -348,6 +356,60 @@
             variance = max(dot(dFdx(mapped), dFdx(mapped)), dot(dFdy(mapped), dFdy(mapped)));
             if (abs(det) < 1e-12 || min(t2, b2) < 1e-16) return n;
             return normalize(t * inversesqrt(t2) * mapped.x - b * inversesqrt(b2) * mapped.y + n * mapped.z);
+        }
+
+
+        // Parallax occlusion mapping: steep ray march through the companion height (roughness map G,
+        // 0.5 = the real surface, class gain baked by the generator) with a linear relief refinement.
+        // The ray is unfolded in UV space, so wrap, mirror and clamp samplers behave like the albedo.
+        uniform vec4 uMaterialEye; // xyz: camera position in vViewPos's (world) space, w: 1 when valid
+        uniform vec2 uMaterialParallax; // x: depth as a fraction of the texture's world size (0 = off), y: fade-out distance
+        vec2 materialParallax(vec2 uv, vec2 dx, vec2 dy, float weight) {
+            vec3 n, t, b;
+            float det, handedness;
+            materialFrame(dx, dy, n, t, b, det, handedness);
+            vec3 toEye = uMaterialEye.xyz - vViewPos;
+            float dist = length(toEye);
+            float fade = uMaterialEye.w * weight * (1.0 - smoothstep(uMaterialParallax.y * 0.55, uMaterialParallax.y, dist));
+            vec3 v = toEye / max(dist, 0.0001);
+            float vn = dot(v, n);
+            if (fade <= 0.001 || abs(det) < 1e-12 || vn <= 0.02) return uv;
+            // World vectors per UV unit, projected into the surface plane.
+            vec3 pu = t / det, pv = b / det;
+            pu -= n * dot(n, pu);
+            pv -= n * dot(n, pv);
+            float g11 = dot(pu, pu), g12 = dot(pu, pv), g22 = dot(pv, pv);
+            float gd = g11 * g22 - g12 * g12;
+            if (gd < 1e-12) return uv;
+            vec3 lateral = v - n * vn;
+            float a = dot(lateral, pu), c = dot(lateral, pv);
+            vec2 duv = vec2(g22 * a - g12 * c, g11 * c - g12 * a) / gd;
+            // Depth reference: the texture's world size, capped so large sparse tiles do not get metre-deep relief.
+            float worldSize = min(sqrt(0.5 * (g11 + g22)), 28.0);
+            // Ray shift over the full depth range, bounded so grazing views cannot sweep across the tile.
+            vec2 q = duv * (uMaterialParallax.x * fade * worldSize / max(vn, 0.25));
+            float reach = max(abs(q.x), abs(q.y));
+            q *= min(1.0, 0.06 / max(reach, 0.0001));
+            reach = min(reach, 0.06);
+            // Layers per ray: enough that one layer shifts less than a joint/crack width (~1/128 UV).
+            float steps = clamp(reach * 640.0, 12.0, 48.0);
+            float layer = 1.0 / steps;
+            float depth = 0.0, prevDepth = 0.0;
+            float surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * 0.5, dx, dy).g;
+            for (int i = 0; i < 48; ++i) {
+                if (float(i) >= steps || depth >= surface) break;
+                prevDepth = depth;
+                depth += layer;
+                surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - depth), dx, dy).g;
+            }
+            // Relief refinement: bisect the last layer so the hit is not quantised to the layer grid.
+            float lo = prevDepth, hi = depth;
+            for (int i = 0; i < 6; ++i) {
+                float mid = 0.5 * (lo + hi);
+                float midSurface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - mid), dx, dy).g;
+                if (mid >= midSurface) hi = mid; else lo = mid;
+            }
+            return uv + q * (0.5 - 0.5 * (lo + hi));
         }
 
 #ifndef GL_ES
@@ -478,6 +540,15 @@
     #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
 
     void main() {
+        @if(o_material_maps)
+            float materialWeight = 1.0;
+            @if(material_blend)
+                materialWeight = clamp(vInput@{material_weight_index}.r, 0.0, 1.0);
+                @if(material_weight_invert)
+                    materialWeight = 1.0 - materialWeight;
+                @end
+            @end
+        @end
         @for(i in 0..2)
             @if(o_textures[i])
                 @{s = o_clamp[i][0]}
@@ -497,6 +568,19 @@
                     @else
                         vec2 vTexCoordAdj@{i} = vec2(vTexCoord@{i}.s, clamp(vTexCoord@{i}.t, 0.5 / texSize@{i}.t, vTexClampT@{i}));
                     @end
+                @end
+
+                @if(o_material_maps)
+                    // Parallax shifts the material tile's lookups; gradients stay those of the undisplaced UV.
+                    if (@{i} == @{material_tile} && uMaterialParallax.x > 0.0) {
+                        vTexCoordAdj@{i} = materialParallax(vTexCoordAdj@{i}, ddx@{i}, ddy@{i}, materialWeight);
+                        @if(s)
+                            vTexCoordAdj@{i}.s = clamp(vTexCoordAdj@{i}.s, 0.5 / texSize@{i}.s, vTexClampS@{i});
+                        @end
+                        @if(t)
+                            vTexCoordAdj@{i}.t = clamp(vTexCoordAdj@{i}.t, 0.5 / texSize@{i}.t, vTexClampT@{i});
+                        @end
+                    }
                 @end
 
                 vec4 texVal@{i} = hookTexture2D(@{i}, uTex@{i}, vTexCoordAdj@{i}, texSize@{i}, ddx@{i}, ddy@{i});
@@ -524,13 +608,6 @@
         @end
 
         @if(o_material_maps)
-            float materialWeight = 1.0;
-            @if(material_blend)
-                materialWeight = clamp(vInput@{material_weight_index}.r, 0.0, 1.0);
-                @if(material_weight_invert)
-                    materialWeight = 1.0 - materialWeight;
-                @end
-            @end
             float materialVariance;
             vec3 materialN = materialNormal(vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}, materialWeight, materialVariance);
             float materialRoughness = textureGrad(uMaterialRoughness, vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}).r;
@@ -699,4 +776,4 @@
             gl_FragDepth = prim_depth;
         @end
     }
-@end
+@end
