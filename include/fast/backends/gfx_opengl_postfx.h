@@ -113,6 +113,12 @@ class PostFxGL {
     bool mUsable = false;
     bool mStats = false; // copy of mSettings.stats for the helpers
     uint32_t mSettingsFrame = UINT32_MAX;
+    // Art-directed grade of the current frame, copied from the scene-end marker's params.
+    struct ArtGrade {
+        bool on = false;
+        float slope[3] = { 1, 1, 1 }, offset = 0, power = 1, contrast = 0, sat = 1;
+        float shadow[3] = {}, high[3] = {}, green[2] = { 0, 1 };
+    } mArt;
     Settings mSettings{};
     uint32_t mStatsW = 0, mStatsH = 0, mStatsMsaa = 0;
 
