@@ -11,7 +11,7 @@ namespace Fast {
 // New Dawn scene post-processing for the OpenGL backend: ambient occlusion on the opaque geometry, then bloom,
 // colour grade and dithering of the finished world. It works on private copies of the game framebuffer's depth and
 // colour, writes its result back into the game framebuffer and leaves all GL state exactly as it found it, so the
-// backend's cached state (and whatever is drawn afterwards) is unaffected. Stateless across calls.
+// backend's cached state (and whatever is drawn afterwards) is unaffected. GI retains rejected temporal history.
 class PostFxGL {
   public:
     // Checks the GL version and builds the shaders. On failure the feature stays unusable.
@@ -124,6 +124,7 @@ class PostFxGL {
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
+    void RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);
@@ -185,6 +186,13 @@ class PostFxGL {
 
     Target mDepth;
     Target mAoRaw, mAoBlur;
+    Program mGiGather, mGiFilter, mGiApply;
+    Target mGiSource, mGiRaw, mGiHistory[2];
+    bool mGiValid = false;
+    int mGiRead = 0, mGiScene = -1;
+    uint32_t mGiFrame = UINT32_MAX;
+    float mGiViewProj[16] = {}, mGiEye[3] = {}, mGiForward[3] = {};
+    float mGiNdcXScale = 1.0f, mGiFlipY = 1.0f;
     Target mScene;
     Target mWaterOpaqueColor, mWaterOpaqueDepth; // captured before XLU, only when reflections are enabled
     Target mWaterReflectionRaw; // half-resolution premultiplied colour and reflection coverage
@@ -210,7 +218,8 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 14;
+    static constexpr int kQueryStages = 15;
+    static constexpr int kGiTimerStage = 14;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;
     static constexpr int kSkyTimerStage = 6;

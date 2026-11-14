@@ -522,6 +522,167 @@ float fetchDepth(ivec2 p) {
 }
 )GLSL";
 
+// GI uses the opaque lit colour once, before fog/particles/water. There is no recursive colour feedback.
+static const char* kGiGeometryLib = R"GLSL(
+uniform mat4 uInvViewProj;
+uniform float uNdcXScale;
+uniform float uFlipY;
+vec3 giPosition(vec2 uv, float d) {
+    vec4 p = uInvViewProj * vec4((uv*2.0-1.0)*vec2(uNdcXScale,uFlipY), d*2.0-1.0, 1.0);
+    return p.xyz/p.w;
+}
+vec3 giNormal(ivec2 p, vec3 P) {
+    ivec2 l = max(p-ivec2(1,0),ivec2(0)), r = min(p+ivec2(1,0),uSize-1);
+    ivec2 b = max(p-ivec2(0,1),ivec2(0)), t = min(p+ivec2(0,1),uSize-1);
+    vec3 L = giPosition((vec2(l)+0.5)/vec2(uSize),fetchDepth(l));
+    vec3 R = giPosition((vec2(r)+0.5)/vec2(uSize),fetchDepth(r));
+    vec3 B = giPosition((vec2(b)+0.5)/vec2(uSize),fetchDepth(b));
+    vec3 T = giPosition((vec2(t)+0.5)/vec2(uSize),fetchDepth(t));
+    vec3 dx = dot(R-P,R-P)<dot(P-L,P-L) ? R-P : P-L;
+    vec3 dy = dot(T-P,T-P)<dot(P-B,P-B) ? T-P : P-B;
+    vec3 n = cross(dx,dy)*uFlipY;
+    return n/max(length(n),1e-6);
+}
+// One-sided normal for emitters: the hemisphere test tolerates silhouette error, and it costs half as much.
+vec3 giNormalFast(ivec2 p, vec3 P) {
+    vec3 R = giPosition((vec2(p+ivec2(1,0))+0.5)/vec2(uSize),fetchDepth(p+ivec2(1,0)));
+    vec3 T = giPosition((vec2(p+ivec2(0,1))+0.5)/vec2(uSize),fetchDepth(p+ivec2(0,1)));
+    vec3 n = cross(R-P,T-P)*uFlipY;
+    return n/max(length(n),1e-6);
+}
+const vec3 giLuma = vec3(0.2126,0.7152,0.0722);
+)GLSL";
+
+static const char* kGiGatherShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+void main() {
+    ivec2 p = min(ivec2(vUv*vec2(uSize)),uSize-1);
+    float d = fetchDepth(p);
+    oColor = vec4(0.0,0.0,0.0,d);
+    if (d>=0.99999) return;
+    vec2 uv = (vec2(p)+0.5)/vec2(uSize);
+    vec3 P = giPosition(uv,d), N = giNormal(p,P);
+    float z = linDepth(d);
+    // 140 units is about two Link heights. Project through the exact interpolated camera.
+    vec3 side = giPosition(uv+vec2(1.0/float(uSize.x),0.0),d)-P;
+    float radius = min(160.0,140.0/max(length(side),0.001));
+    vec3 sum = vec3(0.0);
+    // Fixed low discrepancy disk: temporal filtering never depends on changing RNG/game state.
+    float rotation = fract(dot(floor(gl_FragCoord.xy),vec2(0.75487766,0.56984029)))*6.2831853;
+    for (int i=0;i<16;++i) {
+        float a = float(i)*2.39996323+rotation;
+        float r = sqrt((float(i)+0.5)/16.0);
+        vec2 qUv = uv+vec2(cos(a),sin(a))*radius*r/vec2(uSize);
+        if (any(lessThan(qUv,vec2(0.0))) || any(greaterThanEqual(qUv,vec2(1.0)))) continue;
+        ivec2 q = ivec2(qUv*vec2(uSize));
+        float qd = fetchDepth(q);
+        if (qd>=0.99999) continue;
+        qUv = (vec2(q)+0.5)/vec2(uSize);
+        vec3 Q = giPosition(qUv,qd), V = Q-P;
+        float dist = length(V);
+        if (dist<2.0 || dist>140.0) continue;
+        vec3 dir = V/dist;
+        // Both surfaces must face the transfer. Coplanar floor samples contribute zero.
+        float receive = max(dot(N,dir)-0.035,0.0);
+        if (receive<=0.0) continue;
+        vec3 M = giNormalFast(q,Q);
+        float emit = max(dot(M,-dir),0.0);
+        // Reject an occluding surface along the segment rather than leaking through foreground edges.
+        vec2 midUv = mix(uv,qUv,0.5);
+        float midZ = linDepth(texture(uDepth,midUv).r);
+        float segmentZ = 2.0/(1.0/z+1.0/linDepth(qd));
+        if (midZ < segmentZ-max(3.0,dist*0.08)) continue;
+        float edge = smoothstep(0.0,0.035,min(min(qUv.x,qUv.y),min(1.0-qUv.x,1.0-qUv.y)));
+        float weight = receive*emit*pow(1.0-dist/140.0,2.0)*edge;
+        vec3 c = max(texelFetch(uScene,q,0).rgb,vec3(0.0));
+        // Luminance-preserving firefly limit, before gathering: retain coloured wall/grass hue.
+        c *= min(1.0,0.5/max(dot(c,giLuma),0.0001));
+        sum += c*weight;
+    }
+    oColor.rgb = sum*(28.0/16.0)*smoothstep(1.5,5.0,radius);
+}
+)GLSL";
+
+static const char* kGiFilterShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uGiRaw;
+uniform sampler2D uGiHistory;
+uniform mat4 uPreviousViewProj;
+uniform vec2 uPreviousScale;
+uniform int uHistoryValid;
+void main() {
+    ivec2 hs = textureSize(uGiRaw,0);
+    ivec2 p = min(ivec2(vUv*vec2(uSize)),uSize-1);
+    float d = fetchDepth(p);
+    oColor = vec4(0.0,0.0,0.0,d);
+    if (d>=0.99999) return;
+    float z = linDepth(d);
+    vec3 sum=vec3(0.0), lo=vec3(1e6), hi=vec3(0.0);
+    float ws=0.0;
+    ivec2 center = ivec2(gl_FragCoord.xy);
+    for (int y=-2;y<=2;++y) for (int x=-2;x<=2;++x) {
+        ivec2 q=clamp(center+ivec2(x,y),ivec2(0),hs-1);
+        vec4 g=texelFetch(uGiRaw,q,0);
+        float dz=(linDepth(g.a)-z)/max(2.0,z*0.015);
+        float w=exp(-dz*dz-float(x*x+y*y)*0.22);
+        sum+=g.rgb*w;ws+=w;
+        if (w>0.05) { lo=min(lo,g.rgb);hi=max(hi,g.rgb); }
+    }
+    vec3 current=sum/max(ws,0.0001);
+    vec3 P=giPosition((vec2(p)+0.5)/vec2(uSize),d);
+    vec4 clip=uPreviousViewProj*vec4(P,1.0);
+    vec3 ndc=clip.xyz/max(clip.w,0.0001);
+    vec2 prevUv=ndc.xy/uPreviousScale*0.5+0.5;
+    if (uHistoryValid!=0 && clip.w>0.0 && all(greaterThan(prevUv,vec2(0.0))) && all(lessThan(prevUv,vec2(1.0)))) {
+        vec4 old=texelFetch(uGiHistory,clamp(ivec2(prevUv*vec2(hs)),ivec2(0),hs-1),0);
+        float expected=linDepth(ndc.z*0.5+0.5);
+        float error=abs(linDepth(old.a)-expected);
+        float confidence=1.0-smoothstep(max(1.0,expected*0.002),max(3.0,expected*0.008),error);
+        // Clamp history to this frame's neighbourhood; moving actors and changing lights cannot leave long trails.
+        current=mix(current,clamp(old.rgb,lo,hi),0.6*confidence);
+    }
+    oColor.rgb=current;
+}
+)GLSL";
+
+static const char* kGiApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform sampler2D uGiHistory;
+uniform float uStrength;
+uniform float uDebug;
+void main() {
+    ivec2 p=ivec2(gl_FragCoord.xy);
+    vec4 scene=texelFetch(uScene,p,0);
+    float d=fetchDepth(p),z=linDepth(d);
+    // Additive pass (GL_ONE, GL_ONE): keeps MSAA samples intact and writes nothing on sky.
+    oColor=vec4(0.0);
+    if (d>=0.99999) return;
+    ivec2 hs=textureSize(uGiHistory,0);
+    vec2 hpos=vUv*vec2(hs)-0.5;
+    ivec2 base=ivec2(floor(hpos));vec2 f=fract(hpos);
+    vec3 sum=vec3(0.0);float ws=0.0;
+    for (int y=0;y<2;++y) for (int x=0;x<2;++x) {
+        ivec2 q=clamp(base+ivec2(x,y),ivec2(0),hs-1);
+        vec4 g=texelFetch(uGiHistory,q,0);
+        float dz=(linDepth(g.a)-z)/max(1.0,z*0.01);
+        float w=exp(-dz*dz)*mix(1.0-f.x,f.x,float(x))*mix(1.0-f.y,f.y,float(y));
+        sum+=g.rgb*w;ws+=w;
+    }
+    float Y=max(dot(scene.rgb,giLuma),0.0);
+    // Albedo is unavailable: bounded lit-colour proxy preserves receiver hue and extinguishes crushed blacks.
+    vec3 receiver=clamp(scene.rgb/max(Y,0.01),vec3(0.0),vec3(2.0));
+    vec3 bounce=sum/max(ws,0.0001)*mix(vec3(1.0),receiver,0.5)*uStrength;
+    bounce*=smoothstep(0.002,0.025,Y)*(1.0-smoothstep(0.35,1.1,Y));
+    bounce*=min(1.0,0.6*Y/max(dot(bounce,giLuma),0.00001));
+    oColor.rgb=bounce*uDebug;
+}
+)GLSL";
+
 static const char* kAoShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -2016,7 +2177,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
                           { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
-                          { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
+                          { "uGiRaw", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -2250,6 +2411,15 @@ bool PostFxGL::BuildPrograms() {
     mSkyEnvironment.id = BuildProgram("sky radiance cube", skyEnvironment, 5, mSkyEnvironment.uniforms);
     mCloudEnvironment.id = BuildProgram("cloud radiance cube", cloudEnvironment, 5, mCloudEnvironment.uniforms);
     mSkyConvolve.id = BuildProgram("sky diffuse convolution", convolve, 3, mSkyConvolve.uniforms);
+    const char* giGather[] = { kVersion, kDepthLib, kGiGeometryLib, kGiGatherShader };
+    const char* giFilter[] = { kVersion, kDepthLib, kGiGeometryLib, kGiFilterShader };
+    const char* giApply[] = { kVersion, kDepthLib, kGiGeometryLib, kGiApplyShader };
+    // Optional GI failures leave the existing rendering path available. Reuse dedicated 2D lanes 8..11;
+    // every sampler is assigned at link time and each lane starts with a complete transparent dummy.
+    for (int unit = 0; unit < 4; ++unit) Bind(unit, mFogNeutral);
+    mGiGather.id = BuildProgram("GI gather", giGather, 4, mGiGather.uniforms);
+    mGiFilter.id = BuildProgram("GI spatial temporal filter", giFilter, 4, mGiFilter.uniforms);
+    mGiApply.id = BuildProgram("GI bilateral composite", giApply, 4, mGiApply.uniforms);
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -2441,6 +2611,7 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 11) ? "ambient particles"
                                 : (stage == 12) ? "wet surfaces and rain shelter"
                                 : (stage == 13) ? "rain and snow"
+                                : (stage == 14) ? "screen-space GI"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -2905,6 +3076,10 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doShadow = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.shadowsOn && params.shadowEnabled != 0 &&
                           shadowPositions != nullptr && shadowVertexCount >= 3;
     const bool doAo = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && s.postFxOn && s.aoOn;
+    const bool doGi = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && s.postFxOn &&
+                      params.giEnabled && params.giStrength > 0.0f && params.shadowUseExactProj &&
+                      mGiGather.id && mGiFilter.id && mGiApply.id && s.debugView == 0 && s.shadowDebug == 0;
+    if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGi) mGiValid = false;
     const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END &&
                               (params.waterReflections != 0 || params.waterFoam > 0.0f ||
                                params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
@@ -2924,7 +3099,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
-    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather) {
+    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi) {
         return;
     }
 
@@ -2945,7 +3120,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather) {
+    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi) {
         PrepareDepth(fb);
     }
     if (doWater) {
@@ -2969,6 +3144,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(1);
         RunSceneEnd(fb, s);
         EndTimer(1);
+    }
+    if (doGi) {
+        BeginTimer(kGiTimerStage);
+        RunGlobalIllumination(params, fb, frameIndex);
+        EndTimer(kGiTimerStage);
     }
     if (doShafts) {
         BeginTimer(kShaftTimerStage);
@@ -3816,6 +3996,91 @@ void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const Framebuffer
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
     CheckError("sun shaft apply");
+}
+
+void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb,
+                                    uint32_t frameIndex) {
+    const int w = fb.width, h = fb.height;
+    const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+    bool valid = mGiValid && mGiFrame + 1 == frameIndex && mGiScene == params.giSceneId &&
+                 mGiSource.w == w && mGiSource.h == h && mGiNdcXScale == params.shadowNdcXScale &&
+                 mGiFlipY == params.shadowFlipY;
+    const float* inv = params.shadowInvViewProj;
+    float forward[3];
+    float length = 0.0f, movement = 0.0f, angle = 0.0f;
+    // Centre ray from the exact inverse projection, independent of the shadow/sun eligibility.
+    for (int i = 0; i < 3; ++i) {
+        forward[i] = (inv[8 + i] * 0.5f + inv[12 + i]) / (inv[11] * 0.5f + inv[15]) -
+                     inv[12 + i] / inv[15];
+        length += forward[i] * forward[i];
+        float delta = params.giCameraEye[i] - mGiEye[i];
+        movement += delta * delta;
+    }
+    length = std::sqrt(std::max(length, 1e-12f));
+    for (int i = 0; i < 3; ++i) {
+        forward[i] /= length;
+        angle += forward[i] * mGiForward[i];
+    }
+    valid = valid && movement < 60.0f * 60.0f && angle > 0.85f;
+    EnsureTarget(mGiSource, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    EnsureTarget(mGiRaw, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    for (auto& history : mGiHistory) {
+        EnsureTarget(history, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    }
+    if (!mUsable) {
+        mGiValid = false;
+        return;
+    }
+    // The AO apply pass leaves a multiplicative blend (and possibly a scissor) enabled.
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mGiSource.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mGiSource.tex);
+    Bind(1, mDepth.tex);
+    Bind(2, mGiRaw.tex);
+    Bind(3, mGiHistory[mGiRead].tex);
+    auto geometry = [&]() {
+        glUniform2i(Loc("uSize"), w, h);
+        glUniform1f(Loc("uNear"), params.zNear);
+        glUniform1f(Loc("uFar"), params.zFar);
+        glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+        glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+        glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    };
+    Use(mGiGather);
+    geometry();
+    Draw(mGiRaw);
+    const int write = 1 - mGiRead;
+    Use(mGiFilter);
+    geometry();
+    glUniformMatrix4fv(Loc("uPreviousViewProj"), 1, GL_FALSE, mGiViewProj);
+    glUniform2f(Loc("uPreviousScale"), mGiNdcXScale, mGiFlipY);
+    glUniform1i(Loc("uHistoryValid"), valid);
+    Draw(mGiHistory[write]);
+    Bind(3, mGiHistory[write].tex);
+    Use(mGiApply);
+    geometry();
+    glUniform1f(Loc("uStrength"), params.giStrength);
+    const float debug = static_cast<float>(CvInt("gNewDawn.GI.Debug", 0)); // 0 off, N: show only bounce * N
+    glUniform1f(Loc("uDebug"), debug > 0.0f ? debug : 1.0f);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, debug > 0.0f ? GL_ZERO : GL_ONE);
+    glBlendEquation(GL_FUNC_ADD);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    mGiRead = write;
+    mGiFrame = frameIndex;
+    mGiScene = params.giSceneId;
+    mGiNdcXScale = params.shadowNdcXScale;
+    mGiFlipY = params.shadowFlipY;
+    std::copy_n(params.shadowViewProj, 16, mGiViewProj);
+    std::copy_n(params.giCameraEye, 3, mGiEye);
+    std::copy_n(forward, 3, mGiForward);
+    mGiValid = true;
+    CheckError("screen-space GI");
 }
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
