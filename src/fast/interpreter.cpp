@@ -5041,7 +5041,7 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
-                                                         params.fogVolumetric != 0));
+                                                         params.fogVolumetric != 0 || params.giEnabled != 0));
         return false;
     }
 

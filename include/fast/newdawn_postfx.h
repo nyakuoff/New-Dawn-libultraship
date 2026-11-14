@@ -59,6 +59,11 @@ typedef struct NewDawnPostFxParams {
     float shadowViewProj[16];
     float shadowInvViewProj[16];
 
+    /* Screen-space diffuse bounce. Camera/scene are read-only history rejection inputs. */
+    int32_t giEnabled, giSceneId;
+    float giStrength;
+    float giCameraEye[3];
+
     /* New Dawn sun shafts: raymarched in-scattering through the shadow map. Only used when shadowEnabled is set. */
     int32_t shaftEnabled;
     float shaftStrength;     /* already multiplied by the sun-height and sun-colour fades */
