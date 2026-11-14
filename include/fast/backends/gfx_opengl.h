@@ -62,6 +62,8 @@ struct ShaderProgram {
     int materialTile = 0;
     GLint material_strength_location;
     GLint material_debug_location;
+    GLint material_parallax_location;
+    GLint material_eye_location;
     GLint material_mirror_location;
 };
 
