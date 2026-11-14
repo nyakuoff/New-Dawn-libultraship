@@ -174,6 +174,8 @@ class PostFxGL {
     bool BuildVfxProgram();
     bool BuildGrassProgram();
     void RunGrass(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void CaptureGrassGround(const FramebufferOGL& fb);
+    bool mGrassGroundReady = false; // the ground-only colour copy of this frame exists (taken before actors are drawn)
     Program mGrass;
     bool mGrassAttempted = false;
     GLuint mGrassAtlas = 0, mGrassVao = 0, mGrassVbo = 0;

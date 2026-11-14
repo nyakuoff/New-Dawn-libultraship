@@ -95,9 +95,9 @@ void main() {
     float r2 = rnd(seed), r3 = rnd(seed), r4 = rnd(seed), r5 = rnd(seed), r6 = rnd(seed);
     float comp = clamp(sqrt(uDensityNear / max(f, 0.05)), 1.0, 2.4); // sparser far field: bigger tufts keep coverage
     float pd = length(root.xz - uFocus.xz);
-    float lay = mix(0.4, 1.0, smoothstep(10.0, 55.0, pd)); // laid low around the player (render only)
+    float lay = mix(0.15, 1.0, smoothstep(16.0, 85.0, pd)); // laid low around the player (render only)
     float h = 11.0 * uHeight * (0.65 + 0.8 * r2) * (1.0 + 0.3 * (comp - 1.0)) * vis * lay;
-    float wd = 11.0 * sqrt(uHeight) * (0.95 + 0.4 * r3) * (1.0 + 0.35 * (comp - 1.0)) * vis * mix(0.8, 1.0, lay);
+    float wd = 11.0 * sqrt(uHeight) * (0.95 + 0.4 * r3) * (1.0 + 0.35 * (comp - 1.0)) * vis * mix(0.6, 1.0, lay);
 
     int id = gl_VertexID;
     int q = id / 12, r = id % 12, seg = r / 6, k = r % 6;
@@ -274,6 +274,17 @@ bool PostFxGL::BuildGrassProgram() {
     return true;
 }
 
+void PostFxGL::CaptureGrassGround(const FramebufferOGL& fb) {
+    const int w = fb.width, h = fb.height;
+    EnsureTarget(mGrassGround, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mGrassGround.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST); // resolves MSAA
+    mGrassGroundReady = true;
+}
+
 void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     if (!mGrassData || mGrassCount == 0 || !BuildGrassProgram())
         return;
@@ -382,12 +393,9 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
 
     // ---- GPU
     const int w = fb.width, h = fb.height;
-    EnsureTarget(mGrassGround, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
-    glDisable(GL_SCISSOR_TEST);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
-    glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mGrassGround.fbo);
-    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST); // resolves MSAA
+    if (!mGrassGroundReady)
+        CaptureGrassGround(fb); // no ground-end marker this frame: fall back to the finished scene
+    mGrassGroundReady = false;
 
     Use(mGrass);
     glActiveTexture(GL_TEXTURE0 + kGroundUnit);

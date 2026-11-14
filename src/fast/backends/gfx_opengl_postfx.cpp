@@ -3885,8 +3885,20 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    if (stage == NEWDAWN_POSTFX_STAGE_GROUND_END) {
+        // Ground-only colour for the grass: room geometry is in, actors (Link, NPCs, props) are not, so tufts rooted behind
+        // an actor never take its colours.
+        if (mHdrActive && params.grassEnabled && s.debugView == 0 && s.shadowDebug == 0) {
+            GlStateGuard groundGuard;
+            groundGuard.Neutralise();
+            CaptureGrassGround(fb);
+        }
+        return;
+    }
     const bool doGrass = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.grassEnabled && mGrassCount > 0 &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGrass)
+        mGrassGroundReady = false;
     const bool doCaustics = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterCaustics > 0.0f &&
                             params.waterBoxCount > 0 && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
                             s.shadowDebug == 0;
@@ -3926,6 +3938,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         // ordinary opaque geometry.
         BeginTimer(kGrassTimerStage);
         RunGrass(params, fb);
+        mGrassGroundReady = false;
         EndTimer(kGrassTimerStage);
     }
     if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal || doCaustics ||
