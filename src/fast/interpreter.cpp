@@ -1030,7 +1030,8 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 
 // ---- New Dawn VFX: native effect sprites are recognised by texture path, recorded in clip space and drawn again by the
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
-enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7 };
+enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7,
+       VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */ };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1045,6 +1046,8 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
     static const std::pair<std::string_view, uint8_t> kTable[] = {
         { "gEffFireTex", VFX_FLAME },
         { "gEffEnemyDeathFlame", VFX_FLAME },
+        { "gameplay_keep_Tex_01A8B0", VFX_CANDLE }, // gameplay_keep_DL_01ACF0: En_Light's small flame (Inn candles)
+        { "gameplay_keep_Tex_01AAB0", VFX_CANDLE },
         { "gameplay_keep_Tex_08FBE0", VFX_GLOW }, // Lights_DrawGlow: the hard-edged light disc
         { "gEffDust", VFX_DUST },
         { "gEffHitmarkDust", VFX_DUST },
@@ -2612,7 +2615,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
         if (cls != VFX_NONE) {
-            RecordVfxTriangle(v_arr, cls, frame);
+            const bool candle = cls == VFX_CANDLE;
+            RecordVfxTriangle(v_arr, candle ? (uint8_t)VFX_FLAME : cls, frame);
+            if (candle && mVfxLastTri == mVfxTriSerial) {
+                mVfxInst[mVfxInst.size() - NEWDAWN_VFX_FLOATS + 11] = 1.0f;
+            }
             if (mRapi->VfxReplacing()) {
                 return; // the renderer draws this effect as an HD sprite
             }

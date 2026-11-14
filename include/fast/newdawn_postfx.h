@@ -65,6 +65,10 @@ typedef struct NewDawnPostFxParams {
     float shadowFlipY;
     float shadowViewProj[16];
     float shadowInvViewProj[16];
+    /* Cascaded sun shadows: 1 = the single shadowRadius map, 2..4 = the map is split into that many tiles that cover
+       the view out to shadowDistance (view-axis distance in world units). */
+    int32_t shadowCascades;
+    float shadowDistance;
 
     /* Screen-space diffuse bounce. Camera/scene are read-only history rejection inputs. */
     int32_t giEnabled, giSceneId;
@@ -144,6 +148,5 @@ typedef struct NewDawnPostFxParams {
     float localLights[NEWDAWN_LOCAL_LIGHTS][4];      /* world position, game radius */
     float localColors[NEWDAWN_LOCAL_LIGHTS][3];      /* the light's own colour, 0..1 */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
-    int32_t localPlayerValid;
-    float localPlayer[3];    /* the player's position: a soft readability exemption from the darkening */
+    float localGain;         /* light intensity multiplier (interiors are lit harder) */
 } NewDawnPostFxParams;

@@ -1035,6 +1035,25 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
         }
     }
 
+#ifndef USE_OPENGLES
+    // New Dawn local lights: character-classified draws (the same classifier as the rim/specular) mark stencil 1 so the
+    // darkening pass can spare enemies, NPCs, Link and props. Only the HDR game framebuffer is marked.
+    const bool markStencil = HdrWorldActive() && mPostFx && mPostFx->LocalMarking() &&
+                             mPerPixelLightState.characterLight[3] > 0.0f &&
+                             mCurrentShaderProgram->per_pixel_character_location >= 0;
+    if (markStencil != mStencilMarkOn) {
+        mStencilMarkOn = markStencil;
+        if (markStencil) {
+            glEnable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        } else {
+            glDisable(GL_STENCIL_TEST);
+        }
+    }
+#endif
+
     if (mCurrentZmodeDecal != mLastZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
         if (mCurrentZmodeDecal) {
@@ -1729,6 +1748,10 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         mPostFx->SetVfxSprites(mVfxSprites, mVfxSpriteCount);
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
+        if (mStencilMarkOn) {
+            mStencilMarkOn = false; // the post pass leaves stencil testing off
+            glDisable(GL_STENCIL_TEST);
+        }
     }
     if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrGameFb >= 0)
         FinishWorld();

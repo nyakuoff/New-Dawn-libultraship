@@ -100,8 +100,23 @@ uniform vec3 uLightColors[8];
 float linearDepth(float d) {
     return 2.0*uNearFar.x*uNearFar.y / max(uNearFar.y+uNearFar.x-(2.0*d-1.0)*(uNearFar.y-uNearFar.x),0.001);
 }
+#ifdef CSM
+float csmTap(vec3 uvz) {
+    vec2 texel = 1.0/vec2(textureSize(uAtmosShadow,0));
+    float sum = 0.0;
+    for (int y=0;y<2;y++) for (int x=0;x<2;x++) {
+        float d = texture(uAtmosShadow,uvz.xy+(vec2(x,y)-0.5)*texel*2.0).r;
+        sum += float(uvz.z < d)*0.25;
+    }
+    return sum;
+}
+#endif
 float sunlight() {
     if (!uShadowReady) return 0.18;
+#ifdef CSM
+    float s = csmLit(vWorld, vec3(0.0), vViewZ, 0.0, 0.0005);
+    return s < 0.0 ? 0.0 : s;
+#endif
     vec4 clip = uLightViewProj*vec4(vWorld,1.0);
     vec3 p = clip.xyz/clip.w*0.5+0.5;
     if (any(lessThan(p,vec3(0.0))) || any(greaterThan(p,vec3(1.0)))) return 0.0;
@@ -212,12 +227,23 @@ bool PostFxGL::BuildAtmosProgram() {
     mAtmosAttempted = true;
     if (!BuildAtmosShader(mAtmos, kVertex, kFragment))
         return false;
+    auto samplers = [this]() {
+        glUniform1i(Loc("uAtmosSprite"), kSpriteUnit);
+        glUniform1i(Loc("uAtmosDepth"), kDepthUnit);
+        glUniform1i(Loc("uAtmosShadow"), kShadowUnit);
+        glUniform1i(Loc("uAtmosLeaf"), kLeafUnit);
+        glUniform1i(Loc("uAtmosBackground"), kBackgroundUnit);
+    };
     Use(mAtmos);
-    glUniform1i(Loc("uAtmosSprite"), kSpriteUnit);
-    glUniform1i(Loc("uAtmosDepth"), kDepthUnit);
-    glUniform1i(Loc("uAtmosShadow"), kShadowUnit);
-    glUniform1i(Loc("uAtmosLeaf"), kLeafUnit);
-    glUniform1i(Loc("uAtmosBackground"), kBackgroundUnit);
+    samplers();
+    // Cascaded sun shadows: the same shader with CSM defined (and the cascade library) after the #version line.
+    static const std::string kVersionLine = "#version 330 core\n";
+    const std::string csmFragment =
+        kVersionLine + "#define CSM 1\n" + kNewDawnCsmLib + (kFragment + kVersionLine.size());
+    if (BuildAtmosShader(mAtmosCsm, kVertex, csmFragment.c_str())) {
+        Use(mAtmosCsm);
+        samplers();
+    }
     int w, h, n;
     auto vars = Ship::Context::GetRawInstance()->GetConsoleVariables();
     auto assetPath = [](const char* path) {
@@ -279,7 +305,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
                         bool shadowReady) {
     if (!BuildAtmosProgram())
         return;
-    Use(mAtmos);
+    Use(shadowReady && mCsm.count > 1 && mAtmosCsm.id ? mAtmosCsm : mAtmos);
     GLuint background = mWaterOpaqueColor.tex;
     if (mWaterOpaqueFrame != mSettingsFrame || mWaterOpaqueColor.w != fb.width || mWaterOpaqueColor.h != fb.height) {
         // No water snapshot in this view: copy to a separate target, never sample the draw framebuffer.
@@ -309,6 +335,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glUniform2f(Loc("uSize"), fb.width, fb.height);
     glUniform2f(Loc("uNearFar"), p.zNear, p.zFar);
     glUniform1i(Loc("uShadowReady"), shadowReady);
+    SetCascadeUniforms();
     glUniform1i(Loc("uBiome"), p.atmosBiome);
     glUniform1f(Loc("uNight"), p.atmosNight);
     glUniform1f(Loc("uRain"), p.atmosRain);
