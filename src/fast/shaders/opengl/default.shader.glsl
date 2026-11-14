@@ -387,24 +387,32 @@
             // Depth reference: the texture's world size, capped so large sparse tiles do not get metre-deep relief.
             float worldSize = min(sqrt(0.5 * (g11 + g22)), 28.0);
             // Ray shift over the full depth range, bounded so grazing views cannot sweep across the tile.
+            // Ease the depth out toward grazing so silhouettes do not shear.
+            fade *= smoothstep(0.04, 0.4, vn);
             vec2 q = duv * (uMaterialParallax.x * fade * worldSize / max(vn, 0.25));
             float reach = max(abs(q.x), abs(q.y));
             q *= min(1.0, 0.06 / max(reach, 0.0001));
             reach = min(reach, 0.06);
-            // Layers per ray: enough that one layer shifts less than a joint/crack width (~1/128 UV).
-            float steps = clamp(reach * 640.0, 12.0, 48.0);
+            // Layers per ray: enough that one layer shifts less than a joint/crack width (~1/128 UV), and more
+            // at grazing angles (N.V) where the ray crosses the height field at a shallow slope.
+            float steps = clamp(max(reach * 640.0, mix(56.0, 14.0, vn)), 14.0, 64.0);
             float layer = 1.0 / steps;
             float depth = 0.0, prevDepth = 0.0;
             float surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * 0.5, dx, dy).g;
-            for (int i = 0; i < 48; ++i) {
+            for (int i = 0; i < 64; ++i) {
                 if (float(i) >= steps || depth >= surface) break;
                 prevDepth = depth;
                 depth += layer;
                 surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - depth), dx, dy).g;
             }
-            // Relief refinement: bisect the last layer so the hit is not quantised to the layer grid.
-            float lo = prevDepth, hi = depth;
-            for (int i = 0; i < 6; ++i) {
+            // Relief refinement: a linear (classic POM) estimate inside the last layer, then bisection around it,
+            // so the hit is not quantised to the layer grid.
+            float before = (1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - prevDepth), dx, dy).g) - prevDepth;
+            float after = surface - depth;
+            float lerpDepth = mix(depth, prevDepth, clamp(after / min(after - before, -0.000001), 0.0, 1.0));
+            float lo = max(prevDepth, lerpDepth - 0.25 * layer), hi = min(depth, lerpDepth + 0.25 * layer);
+            if (hi < lo) { lo = prevDepth; hi = depth; }
+            for (int i = 0; i < 5; ++i) {
                 float mid = 0.5 * (lo + hi);
                 float midSurface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - mid), dx, dy).g;
                 if (mid >= midSurface) hi = mid; else lo = mid;
@@ -436,7 +444,9 @@
         // Specular only: the diffuse term reuses the game's own per-pixel light model (see shadeNormal),
         // so material surfaces keep the scene's tone and only gain relief and highlights.
         vec3 materialSpecular(vec3 n, float roughness, float weight, bool hdrLit) {
-            vec3 v = -vViewPos / max(length(vViewPos), 0.0001);
+            // The eye in vViewPos's (world) space; -vViewPos only points at the world origin.
+            vec3 viewVec = uMaterialEye.w > 0.0 ? uMaterialEye.xyz - vViewPos : -vViewPos;
+            vec3 v = viewVec / max(length(viewVec), 0.0001);
             float nv = clamp(dot(n, v), 0.0, 1.0);
             // A BRDF has no response below either hemisphere. Clamping a negative N.V
             // positive instead produced bright grazing lobes on the game's authored normals.
@@ -722,7 +732,7 @@
                 if (uMaterialDebug == 1) texel.rgb = uHdrWorld ? specular : fromLinear(vec4(specular, 1.0)).rgb;
                 if (uMaterialDebug == 2) texel.rgb = vec3(materialRoughness);
                 if (uMaterialDebug == 3) {
-                    float nv = dot(materialN, normalize(-vViewPos));
+                    float nv = dot(materialN, normalize(uMaterialEye.w > 0.0 ? uMaterialEye.xyz - vViewPos : -vViewPos));
                     texel.rgb = nv > 0.0 ? vec3(0.0, nv, 0.0) : vec3(-nv, 0.0, 0.0);
                 }
             }
