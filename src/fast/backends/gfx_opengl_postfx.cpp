@@ -1999,8 +1999,9 @@ uniform float uSurfaceDetail;
 
 // March uniformly in screen space, interpolating reciprocal clip W for perspective-correct axial depth.
 // Stable deterministic steps: no temporal history, random jitter or feedback from the translucent world.
-vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) {
+vec4 traceReflection(vec3 origin, vec3 direction, float planeY, float roughness, out int status, out float hitDist) {
     status = 0; // 0: sky/miss, 1: accepted hit, 2: rejected candidate
+    hitDist = 0.0;
     if (direction.y <= 0.002) {
         status = 2;
         return vec4(0.0);
@@ -2070,15 +2071,23 @@ vec4 traceReflection(vec3 origin, vec3 direction, float planeY, out int status) 
             confidence *= 1.0 - smoothstep(thickness * 0.25, thickness, mismatch);
             confidence *= smoothstep(0.002, 0.06, direction.y);
             confidence *= 1.0 - smoothstep(0.75, 1.0, hi);
+            // Real water is not a mirror: the reflected image softens with the distance between the reflected point and
+            // the waterline (a rough surface integrates a cone of directions) and smears along the vertical, since wave
+            // slopes tilt the reflection mostly up and down the screen. Radius is in full-resolution pixels.
+            hitDist = length(hit - origin);
+            float angular = hitDist * roughness / max(depth, 1.0);
+            float radius = clamp(angular / max(uPixelAngle * 0.5, 1e-5), 0.65, 9.0);
             // Restyled water uses a subpixel gather. The legacy 2.5px gather is retained when Restyle is off.
+            radius = max(radius, mix(2.5, 0.65, uSurfaceDetail));
             vec3 color = texture(uOpaqueColor, uv).rgb;
             float weight = 1.0;
-            const vec2 taps[4] = vec2[4](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
-            for (int j = 0; j < 4; j++) {
-                float sharp = uSurfaceDetail;
-                vec2 tap = uv + taps[j] * mix(2.5, 0.65, sharp) / vec2(uSize);
+            const float golden = 2.39996323;
+            for (int j = 0; j < 12; j++) {
+                float a = float(j) * golden;
+                float r = sqrt((float(j) + 0.5) / 12.0);
+                vec2 tap = uv + vec2(cos(a), sin(a) * 1.8) * r * radius / vec2(uSize);
                 float td = linDepth(texture(uOpaqueDepth, tap).r);
-                float w = exp(-abs(td - depth) / thickness);
+                float w = exp(-abs(td - depth) / (thickness * 2.0)) * (1.0 - 0.5 * r);
                 color += texture(uOpaqueColor, tap).rgb * w;
                 weight += w;
             }
@@ -2127,6 +2136,19 @@ vec2 waterSlope(vec2 pos, float footprint) {
     s += 0.55 * f2 * noised(pos / wl2 + vec2(-0.043, 0.081) * uTime + 7.3).yz / wl2 * 9.0;
     return s;
 }
+
+#ifdef WATER_REFLECTIONS
+// Normal that bends the reflection: the glint slope plus two finer travelling octaves, each faded out as the pixel footprint
+// reaches its wavelength. This is what makes a reflected tower wobble and shear instead of staying a perfect copy.
+vec2 reflectionSlope(vec2 pos, float footprint) {
+    float f3 = 1.0 - smoothstep(0.12, 0.5, footprint / 17.0);
+    float f4 = 1.0 - smoothstep(0.12, 0.5, footprint / 6.5);
+    vec2 s = waterSlope(pos, footprint) * 0.6;
+    s += 0.9 * f3 * noised(pos / 17.0 + vec2(0.17, -0.11) * uTime + 3.7).yz / 17.0 * 2.6;
+    s += 0.6 * f4 * noised(pos / 6.5 + vec2(-0.31, 0.23) * uTime + 11.9).yz / 6.5 * 1.1;
+    return s;
+}
+#endif
 
 void main() {
 #ifdef WATER_REFLECTIONS
@@ -2187,11 +2209,16 @@ void main() {
     vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
 #ifdef WATER_REFLECTIONS
     // A filtered, gently distorted reflection normal; retain the original glint slope separately.
-    vec3 reflectionNormal = normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25));
+    vec2 reflSlope = reflectionSlope(H.xz, footprint);
+    vec3 reflectionNormal = normalize(vec3(-reflSlope.x, 1.0, -reflSlope.y));
     int hitStatus;
+    float hitDist;
+    // Wave steepness roughens the reflection further.
+    float roughness = 0.012 + 0.12 * length(reflSlope);
     // Use the exact plane even when a water mesh's own depth was accepted within the mask's 1.5-unit tolerance.
     vec3 reflectionH = uEye + ray * ((uBoxY[bi] - uEye.y) / ray.y);
-    vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], hitStatus);
+    vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], roughness,
+                               hitStatus, hitDist);
     if (uDebug == 2) {
         oColor = vec4(hitStatus == 1 ? vec3(0.0, 1.0, 0.0) :
                       (hitStatus == 2 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0)), 1.0);
@@ -2201,12 +2228,18 @@ void main() {
     // erased dark reflected objects. Lift the Fresnel response perceptually while retaining its view-angle falloff.
     if (uSkyReflectionsEnabled) {
         vec3 R = reflect(-V, reflectionNormal);
-        vec3 environment = textureLod(uSkySpecular, R, 0.4 + clamp(footprint * 0.02, 0.0, 1.1)).rgb;
+        R.y = max(R.y, 0.02);
+        vec3 environment = textureLod(uSkySpecular, normalize(R), 0.8 + clamp(footprint * 0.02, 0.0, 1.1) + roughness * 6.0).rgb;
         // Retain the established perceptual visibility for confident geometry hits. The cube uses
         // physical water Schlick (F0=0.02), so a miss cannot increase reflection strength or wash out
         // mid-angle turquoise. Confidence crossfades the two premultiplied contributions.
-        float ssrWeight = uReflectionStrength * sqrt(fres) * shore * hit.a;
-        float skyWeight = 0.4 * uReflectionStrength * fres * shore * (1.0-hit.a);
+        // Imperfect on purpose (a mirror reads as fake): Fresnel is the physical F raised to 0.62 rather than the old square
+        // root, so steep views reflect clearly less; the reflection never reaches full opacity, thins with the distance the
+        // light travelled, and breaks up slightly where the surface is rougher.
+        float breakup = 1.0 - 0.3 * smoothstep(0.35, 0.85, 0.5 + 0.5 * noised(H.xz / 23.0 + vec2(0.05, 0.04) * uTime).x * 1.4);
+        float travel = 1.0 - 0.45 * smoothstep(200.0, 3500.0, hitDist);
+        float ssrWeight = uReflectionStrength * min(pow(fres, 0.62), 0.85) * shore * hit.a * breakup * travel;
+        float skyWeight = 0.4 * uReflectionStrength * fres * shore * (1.0-hit.a) * breakup;
         float weight = ssrWeight + skyWeight;
         vec3 glints = max(add - refl * 0.6 * uStrength * shore, vec3(0.0));
         oColor = vec4(environment * skyWeight + hit.rgb * ssrWeight + glints * (1.0-weight), weight);
@@ -3897,7 +3930,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                               (params.waterReflections != 0 || params.waterFoam > 0.0f ||
                                params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
-    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
+    // The water surface runs before the soft-sprite effects (NEWDAWN_POSTFX_STAGE_WATER_XLU) so splashes and ripples draw above it
+    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
     const bool doWeather = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosWeather &&
                            params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
@@ -3975,7 +4009,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         RunUnderwater(params, fb);
         EndTimer(kUnderwaterTimerStage);
     }
-    if (doWater && !(doUnderwater && params.waterUnderwaterState >= 1.0f)) {
+    // Fully submerged cameras use the underwater pass (scene end) instead of the surface
+    if (doWater && !(params.waterUnderwater > 0.0f && params.waterUnderwaterState >= 1.0f && mUnderwater.id)) {
         BeginTimer(kWaterTimerStage);
         RunWaterSurface(params, fb);
         if (params.waterStrength > 0.0f || params.waterReflections != 0) {
