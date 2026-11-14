@@ -138,7 +138,7 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         // Parallax: depth is a fraction of the texture's world size; fades out by the distance cvar (game units).
         const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         const float parallax = cvars->GetInteger("gNewDawn.Materials.Parallax", 0) != 0
-                                   ? std::clamp(cvars->GetFloat("gNewDawn.Materials.ParallaxScale", 0.04f), 0.0f, 0.2f)
+                                   ? std::clamp(cvars->GetFloat("gNewDawn.Materials.ParallaxScale", 0.07f), 0.0f, 0.2f)
                                    : 0.0f;
         glUniform2f(mCurrentShaderProgram->material_parallax_location, parallax,
                     std::clamp(cvars->GetFloat("gNewDawn.Materials.ParallaxDistance", 700.0f), 100.0f, 4000.0f));

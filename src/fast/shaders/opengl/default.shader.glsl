@@ -387,15 +387,23 @@
             // Depth reference: the texture's world size, capped so large sparse tiles do not get metre-deep relief.
             float worldSize = min(sqrt(0.5 * (g11 + g22)), 28.0);
             // Ray shift over the full depth range, bounded so grazing views cannot sweep across the tile.
-            // Ease the depth out toward grazing so silhouettes do not shear.
-            fade *= smoothstep(0.04, 0.4, vn);
+            // Skip texels the sampler is already minifying: relief below a few texels per pixel only shimmers.
+            vec2 heightSize = vec2(textureSize(uMaterialRoughness, 0));
+            vec2 footX = dx * heightSize, footY = dy * heightSize;
+            float lod = 0.5 * log2(max(max(dot(footX, footX), dot(footY, footY)), 1.0));
+            fade *= 1.0 - smoothstep(1.5, 3.5, lod);
+            // Ease the depth out only at very grazing angles, where the shift would shear silhouettes.
+            fade *= smoothstep(0.08, 0.36, vn);
+            if (fade <= 0.001) return uv;
             vec2 q = duv * (uMaterialParallax.x * fade * worldSize / max(vn, 0.25));
             float reach = max(abs(q.x), abs(q.y));
-            q *= min(1.0, 0.06 / max(reach, 0.0001));
-            reach = min(reach, 0.06);
+            q *= min(1.0, 0.09 / max(reach, 0.0001));
+            reach = min(reach, 0.09);
             // Layers per ray: enough that one layer shifts less than a joint/crack width (~1/128 UV), and more
             // at grazing angles (N.V) where the ray crosses the height field at a shallow slope.
             float steps = clamp(max(reach * 640.0, mix(56.0, 14.0, vn)), 14.0, 64.0);
+            // Spend layers where they are seen: fewer with distance.
+            steps = max(mix(steps, 12.0, smoothstep(180.0, 520.0, dist)), 12.0);
             float layer = 1.0 / steps;
             float depth = 0.0, prevDepth = 0.0;
             float surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * 0.5, dx, dy).g;
