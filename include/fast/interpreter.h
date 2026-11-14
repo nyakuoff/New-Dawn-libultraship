@@ -316,6 +316,7 @@ struct RDP {
         bool blended;
         uint8_t vfxClass; // New Dawn VFX: classification of the loaded texture's path (0 = none)
         uint16_t grassId; // New Dawn grass: 1 + index into the grass texture table (0 = not grass)
+        bool swayPlant;   // New Dawn wind: a plant cut-out texture (only meaningful inside a room wind scope)
     } loaded_texture[2];
     struct {
         uint8_t fmt;
@@ -478,6 +479,7 @@ class Interpreter {
     void SubmitVfx();
     void BeginGrassRecording(bool enabled);
     uint16_t GrassClassify(std::string_view path);
+    bool SwayClassify(std::string_view path);
     void RecordGrassTriangle(const LoadedVertex* const v[3]);
     void SubmitGrass();
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
@@ -664,6 +666,7 @@ class Interpreter {
     float mWindT = 0.0f;
     NewDawnWindState mWindState = {};
     bool mWindSway = false; // inside a New Dawn wind scope (room or foliage actor), render-only sway
+    bool mWindRoom = false; // the scope is room geometry: only plant cut-out textures sway there
     uint32_t mShadowSerial = 0;
     size_t mShadowFoliageFloats = 0;
     std::unordered_map<uint32_t, std::vector<float>> mShadowFoliageByTex;

@@ -9,6 +9,7 @@
 #define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
 #define NEWDAWN_POSTFX_STAGE_WIND_END 12
+#define NEWDAWN_POSTFX_WIND_ROOM_SHIFT 8 /* bit of the WIND_BEGIN command word: room geometry (sways plant textures only) */
 #define NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN 9 /* native rain draw scope, updates/RNG still run */
 #define NEWDAWN_POSTFX_STAGE_WEATHER_END 10
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN 7 /* native sun flare draw scope; environment updates still run */
