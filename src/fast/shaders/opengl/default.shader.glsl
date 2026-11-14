@@ -157,6 +157,9 @@
             float y = dot(baseline,vec3(0.2126,0.7152,0.0722));
             return texture(uSkyIrradiance,N).rgb*y;
         }
+        uniform bool uSkyReflectionsEnabled;
+        uniform samplerCube uSkySpecular;
+        uniform vec3 uSkyEye;
 
 #endif
 
@@ -228,10 +231,12 @@
         // 0 for room meshes, the HUD and everything while the feature is off.
         uniform vec4 uCharLight;
 
-        // Additive linear radiance for lit actor draws: a Fresnel rim (sky behind the subject, the scene's
-        // own light colours indoors, sun when backlit) and a bounded specular from the same lights. Both are
-        // tied to the albedo so dark texels stay dark, and skin-like hues get no specular.
-        vec3 newDawnCharacter(vec3 albedoLin, vec3 albedoGamma, vec3 shadeNormal) {
+        // Additive linear radiance for lit actor draws: a soft Fresnel rim (sky behind the subject, the scene's own
+        // light colours indoors, sun when backlit) and a bounded specular from the same lights. Actor meshes are
+        // low-poly, so the rim, the wrap and everything that is not metal read from a softened normal and broad lobes
+        // (no facet edges); only bright neutral (metal) texels get a crisp highlight, tinted by their own albedo, plus a
+        // reflection of the sky. Both terms are tied to the albedo so dark texels stay dark, and skin hues get no specular.
+        vec3 newDawnCharacter(vec3 albedoLin, vec3 albedoGamma, vec3 shadeNormal, vec3 irradiance) {
             vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
             mat3 cof = mat3(cross(uViewMatrix[1], uViewMatrix[2]),
                             cross(uViewMatrix[2], uViewMatrix[0]),
@@ -243,8 +248,6 @@
             float vl = length(v);
             if (vl < 1.0) return vec3(0.0);
             v /= vl;
-            float nv = clamp(dot(wn, v), 0.0, 1.0);
-            float fres = pow(1.0 - nv, 2.0);
 
             // Material class from the albedo alone (render state has no material id): bright neutral texels read as
             // metal, skin hues stay matte, saturated cloth gets only a faint broad sheen.
@@ -252,21 +255,32 @@
             float mn = min(albedoGamma.r, min(albedoGamma.g, albedoGamma.b));
             float sat = (mx - mn) / max(mx, 0.001);
             float luma = dot(albedoGamma, vec3(0.2126, 0.7152, 0.0722));
-            float metal = (1.0 - smoothstep(0.12, 0.36, sat)) * smoothstep(0.32, 0.65, luma);
+            float metal = (1.0 - smoothstep(0.20, 0.46, sat)) * smoothstep(0.22, 0.50, luma) *
+                          (1.0 - smoothstep(0.70, 0.86, luma)); // near-white (cloth, eyes, socks) is not metal
             float skin = step(albedoGamma.g, albedoGamma.r) * step(albedoGamma.b, albedoGamma.g) *
                          smoothstep(0.10, 0.20, sat) * (1.0 - smoothstep(0.55, 0.75, sat)) *
                          smoothstep(0.22, 0.38, luma);
             float specWeight = mix(0.07 * (1.0 - skin), 1.0, metal);
-            float rough = mix(0.62, 0.30, metal);
+
+            // The broad terms read from a normal pulled toward the view: facet borders of the low-poly meshes merge
+            // into a smooth gradient. Metal keeps the real normal so its highlight stays crisp.
+            vec3 wnSoft = normalize(wn + 0.5 * v);
+            vec3 ns = normalize(mix(wnSoft, wn, metal));
+            float nv = clamp(dot(ns, v), 0.0, 1.0);
+            // 0 facing the camera, 1 at the silhouette (0.447 is the soft normal's N.V there): a wide, low-contrast rim.
+            float fres = pow(clamp((1.0 - dot(wnSoft, v)) / 0.553, 0.0, 1.0), 1.5);
+
+            float rough = mix(0.72, 0.24, metal);
             float a2 = pow(rough, 4.0);
-            float f0 = mix(0.04, 0.5, metal);
+            // Metal reflects with its own colour: F0 is the albedo's hue pushed to full saturation, not a grey.
+            vec3 f0 = mix(vec3(0.04), 0.92 * pow(albedoGamma / max(mx, 0.001), vec3(3.0)), metal);
 
             vec3 ambient = (uLightAmbient / 255.0) * uHdrAmbient;
             vec3 rimBase = ambient;
 #ifndef GL_ES
-            if (uSkyAmbientEnabled) rimBase = skyAmbientColor(ambient, reflect(-v, wn));
+            if (uSkyAmbientEnabled) rimBase = skyAmbientColor(ambient, reflect(-v, wnSoft));
 #endif
-            vec3 rim = rimBase * 5.5 * fres;
+            vec3 rim = rimBase * 3.4 * fres;
             vec3 spec = vec3(0.0);
             for (int i = 0; i < uLightCount; ++i) {
                 vec3 l;
@@ -278,32 +292,46 @@
                     float d2 = max(dot(delta.xy, delta.xy) + 2.0 * delta.z * delta.z, 0.000001);
                     float distf = mix(floor(sqrt(d2)), sqrt(d2), uPointLightQuality);
                     radiance /= 1.0 + (distf * uLightAtten[i].x * 2.0 + distf * distf * uLightAtten[i].y / 8.0) / 65535.0;
+                    radiance *= mix(0.5, 1.0, metal); // point-light glints on faceted cloth and skin read as noise
                 } else {
                     l = normalize(uViewMatrix * uLightDir[i]);
                     radiance *= uHdrSun;
                 }
-                float nl = dot(wn, l);
+                float nl = dot(ns, l);
                 // Light from behind the subject, seen from the camera, wraps around the silhouette.
                 float back = smoothstep(-0.1, 0.7, -dot(v, l));
-                rim += radiance * fres * back * clamp(nl + 0.3, 0.0, 1.0) * 2.6;
+                rim += radiance * fres * back * clamp((nl + 0.6) / 1.6, 0.0, 1.0) * 2.2;
                 if (nl <= 0.0 || nv <= 0.0) continue;
                 vec3 h = normalize(v + l);
-                float nh = max(dot(wn, h), 0.0);
+                float nh = max(dot(ns, h), 0.0);
                 float vh = clamp(dot(v, h), 0.0, 1.0);
                 float denom = nh * nh * (a2 - 1.0) + 1.0;
                 float d = a2 / max(denom * denom, 0.00001);
+                // Metal: a crisp core plus a broad lobe, so a curved shield shows a highlight gradient, not just a pinpoint.
+                float denomB = nh * nh * (0.0625 - 1.0) + 1.0;
+                d = mix(d, 0.6 * d + 0.4 * 0.0625 / max(denomB * denomB, 0.00001), metal);
                 float gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);
                 float gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);
                 float vis = 0.5 / max(gv + gl, 0.00001);
-                float fr = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
-                spec += radiance * (fr * d * vis * nl);
+                vec3 fr = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+                spec += radiance * fr * (d * vis * nl);
             }
+#ifndef GL_ES
+            // Metal also mirrors the sky (the same prefiltered cube the material maps use), tinted by F0.
+            if (uSkyReflectionsEnabled && metal > 0.0) {
+                float nvm = clamp(dot(wn, v), 0.0, 1.0);
+                vec3 env = textureLod(uSkySpecular, reflect(-v, wn), rough * 4.0).rgb;
+                spec += env * (f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - nvm, 5.0)) * metal * 10.0; // the sky cube holds radiance well below sunlit surfaces; lift it so metal reads as reflective
+            }
+#endif
             // The specular is bounded per channel by the lit albedo, so a black or dark texel cannot be lifted.
-            vec3 budget = albedoLin * (0.03 + 0.9 * metal);
+            vec3 budget = albedoLin * (0.03 + 4.5 * metal) + vec3(0.02 * metal);
             spec *= specWeight;
             spec = budget * spec / max(budget + spec, vec3(0.000001));
             // Characters are read at close range; far-away large props drawn as actors fade out (Link is ~60 units).
-            return (albedoLin * rim + spec) * uCharLight.w * (1.0 - smoothstep(400.0, 800.0, vl));
+            // A metal has no diffuse of its own to speak of: dim it so the highlight and sky reflection carry the look.
+            vec3 diffuseLoss = albedoLin * irradiance * (0.5 * metal);
+            return (albedoLin * rim + spec - diffuseLoss) * uCharLight.w * (1.0 - smoothstep(400.0, 800.0, vl));
         }
     @end
 
@@ -313,12 +341,6 @@
         uniform float uMaterialStrength;
         uniform int uMaterialDebug; // 1: specular only, 2: roughness, 3: N.V sign, 4: diffuse only
         uniform vec2 uMaterialMirror;
-#ifndef GL_ES
-        uniform bool uSkyReflectionsEnabled;
-        uniform samplerCube uSkySpecular;
-        uniform vec3 uSkyEye;
-#endif
-
         // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
         // +Y-up normals (texture rows increase down). Keeping the signed determinant handles
         // mirrored islands; repeat/mirror sampling and tile clamp match the albedo sampler.
@@ -711,12 +733,13 @@
             @if(o_per_pixel_lighting)
                 if (hdrDiffuse) {
                     vec3 albedoLin = texel.rgb;
-                    texel.rgb *= newDawnIrradiance(shadeNormal);
+                    vec3 charIrradiance = newDawnIrradiance(shadeNormal);
+                    texel.rgb *= charIrradiance;
                     bool characterLit = uCharLight.w > 0.0;
                     @if(o_material_maps)
                         characterLit = characterLit && !materialDiffuse;
                     @end
-                    if (characterLit) texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal);
+                    if (characterLit) texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal, charIrradiance);
                 }
             @end
         }
