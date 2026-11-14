@@ -381,10 +381,13 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glUniform1f(Loc("uTime"), static_cast<float>(std::fmod(seconds, 3600.0)));
 
     std::vector<float> flames, glows, puffs;
+    mFlameLights.clear();
     for (uint32_t i = 0; i < mVfxCount; ++i) {
         const float* f = mVfxData + (size_t)i * NEWDAWN_VFX_FLOATS;
-        if (f[0] == 1.0f)
+        if (f[0] == 1.0f) {
             flames.insert(flames.end(), f, f + NEWDAWN_VFX_FLOATS);
+            mFlameLights.insert(mFlameLights.end(), f, f + NEWDAWN_VFX_FLOATS); // local lights read these next frame
+        }
         else if (f[0] == 2.0f)
             glows.insert(glows.end(), f, f + NEWDAWN_VFX_FLOATS);
         else if (f[0] >= 3.0f)
