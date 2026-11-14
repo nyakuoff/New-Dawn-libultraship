@@ -6,6 +6,10 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
+#define NEWDAWN_POSTFX_STAGE_WIND_END 12
+#define NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN 9 /* native rain draw scope, updates/RNG still run */
+#define NEWDAWN_POSTFX_STAGE_WEATHER_END 10
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN 7 /* native sun flare draw scope; environment updates still run */
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_END 8
 #define NEWDAWN_POSTFX_STAGE_SKY_BEGIN 4 /* explicit skybox colour calibration */
@@ -72,6 +76,16 @@ typedef struct NewDawnPostFxParams {
     float fogPointPosRadius[NEWDAWN_FOG_POINT_LIGHTS][4];
     float fogPointColor[NEWDAWN_FOG_POINT_LIGHTS][3];
 
+    /* Render-only ambient particles. Scene and lights are read-only snapshots. */
+#define NEWDAWN_ATMOS_LIGHTS 8
+    int32_t atmosBiome, atmosScene, atmosParticles, atmosWeather;
+    float atmosSnow;
+    float atmosNight, atmosRain;
+    float atmosEye[3], atmosSunColor[3], atmosSkyColor[3];
+    int32_t atmosLightCount;
+    float atmosLights[NEWDAWN_ATMOS_LIGHTS][4]; /* position, radius */
+    float atmosLightColors[NEWDAWN_ATMOS_LIGHTS][3];
+
     /* New Dawn water: glints and Fresnel over the scene's water planes, applied at the scene-end marker. */
 #define NEWDAWN_MAX_WATER_BOXES 16
     int32_t waterEnabled;
@@ -92,4 +106,15 @@ typedef struct NewDawnPostFxParams {
     float waterRestyle;           /* 0..1: replace the painted water colour with the absorption/scattering model */
     float waterScatter[3];        /* linear in-scatter colour of deep water (lit by the scene's light) */
     float waterAbsorb[3];         /* per-channel absorption coefficient, 1/world units */
+    /* New Dawn art-directed grade, applied in display space after the base grade at the scene-end marker. The game
+       computes the final (time-of-day interpolated, scene cross-faded, strength-scaled) look; 0 = skipped entirely. */
+    int32_t artEnabled;
+    float artSlope[3];      /* per-channel gain (warmth/tint folded in) */
+    float artOffset;        /* black lift, added before the power */
+    float artPower;         /* gamma exponent (>1 darkens mid-tones) */
+    float artContrast;      /* extra S-curve, 0 = none */
+    float artSat;           /* overall saturation multiplier */
+    float artShadowTint[3]; /* added, weighted towards the shadows */
+    float artHighTint[3];   /* added, weighted towards the highlights */
+    float artGreen[2];      /* green hue range: shift towards yellow (+) or teal (-), saturation multiplier */
 } NewDawnPostFxParams;

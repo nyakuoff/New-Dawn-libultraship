@@ -1009,7 +1009,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 #ifndef USE_OPENGLES
     // Replace the tagged native sun sprites/wash with the HDR diffraction pass. Native environment
     // updates still execute; LDR and runtime HDR fallback frames retain the original draws.
-    if (mSunFlare && HdrWorldActive())
+    if ((mSunFlare || mNativeWeatherScope) && HdrWorldActive())
         return;
 #endif
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
@@ -1616,11 +1616,16 @@ void GfxRenderingAPIOGL::FinishWorld() {
     mHdrGameFb = -1;
     mHdrSky = false;
     mSunFlare = false;
+    mNativeWeatherScope = false;
 #endif
 }
 
 void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params, int gameFbId) {
 #ifndef USE_OPENGLES
+    if (stage == NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN || stage == NEWDAWN_POSTFX_STAGE_WEATHER_END) {
+        mNativeWeatherScope = stage == NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN && mPostFx && mPostFx->WeatherActive();
+        return;
+    }
     if (stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN || stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_END) {
         const bool begin = stage == NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN;
         mSunFlare = begin &&
@@ -1636,6 +1641,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
     if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
         mHdrSky = false;
         mSunFlare = false;
+    mNativeWeatherScope = false;
         if (mPostFx && mPostFx->BeginHdr(mFrameBuffers[gameFbId])) {
             mHdrGameFb = gameFbId;
         }

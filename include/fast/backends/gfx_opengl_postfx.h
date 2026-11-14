@@ -41,6 +41,8 @@ class PostFxGL {
     bool HdrActive() const {
         return mHdrActive;
     }
+    bool WeatherReady() const { return mWeatherParticles.id && mWeatherWet.id; }
+    bool WeatherActive() const { return mWeatherFrameReady; }
     bool SkyAmbientActive() const {
         return mHdrActive && mSkyAmbientReady;
     }
@@ -91,6 +93,26 @@ class PostFxGL {
     void SetSkyUniforms(const NewDawnPostFxParams& params);
     void RunSkyAmbient(const NewDawnPostFxParams& params);
     bool BuildPrograms();
+    bool BuildAtmosProgram();
+    bool BuildAtmosShader(Program& program, const char* vertex, const char* fragment);
+    bool BuildWeatherPrograms();
+    void RunWeather(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* roofMatrix,
+                    const float* positions, uint32_t vertexCount);
+    void RunWeatherParticles(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    float mWeatherTime = 0.0f, mWeatherRoofMatrix[16] = {};
+    bool mWeatherAttempted = false, mWeatherFrameReady = false;
+    Program mWeatherParticles, mWeatherWet;
+    Target mWeatherRoof;
+    GLuint mWeatherRing = 0, mWeatherNeutralCube = 0;
+    float mWeatherWetness = 0.0f;
+    int mWeatherScene = -1;
+    double mWeatherLastTime = 0.0;
+    uint32_t mWeatherLastFrame = UINT32_MAX;
+    void RunAtmos(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float* lightMatrix,
+                  bool shadowReady);
+    Program mAtmos;
+    bool mAtmosAttempted = false;
+    GLuint mAtmosSprite = 0, mAtmosLeaf = 0, mAtmosNeutralDepth = 0;
     void EnsureTarget(Target& t, int w, int h, GLint internalFormat, GLenum format, GLenum type, bool depthStencil,
                       bool linear);
     void PrepareDepth(const FramebufferOGL& fb);
@@ -116,6 +138,12 @@ class PostFxGL {
     bool mUsable = false;
     bool mStats = false; // copy of mSettings.stats for the helpers
     uint32_t mSettingsFrame = UINT32_MAX;
+    // Art-directed grade of the current frame, copied from the scene-end marker's params.
+    struct ArtGrade {
+        bool on = false;
+        float slope[3] = { 1, 1, 1 }, offset = 0, power = 1, contrast = 0, sat = 1;
+        float shadow[3] = {}, high[3] = {}, green[2] = { 0, 1 };
+    } mArt;
     Settings mSettings{};
     uint32_t mStatsW = 0, mStatsH = 0, mStatsMsaa = 0;
 
@@ -182,7 +210,7 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 11;
+    static constexpr int kQueryStages = 14;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;
     static constexpr int kSkyTimerStage = 6;

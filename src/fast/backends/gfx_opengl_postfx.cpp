@@ -1,6 +1,7 @@
 #if defined(ENABLE_OPENGL) && !defined(USE_OPENGLES)
 
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_wind.h"
 
 #include <algorithm>
 #include <cmath>
@@ -747,6 +748,16 @@ const int uHdr = 0;
 #endif
 uniform float uExposure;
 uniform int uDither;
+// Art-directed grade (game-side look, already interpolated over time of day and scene changes); skipped when off.
+uniform int uArtOn;
+uniform vec3 uArtSlope;
+uniform float uArtOffset;
+uniform float uArtPower;
+uniform float uArtContrast;
+uniform float uArtSat;
+uniform vec3 uArtShadow;
+uniform vec3 uArtHigh;
+uniform vec2 uArtGreen;
 
 float ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
@@ -790,6 +801,25 @@ void main() {
         c = c + (uContrast - 1.0) * 2.0 * (s - c);
         float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
         c = mix(vec3(l), c, uSaturation);
+    }
+    if (uArtOn != 0) {
+        const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+        // Green hue range: foliage greens drift towards yellow (+) or teal (-) and get their own saturation.
+        float gw = smoothstep(0.0, 0.15, c.g - max(c.r, c.b));
+        if (uArtGreen.x >= 0.0) c.r = mix(c.r, c.g, gw * uArtGreen.x);
+        else c.b = mix(c.b, c.g, -gw * uArtGreen.x);
+        float gl = dot(c, lw);
+        c = mix(vec3(gl), c, 1.0 + gw * (uArtGreen.y - 1.0));
+        // Slope / offset / power, then an S-curve, split tone and global saturation (all in display space).
+        c = pow(max(c * uArtSlope + uArtOffset, vec3(0.0)), vec3(uArtPower));
+        // Keep the contrast curve monotonic when slope/saturation put a channel above display white.
+        vec3 cc = clamp(c, 0.0, 1.0);
+        vec3 sc = cc * cc * (3.0 - 2.0 * cc);
+        c += 2.0 * uArtContrast * (sc - cc);
+        float al = dot(c, lw);
+        c += uArtShadow * (1.0 - smoothstep(0.0, 0.5, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
+        al = dot(c, lw);
+        c = mix(vec3(al), c, uArtSat);
     }
     // Dither before the 8 bit quantisation. +-half a step leaves unchanged pixels (and pure black) exactly as they were.
     #ifndef NO_DITHER
@@ -2408,6 +2438,9 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 7) ? "volumetric clouds"
                                 : (stage == 9) ? "volumetric fog"
                                 : (stage == 10) ? "textured sun flare"
+                                : (stage == 11) ? "ambient particles"
+                                : (stage == 12) ? "wet surfaces and rain shelter"
+                                : (stage == 13) ? "rain and snow"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -2436,6 +2469,7 @@ void PostFxGL::RestoreColor(const FramebufferOGL& fb) {
 }
 
 bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
+    mWeatherFrameReady = false;
     // Eligibility must be re-established by this frame's physical-sky marker. Never reuse a previous
     // outdoor frame's illumination in interiors, scripted/final-day skies, pause backgrounds or HDR fallbacks.
     mSkyAmbientReady = false;
@@ -2518,12 +2552,14 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
     glUniform1f(Loc("uCoverage"),
                 std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast));
-    // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
+    // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
-    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(seconds * 0.018, 1024.0)),
-                static_cast<float>(std::fmod(seconds * 0.009, 1024.0)));
+    // Density samples world + offset, so negative travel advects clouds along the positive foliage/particle wind.
+    const double drift = CvInt("gNewDawn.Atmos.Wind", 0) ? -NewDawnWindTravel(NewDawnWindSeconds()) : seconds;
+    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018, 1024.0)),
+                static_cast<float>(std::fmod(drift * 0.009, 1024.0)));
 }
 
 void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
@@ -2849,6 +2885,17 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     if (!mUsable || fb.width < 8 || fb.height < 8) {
         return;
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+        mArt.on = params.artEnabled != 0;
+        std::copy(params.artSlope, params.artSlope + 3, mArt.slope);
+        mArt.offset = params.artOffset;
+        mArt.power = params.artPower;
+        mArt.contrast = params.artContrast;
+        mArt.sat = params.artSat;
+        std::copy(params.artShadowTint, params.artShadowTint + 3, mArt.shadow);
+        std::copy(params.artHighTint, params.artHighTint + 3, mArt.high);
+        std::copy(params.artGreen, params.artGreen + 2, mArt.green);
+    }
     // Both stages of a frame (and every walk of one game tick's display list is a new frame) share one read
     if (frameIndex != mSettingsFrame) {
         mSettings = ReadSettings();
@@ -2864,6 +2911,10 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                               params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
+    const bool doWeather = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosWeather &&
+                           params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doAtmos = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosParticles &&
+                         params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doFog = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && (doShadow || params.fogVolumetric == 2) &&
                        mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
@@ -2872,8 +2923,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
-                         (s.bloomOn || s.gradeOn);
-    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog) {
+                         (s.bloomOn || s.gradeOn || mArt.on);
+    if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather) {
         return;
     }
 
@@ -2894,7 +2945,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater || doFog) {
+    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather) {
         PrepareDepth(fb);
     }
     if (doWater) {
@@ -2930,6 +2981,19 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         RunVolumetricFog(params, fb);
         EndTimer(kFogTimerStage);
     }
+    if (doWeather) {
+        auto roofParams = params;
+        roofParams.shadowSunDir[0] = roofParams.shadowSunDir[2] = 0.0f;
+        roofParams.shadowSunDir[1] = 1.0f;
+        roofParams.shadowRadius = 900.0f;
+        roofParams.shadowMapSize = 1024;
+        std::copy_n(params.atmosEye, 3, roofParams.shadowFocus);
+        float roofMatrix[16];
+        BuildLightViewProj(roofParams, roofMatrix);
+        BeginTimer(12);
+        RunWeather(params, fb, roofMatrix, shadowPositions, shadowVertexCount);
+        EndTimer(12);
+    }
     if (captureWater) {
         BeginTimer(kWaterCaptureTimerStage);
         // AO split view leaves its apply scissor enabled; copies must cover the whole source.
@@ -2946,6 +3010,19 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
         mWaterOpaqueFrame = frameIndex;
         EndTimer(kWaterCaptureTimerStage);
+    }
+
+    if (doWeather) {
+        BeginTimer(13);
+        RunWeatherParticles(params, fb);
+        EndTimer(13);
+    }
+    if (doAtmos) {
+        float lightMatrix[16] = {};
+        if (doShadow) BuildLightViewProj(params, lightMatrix);
+        BeginTimer(11);
+        RunAtmos(params, fb, lightMatrix, doShadow);
+        EndTimer(11);
     }
 
     CheckError(doShadow ? "shadow stage" : (stage == 0 ? "opaque end stage" : "scene end stage"));
@@ -3891,6 +3968,17 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     glUniform1i(Loc("uUseGrade"), s.gradeOn ? 1 : 0);
     glUniform1f(Loc("uContrast"), s.contrast);
     glUniform1f(Loc("uSaturation"), s.saturation);
+    glUniform1i(Loc("uArtOn"), mArt.on && s.postFxOn && s.debugView != 2);
+    if (mArt.on) {
+        glUniform3fv(Loc("uArtSlope"), 1, mArt.slope);
+        glUniform1f(Loc("uArtOffset"), mArt.offset);
+        glUniform1f(Loc("uArtPower"), mArt.power);
+        glUniform1f(Loc("uArtContrast"), mArt.contrast);
+        glUniform1f(Loc("uArtSat"), mArt.sat);
+        glUniform3fv(Loc("uArtShadow"), 1, mArt.shadow);
+        glUniform3fv(Loc("uArtHigh"), 1, mArt.high);
+        glUniform2fv(Loc("uArtGreen"), 1, mArt.green);
+    }
     if (s.debugView == 1 && !mHdrActive) {
         glEnable(GL_SCISSOR_TEST);
         glScissor(w / 2, 0, w - w / 2, h);
