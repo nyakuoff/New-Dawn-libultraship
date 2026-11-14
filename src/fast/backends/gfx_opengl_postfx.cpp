@@ -811,8 +811,10 @@ void main() {
         c = mix(vec3(gl), c, 1.0 + gw * (uArtGreen.y - 1.0));
         // Slope / offset / power, then an S-curve, split tone and global saturation (all in display space).
         c = pow(max(c * uArtSlope + uArtOffset, vec3(0.0)), vec3(uArtPower));
-        vec3 sc = c * c * (3.0 - 2.0 * c);
-        c += 2.0 * uArtContrast * (sc - c);
+        // Keep the contrast curve monotonic when slope/saturation put a channel above display white.
+        vec3 cc = clamp(c, 0.0, 1.0);
+        vec3 sc = cc * cc * (3.0 - 2.0 * cc);
+        c += 2.0 * uArtContrast * (sc - cc);
         float al = dot(c, lw);
         c += uArtShadow * (1.0 - smoothstep(0.0, 0.5, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
         al = dot(c, lw);
@@ -2816,7 +2818,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                           s.shadowDebug == 0;
     // The AO debug view needs the finished world left alone, otherwise the grade would tint the AO buffer
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
-                         (s.bloomOn || s.gradeOn);
+                         (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog) {
         return;
     }
@@ -3779,7 +3781,7 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     glUniform1i(Loc("uUseGrade"), s.gradeOn ? 1 : 0);
     glUniform1f(Loc("uContrast"), s.contrast);
     glUniform1f(Loc("uSaturation"), s.saturation);
-    glUniform1i(Loc("uArtOn"), mArt.on);
+    glUniform1i(Loc("uArtOn"), mArt.on && s.postFxOn && s.debugView != 2);
     if (mArt.on) {
         glUniform3fv(Loc("uArtSlope"), 1, mArt.slope);
         glUniform1f(Loc("uArtOffset"), mArt.offset);
