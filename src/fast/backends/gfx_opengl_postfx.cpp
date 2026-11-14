@@ -927,6 +927,8 @@ uniform vec4 uLight[24];    // world position, range
 uniform vec3 uLightRgb[24]; // HDR radiance (strength and flicker already applied)
 uniform float uDebug;
 uniform float uDarken;
+uniform float uFogMul;
+uniform float uFogOff;
 uniform float uSoft; // 1 for the stencil-marked characters: their low-poly depth normals are smoothed
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 // Screen-space contact shadow along the segment to the light, from the opaque depth buffer: walls and actors between
@@ -993,11 +995,14 @@ void main() {
     float need = 1.0 - 0.75 * smoothstep(0.35, 1.0, Y);
     // Contrast: pull the unlit scene down (night / interior) so the lights carry it. Surfaces the lights reach keep
     // their authored brightness; the player gets a soft exemption and nothing drops below a small floor.
-    float D = uDarken; // characters (stencil-marked draws) get a reduced value from the second draw
+    // Native fog is a light of its own: surfaces it already hides keep the fog colour instead of being pulled into a
+    // dark band against the (undarkened) sky. Characters (stencil-marked draws) get a reduced uDarken from the second draw.
+    float fog = clamp((d * 2.0 - 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
+    float D = uDarken * (1.0 - fog);
     float keep = smoothstep(0.0, 0.45, dot(E, giLuma));
     vec3 moon = mix(vec3(1.0), vec3(0.90, 0.97, 1.10), min(D * 1.3, 1.0)); // cool, dim fill
     vec3 base = c * mix(1.0 - D, 1.0, keep) * mix(moon, vec3(1.0), keep);
-    base = max(base, min(c, vec3(0.009)));
+    base = max(base, min(c, vec3(0.0055)));
     if (uDebug > 0.0) {
         oColor = vec4(E * uDebug, 0.0);
         oFactor = vec4(0.0);
@@ -1297,13 +1302,16 @@ void main() {
         float gl = dot(c, lw);
         c = mix(vec3(gl), c, 1.0 + gw * (uArtGreen.y - 1.0));
         // Slope / offset / power, then an S-curve, split tone and global saturation (all in display space).
-        c = pow(max(c * uArtSlope + uArtOffset, vec3(0.0)), vec3(uArtPower));
+        // Deep shadows stay black and neutral: the lift and the gamma fade in above them (a fixed lift or a gamma below 1
+        // would otherwise turn true black into a tinted grey).
+        float dk = smoothstep(0.0, 0.12, dot(c, lw));
+        c = pow(max(c * uArtSlope + uArtOffset * dk, vec3(0.0)), vec3(mix(1.0, uArtPower, dk)));
         // Keep the contrast curve monotonic when slope/saturation put a channel above display white.
         vec3 cc = clamp(c, 0.0, 1.0);
         vec3 sc = cc * cc * (3.0 - 2.0 * cc);
         c += 2.0 * uArtContrast * (sc - cc);
         float al = dot(c, lw);
-        c += uArtShadow * (1.0 - smoothstep(0.0, 0.5, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
+        c += uArtShadow * ((1.0 - smoothstep(0.0, 0.5, al)) * smoothstep(0.0, 0.2, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
         al = dot(c, lw);
         c = mix(vec3(al), c, uArtSat);
     }
@@ -5268,7 +5276,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         ++count;
     };
     for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i)
-        add(params.localLights[i], params.localLights[i][3], params.localColors[i], 1.0f);
+        add(params.localLights[i], params.localLights[i][3], params.localColors[i], params.localBoost[i]);
     // VFX flames the game gives no light to (recorded last frame): tie a warm light to each, nearest first.
     if (params.vfxEnabled && mFlameScene == params.giSceneId && frameIndex - mFlameFrame <= 2u) {
         struct Flame {
@@ -5341,6 +5349,8 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glUniform3fv(Loc("uLightRgb"), kMax, &rgb[0][0]);
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
     // result = light + framebuffer * factor, evaluated per MSAA sample, so edges keep their anti-aliasing.
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_SRC1_COLOR);
@@ -5353,6 +5363,8 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
     glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
     glUniform1f(Loc("uDarken"), darken);
+    glUniform1f(Loc("uFogMul"), fogMul);
+    glUniform1f(Loc("uFogOff"), fogOff);
     glUniform1f(Loc("uSoft"), 0.0f);
     Draw(fb.fbo, w, h);
     glStencilFunc(GL_EQUAL, 1, 0xFF);
