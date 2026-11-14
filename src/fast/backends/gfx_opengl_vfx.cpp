@@ -75,7 +75,7 @@ void main() {
         vLayerKind = float(cls * 10 + l);
         vSeed = p;
         float rot = seed * 6.2831 + float(l) * 1.9 + p * (cls == 3 ? 0.5 : 0.25) * (0.5 + hash(seed));
-        float scale = cls == 3 ? 0.95 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 1.7 : 2.4) : 1.0));
+        float scale = cls == 3 ? 0.85 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 1.7 : 2.4) : 1.0));
         vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
         float r = max(hp.x, hp.y) * scale;
         vec2 local = vec2(cos(rot) * q.x - sin(rot) * q.y, sin(rot) * q.x + cos(rot) * q.y) * r;
@@ -163,7 +163,8 @@ void main() {
         float p = vSeed;
         if (cls == 3) { // dust: soft lit smoke, composited over the scene
             vec3 c = mix(vEnv.rgb, vPrim.rgb, 0.6) * uLit * (0.6 + 0.4 * t.r);
-            float al = clamp(t.a * vAlpha * 0.95, 0.0, 0.6) * soft * uStrength;
+            c = mix(vec3(dot(c, vec3(0.30, 0.59, 0.11))), c, 0.55); // the game's sand/earth tints are saturated; keep dust close to the ground tone
+            float al = clamp(t.a * vAlpha * 0.7, 0.0, 0.4) * soft * uStrength;
             if (uDebug == 1) { oColor = vec4(t.rgb * t.a * 3.0, 0.0); return; }
             oColor = vec4(c * al, al);
             return;
