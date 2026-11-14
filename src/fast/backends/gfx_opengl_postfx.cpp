@@ -725,23 +725,24 @@ uniform vec4 uLight[24];    // world position, range
 uniform vec3 uLightRgb[24]; // HDR radiance (strength and flicker already applied)
 uniform float uDebug;
 uniform float uDarken;
-uniform vec4 uPlayer; // xyz, w = 1 when valid
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 // Screen-space contact shadow along the segment to the light, from the opaque depth buffer: walls and actors between
 // the surface and the flame occlude it. Samples outside the screen count as visible.
 float localVisibility(vec3 P, vec3 L, float jitter) {
+    // 12 steps with a small per-pixel offset; each hit only dims by a fraction, so edges become a soft penumbra
+    // rather than a stippled binary mask.
     float hits = 0.0;
-    for (int s = 0; s < 8; ++s) {
-        vec3 sp = P + (L - P) * ((float(s) + jitter) * (0.92 / 8.0) + 0.02);
+    for (int s = 0; s < 12; ++s) {
+        vec3 sp = P + (L - P) * ((float(s) + 0.5 * jitter) * (0.92 / 12.0) + 0.02);
         vec4 clip = uViewProj * vec4(sp, 1.0);
         if (clip.w <= 0.0) continue;
         vec2 uv = (clip.xy / clip.w / vec2(uNdcXScale, uFlipY)) * 0.5 + 0.5;
         if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) continue;
         float sceneZ = linDepth(fetchDepth(ivec2(uv * vec2(uSize))));
         float diff = clip.w - sceneZ;
-        hits += step(max(2.0, clip.w * 0.012), diff) * (1.0 - step(70.0, diff));
+        hits += smoothstep(max(1.0, clip.w * 0.006), max(4.0, clip.w * 0.02), diff) * (1.0 - step(70.0, diff));
     }
-    return 1.0 - min(1.0, hits * 0.5);
+    return 1.0 - min(1.0, hits * 0.22);
 }
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -781,11 +782,7 @@ void main() {
     float need = 1.0 - 0.75 * smoothstep(0.35, 1.0, Y);
     // Contrast: pull the unlit scene down (night / interior) so the lights carry it. Surfaces the lights reach keep
     // their authored brightness; the player gets a soft exemption and nothing drops below a small floor.
-    float D = uDarken;
-    if (uPlayer.w > 0.5) {
-        vec3 q = (P - uPlayer.xyz) / vec3(95.0, 120.0, 95.0);
-        D *= 1.0 - 0.65 * (1.0 - smoothstep(0.35, 1.0, length(q)));
-    }
+    float D = uDarken; // characters (stencil-marked draws) get a reduced value from the second draw
     float keep = smoothstep(0.0, 0.45, dot(E, giLuma));
     vec3 moon = mix(vec3(1.0), vec3(0.90, 0.97, 1.10), min(D * 1.3, 1.0)); // cool, dim fill
     vec3 base = c * mix(1.0 - D, 1.0, keep) * mix(moon, vec3(1.0), keep);
@@ -2769,6 +2766,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     mSkyReflectionsReady = false;
     mFlareCloudOpacity = 0.0f;
     mRaySkyReady = false;
+    mLocalMarking = false;
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -2820,6 +2818,13 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     // Only swap colour; game depth, stencil, coverage and query scheduling stay intact.
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
+    if (CvInt("gNewDawn.Lighting.Local", 0)) {
+        // Fresh actor mask for this frame; the game never uses stencil.
+        glStencilMask(0xFF);
+        glClearStencil(0);
+        glClear(GL_STENCIL_BUFFER_BIT);
+        mLocalMarking = true;
+    }
     mHdrActive = true;
     return true;
 }
@@ -4252,6 +4257,12 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
             return;
         // Keep the light's own hue; compress its brightness so dim game lights still contribute.
         const float k = (0.5f + 0.5f * m) / m;
+        // Warm the yellow game colours a little, then pull 25% of the saturation toward white so a big flame never
+        // washes a floor mustard.
+        float lightRgb[3] = { col[0], col[1] * (1.0f - 0.3f * std::clamp((col[0] - col[2]) / std::max(col[0], 0.01f), 0.0f, 1.0f)), col[2] };
+        const float lightLum = 0.2126f * lightRgb[0] + 0.7152f * lightRgb[1] + 0.0722f * lightRgb[2];
+        for (float& c : lightRgb)
+            c = c + (lightLum - c) * 0.25f;
         const float warm = std::clamp((col[0] - col[2]) / std::max(col[0], 0.01f), 0.0f, 1.0f);
         const float seed = std::fmod(std::floor(p[0] / 4.0f) * 12.9898f + std::floor(p[1] / 4.0f) * 78.233f +
                                          std::floor(p[2] / 4.0f) * 37.719f,
@@ -4263,7 +4274,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         pos[count][0] = p[0], pos[count][1] = p[1], pos[count][2] = p[2];
         pos[count][3] = std::clamp(radius * 1.3f, 90.0f, 700.0f);
         for (int i = 0; i < 3; ++i)
-            rgb[count][i] = col[i] * (i == 1 ? 1.0f - 0.3f * warm : 1.0f) * k * f * boost * params.localStrength * 4.0f;
+            rgb[count][i] = lightRgb[i] * k * f * boost * params.localStrength * params.localGain * 4.0f;
         ++count;
     };
     for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i)
@@ -4304,11 +4315,11 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
             }
             if (dup)
                 continue;
-            const float warmRgb[3] = { 1.0f, 0.47f, 0.14f };
+            const float warmRgb[3] = { 1.0f, 0.62f, 0.32f };
             float col[3];
             for (int a = 0; a < 3; ++a)
                 col[a] = warmRgb[a];
-            add(fl.f + 12, 200.0f, col, 1.0f);
+            add(fl.f + 12, 150.0f, col, 1.0f);
         }
     }
     if (count == 0 && params.localDarken <= 0.0f)
@@ -4338,14 +4349,24 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glUniform3fv(Loc("uLightRgb"), kMax, &rgb[0][0]);
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
-    glUniform1f(Loc("uDarken"), std::clamp(params.localDarken, 0.0f, 0.9f));
-    glUniform4f(Loc("uPlayer"), params.localPlayer[0], params.localPlayer[1], params.localPlayer[2],
-                params.localPlayerValid ? 1.0f : 0.0f);
     // result = light + framebuffer * factor, evaluated per MSAA sample, so edges keep their anti-aliasing.
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_SRC1_COLOR);
     glBlendEquation(GL_FUNC_ADD);
+    // World first, then the stencil-marked characters (enemies, NPCs, Link, props) with only 40% of the darkening, so
+    // they stay readable in a dark room or street.
+    const float darken = std::clamp(params.localDarken, 0.0f, 0.9f);
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+    glUniform1f(Loc("uDarken"), darken);
     Draw(fb.fbo, w, h);
+    glStencilFunc(GL_EQUAL, 1, 0xFF);
+    glUniform1f(Loc("uDarken"), darken * 0.4f);
+    Draw(fb.fbo, w, h);
+    glStencilMask(0xFF);
+    glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     if (debug > 0.0f) {
         static int logged = 0;

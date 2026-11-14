@@ -41,6 +41,11 @@ class PostFxGL {
         return mUsable && (!mVfxAttempted || mVfx.id != 0);
     }
 
+    // True while this frame's character-classified draws should write stencil 1 (the local-light darkening reads it).
+    bool LocalMarking() const {
+        return mLocalMarking;
+    }
+    bool mLocalMarking = false;
     bool BeginHdr(const FramebufferOGL& fb);
     void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void RunSunFlare(const NewDawnPostFxParams& params, const FramebufferOGL& fb);

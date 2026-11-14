@@ -196,6 +196,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     // New Dawn per-pixel lighting: the last state the interpreter handed us, and the program it
     // was last uploaded for, so a program switch re-applies the uniforms.
     GfxPerPixelLightingState mPerPixelLightState{};
+    bool mStencilMarkOn = false;
     int32_t mPerPixelUploadedSerial = -1;
     ShaderProgram* mPerPixelUploadedProgram = nullptr;
 
