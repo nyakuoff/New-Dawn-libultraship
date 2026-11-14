@@ -30,6 +30,7 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/newdawn_wind.h"
 #include "fast/lus_gbi.h"
 #include "fast/newdawn_postfx.h"
 #include "fast/backends/gfx_window_manager_api.h"
@@ -2201,7 +2202,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // every caster, lit or not.
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
-        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording) {
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -2330,7 +2331,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording) {
+        if (per_pixel_lighting || mShadowRecording || mWindSway) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -2748,6 +2749,54 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (mRdp->loaded_texture[i].blended) {
                 UpdateTextureCacheSize(SHADER_FIRST_REPLACEMENT_TEXTURE + i);
             }
+        }
+    }
+
+    // New Dawn wind: render-only sway of cut-out foliage in scoped room/actor geometry. Drawn vertices and
+    // foliage shadows use the same displaced copy. Geometry, animation and collision
+    // are untouched: the loaded vertices themselves are never modified.
+    LoadedVertex swayed[3];
+    if (mWindSway && !is_rect && comb->usedTextures[0] && mRenderingState.mTextures[0] != nullptr && tex_height[0] > 0 &&
+        (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA && (mRdp->other_mode_l & G_ZS_PRIM) == 0) {
+        const auto cpuStart = mWindProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto& wind = mWindState;
+        const float windT = mWindT;
+        const float(*P)[4] = mRsp->P_matrix;
+        for (int i = 0; i < 3; i++) {
+            swayed[i] = *v_arr[i];
+            float t = v_arr[i]->v / 32.0f;
+            const int shiftt = mRdp->texture_tile[effective_tile[0]].shiftt;
+            if (shiftt != 0) {
+                t = shiftt <= 10 ? t / (1 << shiftt) : t * (1 << (16 - shiftt));
+            }
+            t = (t - mRdp->texture_tile[effective_tile[0]].ult / 4.0f) / tex_height[0];
+            t = (t > -0.02f && t < 1.02f) ? Ship::Math::clamp(t, 0.0f, 1.0f) : t - floorf(t);
+            // Tips (top of the cut-out) move, bases stay planted.
+            const float weight = (1.0f - t) * (1.0f - t);
+            const float* p = v_arr[i]->view_pos;
+            const float phase = (p[0] * wind.dirX + p[2] * wind.dirZ) * 0.015f - windT * 1.7f;
+            const float wave = std::sin(phase) * 0.7f + std::sin(phase * 2.9f + p[1] * 0.05f) * 0.3f;
+            const float amount = (0.55f + wave * 0.45f) * wind.gust * 3.5f * mWindScale * weight;
+            const float flutter = std::sin(windT * 6.0f + p[0] * 0.21f + p[2] * 0.17f) * 0.35f * mWindScale * weight;
+            const float d[3] = { wind.dirX * amount - wind.dirZ * flutter, -fabsf(amount) * 0.12f,
+                                 wind.dirZ * amount + wind.dirX * flutter };
+            swayed[i].view_pos[0] += d[0];
+            swayed[i].view_pos[1] += d[1];
+            swayed[i].view_pos[2] += d[2];
+            float c[4];
+            for (int k = 0; k < 4; k++) {
+                c[k] = d[0] * P[0][k] + d[1] * P[1][k] + d[2] * P[2][k];
+            }
+            swayed[i].x += AdjXForAspectRatio(c[0]);
+            swayed[i].y += c[1];
+            swayed[i].z += c[2];
+            swayed[i].w += c[3];
+            v_arr[i] = &swayed[i];
+        }
+        if (mWindProfile) {
+            mWindCpuNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - cpuStart).count();
+            ++mWindTriangles;
         }
     }
 
@@ -4975,17 +5024,24 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->Flush();
     if (cmd->words.w1 == 0) {
+        gfx->Flush();
         return false;
     }
     const int stage = C0(0, 8);
+    if (stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN || stage == NEWDAWN_POSTFX_STAGE_WIND_END) {
+        // Only changes how later triangles are built: no batch flush needed, so per-actor scopes stay cheap.
+        gfx->mWindSway = stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN && gfx->mPostFxActive;
+        return false;
+    }
+    gfx->Flush();
     const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
 
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
         // Water only needs the camera of this frame, not the casters.
-        gfx->BeginShadowRecording(gfx->mPostFxActive && params.shadowEnabled != 0,
-                                  gfx->mPostFxActive && (params.waterEnabled != 0 || params.fogVolumetric != 0));
+        gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
+                                  gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
+                                                         params.fogVolumetric != 0));
         return false;
     }
 
@@ -6030,6 +6086,8 @@ GfxExecStack g_exec_stack = {};
 void Interpreter::RunGuiOnly() {
     SpReset();
 
+    mWindSway = false;
+
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
 
@@ -6070,6 +6128,22 @@ void Interpreter::RunGuiOnly() {
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
 
+    mWindSway = false;
+    mWindProfile = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Debug.Stats", 0) &&
+                   Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Atmos.Wind", 0);
+    if (!mWindProfile) {
+        mWindProfileFrames = 0;
+        mWindCpuNs = mWindTriangles = 0;
+    }
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Atmos.Wind", 0)) {
+        const double now = NewDawnWindSeconds();
+        mWindT = float(now);
+        mWindState = NewDawnWindAt(now);
+        mWindScale = std::clamp(
+            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Atmos.WindScale", 1.0f),
+            0.0f, 10.0f);
+    }
+
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
 
@@ -6108,6 +6182,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     Flush();
     mRapi->FinishWorld(); // also closes a partial/debugger display-list walk
+    if (mWindProfile && ++mWindProfileFrames == 300) {
+        SPDLOG_INFO("NewDawn wind CPU: {:.4f} ms/frame, {:.1f} triangles/frame (300 frames, timer overhead included)",
+                    double(mWindCpuNs) / 300000000.0, double(mWindTriangles) / 300.0);
+        mWindProfileFrames = 0;
+        mWindCpuNs = mWindTriangles = 0;
+    }
     if (mRenderingState.alpha_to_coverage) {
         mRapi->SetAlphaToCoverage(false); // never leak into the post passes, the resolve or the UI
         mRenderingState.alpha_to_coverage = false;
