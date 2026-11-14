@@ -300,7 +300,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUniform1i(Loc("uKind"), 0);
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 3200);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 1800);
     if (p.atmosBiome == 2 || p.atmosBiome == 3) {
         if (p.atmosNight < 1.0f) {
             glUniform1i(Loc("uKind"), 1);
