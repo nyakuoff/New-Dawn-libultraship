@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fast/newdawn_wind.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <unordered_map>
@@ -631,8 +632,14 @@ class Interpreter {
     std::vector<float> mShadowVertices;
     // Alpha-tested casters (gNewDawn.Shadows.Foliage): x,y,z,u,v per vertex, grouped by GL texture id.
     bool mShadowFoliage = false;
+    // Debug.Stats profiles only displacement work (including timer overhead), averaged over 300 frames.
+    bool mWindProfile = false;
+    uint32_t mWindProfileFrames = 0;
+    uint64_t mWindCpuNs = 0, mWindTriangles = 0;
     float mWindScale = 1.0f;
-    bool mWindSway = false; // inside a New Dawn wind scope (room geometry), render-only foliage sway
+    float mWindT = 0.0f;
+    NewDawnWindState mWindState = {};
+    bool mWindSway = false; // inside a New Dawn wind scope (room or foliage actor), render-only sway
     uint32_t mShadowSerial = 0;
     size_t mShadowFoliageFloats = 0;
     std::unordered_map<uint32_t, std::vector<float>> mShadowFoliageByTex;

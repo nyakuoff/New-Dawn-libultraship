@@ -1,6 +1,7 @@
 #if defined(ENABLE_OPENGL) && !defined(USE_OPENGLES)
 
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_wind.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2430,12 +2431,14 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
     glUniform1f(Loc("uCoverage"),
                 std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast));
-    // Fixed 18/9 m/s wind, driven by monotonic renderer time, independent of the game clock, pause,
+    // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
-    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(seconds * 0.018, 1024.0)),
-                static_cast<float>(std::fmod(seconds * 0.009, 1024.0)));
+    // Density samples world + offset, so negative travel advects clouds along the positive foliage/particle wind.
+    const double drift = CvInt("gNewDawn.Atmos.Wind", 0) ? -NewDawnWindTravel(NewDawnWindSeconds()) : seconds;
+    glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018, 1024.0)),
+                static_cast<float>(std::fmod(drift * 0.009, 1024.0)));
 }
 
 void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {

@@ -1,5 +1,6 @@
 #if defined(ENABLE_OPENGL) && !defined(USE_OPENGLES)
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_wind.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 #include <stb_image.h>
@@ -289,11 +290,14 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glUniform1f(Loc("uStrength"), strength);
     static const auto epoch = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
-    // Double precision drift; wrapping is exactly the volume period. No accumulating integration error.
+    // Double precision drift before converting bounded offsets to shader floats.
     const float t = static_cast<float>(seconds);
     glUniform1f(Loc("uTime"), t);
-    glUniform2f(Loc("uWindOffset"), static_cast<float>(std::fmod(seconds * 3.6, 924000.0)),
-                static_cast<float>(std::fmod(seconds * 1.8, 924000.0)));
+    double drift = seconds;
+    if (vars->GetInteger("gNewDawn.Atmos.Wind", 0))
+        drift = NewDawnWindTravel(NewDawnWindSeconds());
+    glUniform2f(Loc("uWindOffset"), static_cast<float>(std::fmod(drift * 3.6, 924000.0)),
+                static_cast<float>(std::fmod(drift * 1.8, 924000.0)));
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
     glViewport(0, 0, fb.width, fb.height);
     glEnable(GL_BLEND);

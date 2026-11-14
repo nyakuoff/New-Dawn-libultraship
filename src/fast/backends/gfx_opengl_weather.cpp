@@ -18,7 +18,7 @@ const char* kWeatherVertex = R"GLSL(#version 330 core
 uniform mat4 uViewProj;
 uniform vec3 uEye;
 uniform float uTime, uNdcXScale, uFlipY;
-uniform vec2 uProjection,uSize,uWindVel;
+uniform vec2 uProjection,uSize,uWindVel,uWindOffset;
 uniform int uSnow;
 out vec2 vUv;
 out vec3 vWorld;
@@ -31,7 +31,7 @@ void main() {
     float extent=uSnow!=0 ? 380.0 : 360.0;
     float speed=uSnow!=0 ? 12.0 : 620.0;
     vec3 p=(seed-0.5)*extent*2.0;
-    p+=vec3(3.6*uTime,-speed*uTime,1.8*uTime);
+    p+=vec3(uWindOffset.x,-speed*uTime,uWindOffset.y);
     if (uSnow!=0) p+=vec3(sin(uTime*0.7+seed.x*6.28)*10.0,0.0,cos(uTime*0.6+seed.y*6.28)*10.0);
     vec3 relative=mod(p-uEye+extent,extent*2.0)-extent;
     p=uEye+relative;
@@ -218,8 +218,7 @@ void PostFxGL::RunWeather(const NewDawnPostFxParams& p, const FramebufferOGL& fb
     mWeatherFrameReady = false;
     if (!BuildWeatherPrograms())
         return;
-    static const auto epoch = std::chrono::steady_clock::now();
-    const double time = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const double time = NewDawnWindSeconds();
     mWeatherTime = time;
     const float rain = std::clamp(p.atmosRain, 0.0f, 1.0f), snow = p.atmosSnow;
     if (mWeatherScene != p.atmosScene || mWeatherLastFrame + 1 != mSettingsFrame) {
@@ -381,14 +380,19 @@ void PostFxGL::RunWeatherParticles(const NewDawnPostFxParams& p, const Framebuff
     const float projection = 1.0f / std::tan(p.fovyDegrees * 0.00872664626f);
     glUniform2f(Loc("uProjection"), projection * float(fb.height) / fb.width, projection);
     glUniform2f(Loc("uSize"), fb.width, fb.height);
-    // Gusting wind slants rain when the shared wind is enabled; otherwise the original gentle constant drift.
+    // Travel is the integral of the same velocity that slants the streaks.
     float windVel[2] = { 3.6f, 1.8f };
+    float windOffset[2] = { float(mWeatherTime * 3.6), float(mWeatherTime * 1.8) };
     if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Atmos.Wind", 0)) {
-        const auto wind = NewDawnWindAt(NewDawnWindSeconds());
+        const auto wind = NewDawnWindAt(mWeatherTime);
+        const double travel = NewDawnWindTravel(mWeatherTime) * 60.0;
+        windOffset[0] = float(wind.dirX * travel);
+        windOffset[1] = float(wind.dirZ * travel);
         windVel[0] = wind.dirX * wind.gust * 60.0f;
         windVel[1] = wind.dirZ * wind.gust * 60.0f;
     }
     glUniform2f(Loc("uWindVel"), windVel[0], windVel[1]);
+    glUniform2f(Loc("uWindOffset"), windOffset[0], windOffset[1]);
     glUniform2f(Loc("uNearFar"), p.zNear, p.zFar);
     float sky[3];
     for (int i = 0; i < 3; i++)

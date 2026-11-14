@@ -1,6 +1,6 @@
 #pragma once
-// New Dawn: one render-side wind shared by foliage sway and rain. Driven by wall-clock time only (never game time,
-// RNG or state), so it cannot influence gameplay.
+// New Dawn: render-side wind shared by clouds, particles, foliage and precipitation.
+// Wall-clock time only (never game time, RNG or state), so it cannot influence gameplay.
 #include <chrono>
 #include <cmath>
 
@@ -16,8 +16,15 @@ inline double NewDawnWindSeconds() {
 }
 
 inline NewDawnWindState NewDawnWindAt(double t) {
-    const float slow = 0.5f + 0.5f * std::sin(float(std::fmod(t, 628.318)) * 0.21f);
-    const float fast = 0.5f + 0.5f * std::sin(float(std::fmod(t, 62.8318)) * 1.9f + 1.3f);
+    const float slow = 0.5f + 0.5f * std::sin(t * 0.21);
+    const float fast = 0.5f + 0.5f * std::sin(t * 1.9 + 1.3);
     return { 0.894427f, 0.447214f, 0.3f + 1.0f * slow * slow + 0.3f * fast };
+}
+// Analytic integral of gust: no frame-rate-dependent accumulation or velocity-times-time jumps.
+// Derivative is exactly NewDawnWindAt(t).gust; callers choose speed and periodic domain.
+inline double NewDawnWindTravel(double t) {
+    return 0.825 * t + 0.5 * (1.0 - std::cos(0.21 * t)) / 0.21 -
+           0.125 * std::sin(0.42 * t) / 0.42 +
+           0.15 * (std::cos(1.3) - std::cos(1.9 * t + 1.3)) / 1.9;
 }
 } // namespace Fast
