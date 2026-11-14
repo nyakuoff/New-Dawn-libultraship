@@ -147,6 +147,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetShadowCasterGeometry(const float* positions, uint32_t vertexCount) override;
     void SetShadowFoliageGeometry(const float* verts, const GfxShadowFoliageBatch* batches,
                                   uint32_t batchCount) override;
+    void SetVfxSprites(const float* data, uint32_t count) override;
+    bool VfxReplacing() const override;
     bool SupportsAlphaToCoverage() const override {
         return true;
     }
@@ -216,6 +218,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     const float* mShadowFoliageVerts = nullptr;
     const GfxShadowFoliageBatch* mShadowFoliageBatches = nullptr;
     uint32_t mShadowFoliageBatchCount = 0;
+    const float* mVfxSprites = nullptr;
+    uint32_t mVfxSpriteCount = 0;
 
 #ifndef USE_OPENGLES
     GLuint mSkyAmbientNeutral = 0;

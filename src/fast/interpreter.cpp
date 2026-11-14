@@ -1028,6 +1028,117 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
     return texel0;
 }
 
+// ---- New Dawn VFX: native effect sprites are recognised by texture path, recorded in clip space and drawn again by the
+// renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
+enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7 };
+
+void Interpreter::BeginVfxRecording(bool enabled) {
+    mVfx = enabled;
+    mVfxInst.clear();
+    mVfxTriSerial = mVfxLastTri = 0;
+    mVfxLastClass = 0;
+    mVfxDebug = enabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0);
+}
+
+uint8_t Interpreter::VfxClassify(std::string_view path) {
+    // Prefix -> class. Numbered animation frames (gEffDust1..8Tex) carry their frame in the high nibble.
+    static const std::pair<std::string_view, uint8_t> kTable[] = {
+        { "gEffFireTex", VFX_FLAME },
+        { "gEffEnemyDeathFlame", VFX_FLAME },
+        { "gameplay_keep_Tex_08FBE0", VFX_GLOW }, // Lights_DrawGlow: the hard-edged light disc
+        { "gEffDust", VFX_DUST },
+        { "gEffHitmarkDust", VFX_DUST },
+        { "gEffBombExplosion", VFX_BOMB },
+        { "gEffHitmarkRed", VFX_HIT },
+        { "gEffHitmarkWhiteMetal", VFX_HIT },
+        { "gElectricSpark", VFX_SPARK },
+        { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
+    };
+    uint8_t cls = VFX_NONE;
+    for (const auto& [name, c] : kTable) {
+        const size_t pos = path.find(name);
+        if (pos == std::string_view::npos) {
+            continue;
+        }
+        cls = c;
+        const size_t digit = pos + name.size();
+        if (c >= VFX_DUST && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
+            cls |= (uint8_t)((path[digit] - '1') << 4);
+        }
+        break;
+    }
+    if (mVfxDebug) {
+        static std::unordered_set<std::string> seen;
+        if (path.find("gEff") != std::string_view::npos && seen.insert(std::string(path)).second) {
+            SPDLOG_INFO("VFXDBG texture {} class {}", path, cls);
+        }
+    }
+    return cls;
+}
+
+void Interpreter::RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, float frame) {
+    float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f, w = 0, wx = 0, wy = 0, wz = 0;
+    for (int i = 0; i < 3; i++) {
+        if (v[i]->w < 1.0f) {
+            return;
+        }
+        const float x = v[i]->x / v[i]->w, y = v[i]->y / v[i]->w;
+        minx = std::min(minx, x), maxx = std::max(maxx, x), miny = std::min(miny, y), maxy = std::max(maxy, y);
+        minz = std::min(minz, v[i]->z / v[i]->w), maxz = std::max(maxz, v[i]->z / v[i]->w);
+        w += v[i]->w / 3.0f;
+        wx += v[i]->view_pos[0] / 3.0f, wy += v[i]->view_pos[1] / 3.0f, wz += v[i]->view_pos[2] / 3.0f;
+    }
+    const uint32_t serial = mVfxTriSerial;
+    bool merged = false;
+    if (!mVfxInst.empty() && mVfxLastClass == cls && mVfxLastTri + 1 == serial && mVfxLastCount == 1) {
+        for (int i = 0; i < 3 && !merged; i++)
+            for (int j = 0; j < 3; j++)
+                merged |= v[i] == mVfxLastVerts[j];
+    }
+    float* inst;
+    if (merged) {
+        inst = &mVfxInst[mVfxInst.size() - NEWDAWN_VFX_FLOATS];
+        const float ox0 = inst[1] - inst[5], ox1 = inst[1] + inst[5], oy0 = inst[2] - inst[6], oy1 = inst[2] + inst[6];
+        minx = std::min(minx, ox0), maxx = std::max(maxx, ox1), miny = std::min(miny, oy0), maxy = std::max(maxy, oy1);
+        // Average the two triangles' centres: the quad centre.
+        inst[12] = (inst[12] + wx) * 0.5f, inst[13] = (inst[13] + wy) * 0.5f, inst[14] = (inst[14] + wz) * 0.5f;
+    } else {
+        if (mVfxInst.size() / NEWDAWN_VFX_FLOATS >= 2048)
+            return;
+        mVfxInst.resize(mVfxInst.size() + NEWDAWN_VFX_FLOATS, 0.0f);
+        inst = &mVfxInst[mVfxInst.size() - NEWDAWN_VFX_FLOATS];
+        inst[0] = cls;
+        inst[12] = wx, inst[13] = wy, inst[14] = wz;
+        inst[8] = mRdp->prim_color.r / 255.0f, inst[9] = mRdp->prim_color.g / 255.0f;
+        inst[10] = mRdp->prim_color.b / 255.0f, inst[11] = mRdp->prim_color.a / 255.0f;
+        inst[16] = mRdp->env_color.r / 255.0f, inst[17] = mRdp->env_color.g / 255.0f;
+        inst[18] = mRdp->env_color.b / 255.0f, inst[19] = mRdp->env_color.a / 255.0f;
+    }
+    inst[1] = (minx + maxx) * 0.5f, inst[2] = (miny + maxy) * 0.5f, inst[3] = (minz + maxz) * 0.5f;
+    inst[4] = w, inst[5] = (maxx - minx) * 0.5f, inst[6] = (maxy - miny) * 0.5f;
+    // Stable per-source seed: the world position quantised to 4 units (never uses RNG or game state).
+    inst[7] = fmodf(floorf(inst[12] / 4.0f) * 12.9898f + floorf(inst[13] / 4.0f) * 78.233f +
+                        floorf(inst[14] / 4.0f) * 37.719f,
+                    1000.0f);
+    mVfxLastClass = cls, mVfxLastTri = serial;
+    mVfxLastCount = merged ? 2 : 1; // a quad is exactly two triangles
+    for (int i = 0; i < 3; i++)
+        mVfxLastVerts[i] = v[i];
+    inst[15] = frame;
+}
+
+void Interpreter::SubmitVfx() {
+    if (mVfxDebug) {
+        static int sLogged = 0;
+        for (size_t i = 0; i + NEWDAWN_VFX_FLOATS <= mVfxInst.size() && sLogged < 60; i += NEWDAWN_VFX_FLOATS, ++sLogged) {
+            const float* f = &mVfxInst[i];
+            SPDLOG_INFO("VFXDBG inst cls={:.0f} world={:.0f},{:.0f},{:.0f} w={:.0f} half={:.3f},{:.3f} prim={:.2f},{:.2f},{:.2f},{:.2f}",
+                        f[0], f[12], f[13], f[14], f[4], f[5], f[6], f[8], f[9], f[10], f[11]);
+        }
+    }
+    mRapi->SetVfxSprites(mVfxInst.empty() ? nullptr : mVfxInst.data(), (uint32_t)(mVfxInst.size() / NEWDAWN_VFX_FLOATS));
+}
+
 void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
     constexpr size_t kMaxShadowVertices = 2 * 1024 * 1024;
     if (mShadowVertices.size() + 9 > kMaxShadowVertices * 3) {
@@ -2202,7 +2313,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // every caster, lit or not.
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
-        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway) {
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -2453,6 +2564,45 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             return;
         }
         rejected = true;
+    }
+
+    if (mVfx && !is_rect) {
+        mVfxTriSerial++;
+        const uint32_t t0 = mRdp->first_tile_index;
+        const auto& lt0 = mRdp->loaded_texture[mRdp->texture_tile[t0].tmem_index];
+        const auto& lt1 = mRdp->loaded_texture[mRdp->texture_tile[t0 + 1 < 8 ? t0 + 1 : t0].tmem_index];
+        const uint8_t raw = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
+        uint8_t cls = raw & 15;
+        const float frame = (raw >> 4) / 7.0f;
+        if (cls == VFX_GLOW && mRdp->prim_color.a > 80) {
+            cls = VFX_NONE; // only Lights_DrawGlow's alpha-50 discs; other users of the texture keep their draw
+        }
+        if (mVfxDebug) {
+            static std::unordered_set<std::string> seenDraws;
+            const auto name = [](const auto& lt) {
+                return lt.raw_tex_metadata.resource ? lt.raw_tex_metadata.resource->GetInitData()->Path : std::string("-");
+            };
+            const std::string key = name(lt0) + "|" + std::to_string(mRdp->other_mode_l);
+            const std::string n0 = name(lt0);
+            if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.DebugAll", 0)
+                    ? (n0.find("scenes/") == std::string::npos && n0.find("object_link") == std::string::npos)
+                    : (n0.find("gEff") != std::string::npos || n0.find("Fire") != std::string::npos ||
+                       n0.find("Flame") != std::string::npos || n0.find("Spark") != std::string::npos ||
+                       n0.find("Smoke") != std::string::npos || n0.find("Dust") != std::string::npos ||
+                       n0.find("Bomb") != std::string::npos || n0.find("Glow") != std::string::npos)) {
+                if (seenDraws.insert(key).second)
+                    SPDLOG_INFO("VFXDBG draw tex0={} omL={:x} cc={:x} prim={},{},{},{} env={},{},{},{} w={:.0f}",
+                                name(lt0), mRdp->other_mode_l, mRdp->combine_mode, mRdp->prim_color.r,
+                                mRdp->prim_color.g, mRdp->prim_color.b, mRdp->prim_color.a, mRdp->env_color.r,
+                                mRdp->env_color.g, mRdp->env_color.b, mRdp->env_color.a, v1->w);
+            }
+        }
+        if (cls != VFX_NONE) {
+            RecordVfxTriangle(v_arr, cls, frame);
+            if (mRapi->VfxReplacing()) {
+                return; // the renderer draws this effect as an HD sprite
+            }
+        }
     }
 
     const uint32_t cull_both = get_attr(CULL_BOTH);
@@ -3450,6 +3600,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
     }
 
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -3525,6 +3676,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->texture_tile[tile].lrs = lrs;
     mRdp->texture_tile[tile].lrt = lrt;
 
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -5039,9 +5191,11 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
 
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
         // Water only needs the camera of this frame, not the casters.
+        gfx->BeginVfxRecording(gfx->mPostFxActive && params.vfxEnabled != 0);
         gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
-                                                         params.fogVolumetric != 0 || params.giEnabled != 0));
+                                                         params.fogVolumetric != 0 || params.giEnabled != 0 ||
+                                                         params.vfxEnabled != 0));
         return false;
     }
 
@@ -5065,7 +5219,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
                 effective.shadowEnabled = 0;
             }
             gfx->SubmitShadowCasters();
-        } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && effective.waterEnabled != 0) {
+        } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) {
+            gfx->SubmitVfx();
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
             // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
             gfx->FillShadowCameraParams(effective);
@@ -5075,6 +5230,9 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             }
         }
         gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
+    }
+    if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
+        gfx->mVfx = false; // stop recording until the next frame's begin marker
     }
     return false;
 }
