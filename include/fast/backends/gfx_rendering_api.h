@@ -159,6 +159,9 @@ class GfxRenderingAPI {
     // New Dawn VFX: NEWDAWN_VFX_FLOATS floats per recorded sprite; valid until RunPostFx returns.
     virtual void SetVfxSprites(const float* data, uint32_t count) {
     }
+    // New Dawn grass: NEWDAWN_GRASS_TRI_FLOATS floats per recorded ground triangle; valid until RunPostFx returns.
+    virtual void SetGrassTriangles(const float* data, uint32_t count) {
+    }
     // True while the renderer will redraw recorded VFX sprites itself (so the native draw may be skipped).
     virtual bool VfxReplacing() const {
         return false;

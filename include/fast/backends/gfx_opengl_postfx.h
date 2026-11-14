@@ -91,6 +91,12 @@ class PostFxGL {
         mVfxCount = count;
     }
 
+    // New Dawn grass: world-space ground triangles for the next Run (NEWDAWN_GRASS_TRI_FLOATS floats each).
+    void SetGrassTriangles(const float* data, uint32_t count) {
+        mGrassData = data;
+        mGrassCount = count;
+    }
+
     bool VfxUsable() const {
         return mUsable && (!mVfxAttempted || mVfx.id != 0);
     }
@@ -123,6 +129,7 @@ class PostFxGL {
     static constexpr int kFlareUnit = 15;
     static constexpr int kFlareSpritesUnit = 16;
     static constexpr int kFlareCloudUnit = 17;
+    static constexpr int kCausticUnit = 28; // atmos 16..19 and 24, vfx 25..27 are taken
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
     }
@@ -165,6 +172,17 @@ class PostFxGL {
     bool BuildPrograms();
     bool BuildAtmosProgram();
     bool BuildVfxProgram();
+    bool BuildGrassProgram();
+    void RunGrass(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void CaptureGrassGround(const FramebufferOGL& fb);
+    bool mGrassGroundReady = false; // the ground-only colour copy of this frame exists (taken before actors are drawn)
+    Program mGrass;
+    bool mGrassAttempted = false;
+    GLuint mGrassAtlas = 0, mGrassVao = 0, mGrassVbo = 0;
+    Target mGrassGround; // single-sample copy of the finished ground colour, sampled at every tuft root
+    const float* mGrassData = nullptr;
+    uint32_t mGrassCount = 0;
+    std::vector<float> mGrassCells[4]; // per-frame scratch: cell records grouped by slot count
     void RunVfx(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     Program mVfx;
     bool mVfxAttempted = false;
@@ -198,6 +216,9 @@ class PostFxGL {
                     uint32_t vertexCount, int debug);
     void RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunUnderwater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    bool EnsureCausticAssets();
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
@@ -246,6 +267,8 @@ class PostFxGL {
     uint32_t mSkyFrame = 0, mSkyLastEligible = UINT32_MAX, mSkyLastRefresh = 0;
     int32_t mSkyCachedScene = -1;
     float mSkyCachedSun[3] = {}, mSkyCachedWeather = 0.0f;
+    int mSkyCachedVariant = 0;
+    float mSkyCachedMood = 0.0f;
     float mSkyCachedSettings[7] = {};
     void RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RestoreColor(const FramebufferOGL& fb);
@@ -253,6 +276,11 @@ class PostFxGL {
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
     Program mShadowDepth, mShadowApply, mShadowFoliage;
     Program mShadowApplyCsm, mShadowApplyHdrCsm, mShaftMarchCsm, mFogMarchCsm, mGiGatherCsm; // CSM variants
+    Program mCaustics, mCausticsCsm, mUnderwater, mUnderwaterShaft, mUnderwaterShaftCsm;
+    Target mUwShaft; // half resolution underwater light shafts
+    GLuint mCausticTex = 0, mCausticDummy = 0; // 32-layer caustics flipbook on unit kCausticUnit
+    std::string mCausticAssetPath;
+    uint32_t mShadowReadyFrame = UINT32_MAX; // settings frame whose sun shadow map is valid
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply, mWaterSurface;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
@@ -318,12 +346,15 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 17;
+    static constexpr int kQueryStages = 20;
     static constexpr int kLocalTimerStage = 16;
+    static constexpr int kCausticsTimerStage = 17;
+    static constexpr int kUnderwaterTimerStage = 18;
     static constexpr int kGiTimerStage = 14;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;
     static constexpr int kVfxTimerStage = 15;
+    static constexpr int kGrassTimerStage = 19;
     static constexpr int kSkyTimerStage = 6;
     static constexpr int kCloudTimerStage = 7;
     static constexpr int kSkyAmbientTimerStage = 8;

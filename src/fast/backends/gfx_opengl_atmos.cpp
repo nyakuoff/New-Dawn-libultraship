@@ -32,7 +32,7 @@ void main() {
     uint id = uint(gl_InstanceID) + uint(uKind)*8192u;
     vec3 seed = vec3(random(id*3u+1u), random(id*3u+2u), random(id*3u+3u));
     float phase = seed.x*6.2831853;
-    float extent = uBiome == 4 ? 220.0 : (uKind == 2 ? 260.0 : (uKind == 3 ? 400.0 : 380.0));
+    float extent = uBiome == 4 ? 220.0 : (uBiome == 6 ? 240.0 : (uKind == 2 ? 260.0 : (uKind == 3 ? 400.0 : 380.0)));
     vec3 p = (seed-0.5)*extent*2.0;
     p.xz += uWindOffset * (uBiome == 4 ? 0.08 : (uKind == 2 ? 0.1 : (uKind == 3 ? 1.0 : 0.45)));
     // Slow meandering hover (no steady rise or fall) for dust, pollen and fireflies; leaves fall.
@@ -47,7 +47,7 @@ void main() {
     float distance = length(relative);
     vNear = 1.0 - smoothstep(30.0, 110.0, distance);
     // Dust/pollen vanish close to the lens instead of becoming large defocused discs.
-    float nearFade = uKind <= 1 ? smoothstep(150.0, 190.0, distance) : smoothstep(18.0, 55.0, distance);
+    float nearFade = uBiome == 6 ? smoothstep(30.0, 80.0, distance) : (uKind <= 1 ? smoothstep(150.0, 190.0, distance) : smoothstep(18.0, 55.0, distance));
     vFade = nearFade * (1.0-smoothstep(extent*0.65, extent*0.94, distance));
     if (uKind == 2) vFade *= 0.12+0.88*pow(0.5+0.5*sin(uTime*(0.9+seed.y*1.2)+phase*3.0),2.0);
     vec2 corners[6] = vec2[6](vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
@@ -145,6 +145,8 @@ void main() {
         radiance = uSunColor*sun*(uKind <= 1 ? 4.5 : 3.4)*bright*twinkle*vec3(1.0,0.88,0.66);
         alpha *= mix(1.0, 0.5, vNear); // defocused near motes are dimmer
         if (uKind == 1) radiance *= vec3(0.95,1.0,0.65);
+        // Underwater particulates are lit by the filtered sun and by the water's own glow, so they stay visible in shade.
+        if (uBiome == 6) radiance = (radiance*vec3(0.55,0.9,1.0) + vec3(0.16,0.34,0.4)*bright*twinkle*(1.0-0.5*uNight))*3.0;
         for (int i=0;i<uLightCount;i++) {
             float distance = length(vWorld-uLights[i].xyz);
             float influence = max(1.0-distance/max(uLights[i].w,1.0),0.0);

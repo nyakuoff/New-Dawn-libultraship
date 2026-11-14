@@ -6,6 +6,7 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
 #define NEWDAWN_POSTFX_STAGE_WIND_END 12
 #define NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN 9 /* native rain draw scope, updates/RNG still run */
@@ -19,6 +20,9 @@
 #define NEWDAWN_POSTFX_STAGE_OPAQUE_END 0   /* ambient occlusion / shadows on the opaque geometry drawn so far */
 #define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */
 #define NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN 2 /* start recording opaque shadow casters */
+
+/* One recorded grass ground triangle: world xyz of its three vertices. */
+#define NEWDAWN_GRASS_TRI_FLOATS 9
 
 /* One recorded VFX sprite: cls, ndcX, ndcY, ndcZ, viewDepth, halfW, halfH, seed, primRGBA(4), world xyz, unused, envRGBA(4). */
 #define NEWDAWN_VFX_FLOATS 20
@@ -40,6 +44,10 @@ typedef struct NewDawnPostFxParams {
     int32_t skySceneId;       /* cache invalidation only; never used to change game state */
     float skyWeather; /* 0 clear, 1 overcast */
     float skyOvercast; /* 1: winter Mountain Village's overcast deck (replaces its opaque fog fill) */
+    /* gNewDawn.Sky.Special variants, all read-only: 0 normal, 1 winter overcast, 2 final day, 3 cursed Ikana,
+       4 poisoned swamp. skyMood is the final day's 0..1 intensity derived from the game clock. */
+    int32_t skyVariant;
+    float skyMood;
 
     float flareSunPos[3]; /* native sun position, world space, read-only */
     float screenShaftStrength; /* HDR radial rays; independent of shadows and volumetric fog */
@@ -118,6 +126,14 @@ typedef struct NewDawnPostFxParams {
     float waterRestyle;           /* 0..1: replace the painted water colour with the absorption/scattering model */
     float waterScatter[3];        /* linear in-scatter colour of deep water (lit by the scene's light) */
     float waterAbsorb[3];         /* per-channel absorption coefficient, 1/world units */
+    float waterCaustics;          /* 0..1: animated caustics on lit surfaces below (and just above) the water planes */
+    float waterCausticDir[3];     /* unit vector towards the light that forms the caustics */
+    float waterCausticColor[3];   /* its colour, already scaled by the light's fade */
+    float waterUnderwater;        /* 0..1: underwater fog/absorption/god rays/refraction; 0 = off */
+    float waterEyeSurfaceY;       /* surface Y of the WaterBox the camera is below, valid when waterUnderwaterState > 0 */
+    int32_t waterCausticSun;      /* 1: the caustic light is the sun/moon the shadow map was built for */
+    float waterEyeRect[4];        /* XZ rect (minX, minZ, maxX, maxZ) of that WaterBox */
+    float waterUnderwaterState;   /* smoothed 0..1: 1 once the camera is below a surface, ramps down after leaving it */
     /* New Dawn art-directed grade, applied in display space after the base grade at the scene-end marker. The game
        computes the final (time-of-day interpolated, scene cross-faded, strength-scaled) look; 0 = skipped entirely. */
     int32_t artEnabled;
@@ -145,4 +161,12 @@ typedef struct NewDawnPostFxParams {
     float localColors[NEWDAWN_LOCAL_LIGHTS][3];      /* the light's own colour, 0..1 */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
     float localGain;         /* light intensity multiplier (interiors are lit harder) */
+    /* New Dawn grass: render-only instanced tufts on grass-textured ground, drawn at the opaque-end marker. Needs HDR. */
+    int32_t grassEnabled;
+    float grassDensity;      /* 0..2 multiplier on the tuft count */
+    float grassDistance;     /* world units; blades fade out and disappear here */
+    float grassHeight;       /* blade height multiplier */
+    float grassFocus[3];     /* the player's position: blades close to it are laid low (read-only snapshot) */
+    float grassSunDir[3];    /* unit vector towards the sun; all zero when there is none */
+    float grassSunColor[3];  /* sRGB 0..1 */
 } NewDawnPostFxParams;

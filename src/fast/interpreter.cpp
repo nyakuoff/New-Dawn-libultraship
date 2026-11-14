@@ -1223,6 +1223,77 @@ void Interpreter::SubmitVfx() {
     mRapi->SetVfxSprites(mVfxInst.empty() ? nullptr : mVfxInst.data(), (uint32_t)(mVfxInst.size() / NEWDAWN_VFX_FLOATS));
 }
 
+// ---- New Dawn grass: ground triangles whose texture is classified "grass" (tools/newdawn/grass_textures.py) are recorded in
+// world space and scattered with render-only tufts by the renderer at the opaque-end marker. Nothing here reads or changes
+// game state beyond the draw stream.
+namespace {
+const char* const kGrassTextures[] = {
+#include "fast/newdawn_grass_textures.inc"
+};
+} // namespace
+
+void Interpreter::BeginGrassRecording(bool enabled) {
+    mGrass = enabled;
+    mGrassTris.clear();
+    mGrassDebug = enabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Grass.Debug", 0);
+}
+
+uint16_t Interpreter::GrassClassify(std::string_view path) {
+    static const std::unordered_map<std::string_view, uint16_t> table = [] {
+        std::unordered_map<std::string_view, uint16_t> t;
+        for (size_t i = 0; i < sizeof(kGrassTextures) / sizeof(kGrassTextures[0]); i++) {
+            t.emplace(kGrassTextures[i], (uint16_t)(i + 1));
+        }
+        return t;
+    }();
+    const size_t slash = path.rfind('/');
+    const auto found = table.find(slash == std::string_view::npos ? path : path.substr(slash + 1));
+    return found == table.end() ? 0 : found->second;
+}
+
+void Interpreter::RecordGrassTriangle(const LoadedVertex* const v[3]) {
+    constexpr size_t kMaxGrassTriangles = 200000;
+    if (mGrassTris.size() >= kMaxGrassTriangles * NEWDAWN_GRASS_TRI_FLOATS) {
+        return;
+    }
+    const float* a = v[0]->view_pos;
+    const float* b = v[1]->view_pos;
+    const float* c = v[2]->view_pos;
+    const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+    const float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    // Ground only: walls, steep banks and degenerate slivers get no grass.
+    if (len < 1e-3f || std::fabs(n[1]) < 0.6f * len) {
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        mGrassTris.insert(mGrassTris.end(), v[i]->view_pos, v[i]->view_pos + 3);
+    }
+}
+
+void Interpreter::SubmitGrass() {
+    if (mGrassDebug) {
+        static int frame = 0;
+        if (++frame % 600 == 1) {
+            const size_t n = mGrassTris.size() / NEWDAWN_GRASS_TRI_FLOATS;
+            std::vector<std::pair<float, size_t>> big;
+            for (size_t i = 0; i < n; i++) {
+                const float* t = &mGrassTris[i * NEWDAWN_GRASS_TRI_FLOATS];
+                big.emplace_back(std::fabs((t[3] - t[0]) * (t[8] - t[2]) - (t[5] - t[2]) * (t[6] - t[0])), i);
+            }
+            std::sort(big.rbegin(), big.rend());
+            SPDLOG_INFO("GRASSDBG {} triangles recorded", n);
+            for (size_t k = 0; k < std::min<size_t>(12, big.size()); k++) {
+                const float* t = &mGrassTris[big[k].second * NEWDAWN_GRASS_TRI_FLOATS];
+                SPDLOG_INFO("GRASSDBG tri area {:.0f} centre {:.0f},{:.0f},{:.0f}", big[k].first * 0.5f,
+                            (t[0] + t[3] + t[6]) / 3, (t[1] + t[4] + t[7]) / 3, (t[2] + t[5] + t[8]) / 3);
+            }
+        }
+    }
+    mRapi->SetGrassTriangles(mGrassTris.empty() ? nullptr : mGrassTris.data(),
+                             (uint32_t)(mGrassTris.size() / NEWDAWN_GRASS_TRI_FLOATS));
+}
+
 void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
     constexpr size_t kMaxShadowVertices = 2 * 1024 * 1024;
     if (mShadowVertices.size() + 9 > kMaxShadowVertices * 3) {
@@ -2411,7 +2482,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // every caster, lit or not.
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
-        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx) {
+        if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
+            mGrass) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -2540,7 +2612,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording || mWindSway) {
+        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -2655,6 +2727,32 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
     }
     bool rejected = false;
+
+    // New Dawn grass: ground triangles are kept even when off-screen (their tufts can reach into view).
+    if (mGrass && !is_rect) {
+        const auto& lt = mRdp->loaded_texture[mRdp->texture_tile[mRdp->first_tile_index].tmem_index];
+        const uint32_t grassOm = mRdp->other_mode_l;
+        // Opaque ground only: not cut-out foliage, alpha-blended or decal draws.
+        if (lt.grassId != 0 && (grassOm & G_ZS_PRIM) == 0 && (grassOm & CVG_X_ALPHA) == 0 &&
+            (grassOm & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD && (grassOm & ZMODE_DEC) != ZMODE_DEC &&
+            !((grassOm & (3 << 20)) == (G_BL_CLR_MEM << 20) && (grassOm & (3 << 16)) == (G_BL_1MA << 16))) {
+            if (mGrassDebug) {
+                // gNewDawn.Grass.Debug=1 logs every recorded texture once; gNewDawn.Grass.Only=<substring> isolates one.
+                const std::string name = lt.raw_tex_metadata.resource->GetInitData()->Path;
+                static std::unordered_set<std::string> seenGrass;
+                if (seenGrass.insert(name).second) {
+                    SPDLOG_INFO("GRASSDBG texture {}", name);
+                }
+                const std::string only =
+                    Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Grass.Only", "");
+                if (!only.empty() && name.find(only) == std::string::npos) {
+                    goto skipGrass;
+                }
+            }
+            RecordGrassTriangle(v_arr);
+        }
+        skipGrass:;
+    }
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
@@ -3708,6 +3806,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     }
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -3784,6 +3883,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->texture_tile[tile].lrt = lrt;
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
 
@@ -5299,10 +5399,11 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginVfxRecording(gfx->mPostFxActive && params.vfxEnabled != 0);
+        gfx->BeginGrassRecording(gfx->mPostFxActive && params.grassEnabled != 0);
         gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
                                                          params.fogVolumetric != 0 || params.giEnabled != 0 ||
-                                                         params.vfxEnabled != 0));
+                                                         params.vfxEnabled != 0 || params.grassEnabled != 0));
         return false;
     }
 
@@ -5326,6 +5427,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
                 effective.shadowEnabled = 0;
             }
             gfx->SubmitShadowCasters();
+            gfx->SubmitGrass();
+            gfx->mGrass = false;
         } else if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) {
             gfx->SubmitVfx();
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
