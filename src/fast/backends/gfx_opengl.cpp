@@ -135,6 +135,13 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
                     std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
                                    "gNewDawn.Materials.Strength", 1.0f),
                                0.0f, 2.0f));
+        // Parallax: depth is a fraction of the texture's world size; fades out by the distance cvar (game units).
+        const auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        const float parallax = cvars->GetInteger("gNewDawn.Materials.Parallax", 0) != 0
+                                   ? std::clamp(cvars->GetFloat("gNewDawn.Materials.ParallaxScale", 0.07f), 0.0f, 0.2f)
+                                   : 0.0f;
+        glUniform2f(mCurrentShaderProgram->material_parallax_location, parallax,
+                    std::clamp(cvars->GetFloat("gNewDawn.Materials.ParallaxDistance", 700.0f), 100.0f, 4000.0f));
     }
     glUniform1i(mCurrentShaderProgram->hdr_location, HdrWorldActive());
     bool skyAmbient = false, skyReflections = false;
@@ -200,6 +207,7 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1i(prg->per_pixel_shade_mask_location, state.shadeMask);
         glUniform1f(prg->per_pixel_quality_location, state.pointLightQuality);
         glUniform4fv(prg->per_pixel_character_location, 1, state.characterLight);
+        glUniform4fv(prg->material_eye_location, 1, state.cameraPosition);
     }
 }
 
@@ -753,6 +761,8 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->material_mirror_location = glGetUniformLocation(shader_program, "uMaterialMirror");
     prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
     prg->material_debug_location = glGetUniformLocation(shader_program, "uMaterialDebug");
+    prg->material_parallax_location = glGetUniformLocation(shader_program, "uMaterialParallax");
+    prg->material_eye_location = glGetUniformLocation(shader_program, "uMaterialEye");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
     prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
 
