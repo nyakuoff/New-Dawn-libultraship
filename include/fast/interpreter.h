@@ -474,6 +474,7 @@ class Interpreter {
     void BeginVfxRecording(bool enabled);
     uint8_t VfxClassify(std::string_view path);
     void RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, float frame);
+    void RecordVfxArrow(const LoadedVertex* const v[3], uint8_t cls);
     void SubmitVfx();
     void BeginGrassRecording(bool enabled);
     uint16_t GrassClassify(std::string_view path);
@@ -649,6 +650,9 @@ class Interpreter {
     uint8_t mVfxLastClass = 0, mVfxLastCount = 0;
     const LoadedVertex* mVfxLastVerts[3] = {};
     std::vector<float> mVfxInst;
+    std::vector<float> mVfxArrowPts; // NDC points of the magic-arrow model being accumulated (one instance per model)
+    uint32_t mVfxArrowLastTri = 0;
+    int64_t mVfxArrowInst = -1;
     // New Dawn grass: world-space ground triangles with a grass texture (NEWDAWN_GRASS_TRI_FLOATS floats each).
     bool mGrass = false, mGrassDebug = false;
     std::vector<float> mGrassTris;
