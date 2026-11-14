@@ -120,7 +120,7 @@ void main() {
         vLayerKind = float(cls * 10 + l);
         vSeed = p;
         float rot = seed * 6.2831 + float(l) * 1.9 + p * (cls == 3 ? 0.5 : 0.25) * (0.5 + hash(seed));
-        float scale = cls == 3 ? 0.85 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 2.2 : 1.2) : 1.0));
+        float scale = cls == 3 ? 0.85 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : (cls == 6 ? (l == 0 ? 1.7 : 0.8) : 1.0));
         vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
         float r = max(hp.x, hp.y) * scale;
         vec2 local = vec2(cos(rot) * q.x - sin(rot) * q.y, sin(rot) * q.x + cos(rot) * q.y) * r;
@@ -253,7 +253,7 @@ void main() {
             al = t.a * (0.4 + 0.6 * t.r) * (1.0 - smoothstep(0.55, 1.0, p));
         } else if (cls == 6) { // sparkle: crisp HDR 4-point star with a small halo; the game's env alpha is its twinkle
             float tw = mix(0.3, 1.0, clamp(vEnv.a, 0.0, 1.0));
-            c = l == 0 ? mix(vPrim.rgb, vec3(1.0), 0.15) * 5.0 * tw : mix(vEnv.rgb, vPrim.rgb, 0.3) * 3.0;
+            c = l == 0 ? mix(vEnv.rgb, vPrim.rgb, 0.45) * 5.5 * tw : vEnv.rgb * 2.5;
             al = l == 0 ? t.a * t.r * vAlpha * tw : pow(t.a * t.r, 1.5) * vAlpha * 0.35 * tw;
         } else if (cls == 5) { // hit spark
             c = max(vPrim.rgb, vec3(0.2)) * 5.0 * (1.0 - 0.6 * p);
