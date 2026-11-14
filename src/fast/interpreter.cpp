@@ -1061,7 +1061,9 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gFireArrow", VFX_ARROW_FIRE }, // Tex and MaskTex: the 43-vertex glow model
         { "gIceArrow", VFX_ARROW_ICE },
         { "gLightArrow", VFX_ARROW_LIGHT },
-        { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
+        // Sparkles are deliberately NOT classified: the native small pink four-point stars are crisper than the Kenney
+        // star_01 replacement (docs/VFX.md). Re-add { "gameplay_keep_Tex_054AF0", VFX_SPARKLE } with a better sprite to enable.
+        // { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
     };
     uint8_t cls = VFX_NONE;
     for (const auto& [name, c] : kTable) {
