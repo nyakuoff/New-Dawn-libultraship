@@ -2965,6 +2965,7 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 14) ? "screen-space GI"
                                 : (stage == 15) ? "VFX sprites"
                                 : (stage == 16) ? "local lights"
+                                : (stage == 17) ? "grass"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -3458,6 +3459,8 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doGrass = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.grassEnabled && mGrassCount > 0 &&
+                         params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doShafts = CvInt("gNewDawn.SunShafts.Mode", 0) == 0 && !doFog && doShadow &&
                           params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
@@ -3465,7 +3468,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi &&
-        !doVfx && !doLocal) {
+        !doVfx && !doLocal && !doGrass) {
         return;
     }
 
@@ -3486,6 +3489,13 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
+    if (doGrass) {
+        // Drawn into the world before depth is copied: the AO, shadow, local-light and GI passes then treat tufts as
+        // ordinary opaque geometry.
+        BeginTimer(kGrassTimerStage);
+        RunGrass(params, fb);
+        EndTimer(kGrassTimerStage);
+    }
     if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal) {
         PrepareDepth(fb);
     }

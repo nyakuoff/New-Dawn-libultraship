@@ -20,6 +20,9 @@
 #define NEWDAWN_POSTFX_STAGE_SCENE_END 1    /* bloom, colour grade and dithering of the finished world */
 #define NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN 2 /* start recording opaque shadow casters */
 
+/* One recorded grass ground triangle: world xyz of its three vertices. */
+#define NEWDAWN_GRASS_TRI_FLOATS 9
+
 /* One recorded VFX sprite: cls, ndcX, ndcY, ndcZ, viewDepth, halfW, halfH, seed, primRGBA(4), world xyz, unused, envRGBA(4). */
 #define NEWDAWN_VFX_FLOATS 20
 
@@ -145,4 +148,12 @@ typedef struct NewDawnPostFxParams {
     float localColors[NEWDAWN_LOCAL_LIGHTS][3];      /* the light's own colour, 0..1 */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
     float localGain;         /* light intensity multiplier (interiors are lit harder) */
+    /* New Dawn grass: render-only instanced tufts on grass-textured ground, drawn at the opaque-end marker. Needs HDR. */
+    int32_t grassEnabled;
+    float grassDensity;      /* 0..2 multiplier on the tuft count */
+    float grassDistance;     /* world units; blades fade out and disappear here */
+    float grassHeight;       /* blade height multiplier */
+    float grassFocus[3];     /* the player's position: blades close to it are laid low (read-only snapshot) */
+    float grassSunDir[3];    /* unit vector towards the sun; all zero when there is none */
+    float grassSunColor[3];  /* sRGB 0..1 */
 } NewDawnPostFxParams;

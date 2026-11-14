@@ -315,6 +315,7 @@ struct RDP {
         bool masked;
         bool blended;
         uint8_t vfxClass; // New Dawn VFX: classification of the loaded texture's path (0 = none)
+        uint16_t grassId; // New Dawn grass: 1 + index into the grass texture table (0 = not grass)
     } loaded_texture[2];
     struct {
         uint8_t fmt;
@@ -474,6 +475,10 @@ class Interpreter {
     uint8_t VfxClassify(std::string_view path);
     void RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, float frame);
     void SubmitVfx();
+    void BeginGrassRecording(bool enabled);
+    uint16_t GrassClassify(std::string_view path);
+    void RecordGrassTriangle(const LoadedVertex* const v[3]);
+    void SubmitGrass();
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
@@ -644,6 +649,9 @@ class Interpreter {
     uint8_t mVfxLastClass = 0, mVfxLastCount = 0;
     const LoadedVertex* mVfxLastVerts[3] = {};
     std::vector<float> mVfxInst;
+    // New Dawn grass: world-space ground triangles with a grass texture (NEWDAWN_GRASS_TRI_FLOATS floats each).
+    bool mGrass = false, mGrassDebug = false;
+    std::vector<float> mGrassTris;
     // Debug.Stats profiles only displacement work (including timer overhead), averaged over 300 frames.
     bool mWindProfile = false;
     uint32_t mWindProfileFrames = 0;
