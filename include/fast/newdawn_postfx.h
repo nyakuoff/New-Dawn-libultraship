@@ -122,6 +122,14 @@ typedef struct NewDawnPostFxParams {
     float waterRestyle;           /* 0..1: replace the painted water colour with the absorption/scattering model */
     float waterScatter[3];        /* linear in-scatter colour of deep water (lit by the scene's light) */
     float waterAbsorb[3];         /* per-channel absorption coefficient, 1/world units */
+    float waterCaustics;          /* 0..1: animated caustics on lit surfaces below (and just above) the water planes */
+    float waterCausticDir[3];     /* unit vector towards the light that forms the caustics */
+    float waterCausticColor[3];   /* its colour, already scaled by the light's fade */
+    float waterUnderwater;        /* 0..1: underwater fog/absorption/god rays/refraction; 0 = off */
+    float waterEyeSurfaceY;       /* surface Y of the WaterBox the camera is below, valid when waterUnderwaterState > 0 */
+    int32_t waterCausticSun;      /* 1: the caustic light is the sun/moon the shadow map was built for */
+    float waterEyeRect[4];        /* XZ rect (minX, minZ, maxX, maxZ) of that WaterBox */
+    float waterUnderwaterState;   /* smoothed 0..1: 1 once the camera is below a surface, ramps down after leaving it */
     /* New Dawn art-directed grade, applied in display space after the base grade at the scene-end marker. The game
        computes the final (time-of-day interpolated, scene cross-faded, strength-scaled) look; 0 = skipped entirely. */
     int32_t artEnabled;

@@ -123,6 +123,7 @@ class PostFxGL {
     static constexpr int kFlareUnit = 15;
     static constexpr int kFlareSpritesUnit = 16;
     static constexpr int kFlareCloudUnit = 17;
+    static constexpr int kCausticUnit = 28; // atmos 16..19 and 24, vfx 25..27 are taken
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
     }
@@ -198,6 +199,9 @@ class PostFxGL {
                     uint32_t vertexCount, int debug);
     void RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunUnderwater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    bool EnsureCausticAssets();
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
@@ -255,6 +259,11 @@ class PostFxGL {
     Program mDownHdr, mCompositeHdr, mCompositeNoDither, mShadowApplyHdr;
     Program mShadowDepth, mShadowApply, mShadowFoliage;
     Program mShadowApplyCsm, mShadowApplyHdrCsm, mShaftMarchCsm, mFogMarchCsm, mGiGatherCsm; // CSM variants
+    Program mCaustics, mCausticsCsm, mUnderwater, mUnderwaterShaft, mUnderwaterShaftCsm;
+    Target mUwShaft; // half resolution underwater light shafts
+    GLuint mCausticTex = 0, mCausticDummy = 0; // 32-layer caustics flipbook on unit kCausticUnit
+    std::string mCausticAssetPath;
+    uint32_t mShadowReadyFrame = UINT32_MAX; // settings frame whose sun shadow map is valid
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply, mWaterSurface;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
     const Program* mCurrentProgram = nullptr;
@@ -320,8 +329,10 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 17;
+    static constexpr int kQueryStages = 19;
     static constexpr int kLocalTimerStage = 16;
+    static constexpr int kCausticsTimerStage = 17;
+    static constexpr int kUnderwaterTimerStage = 18;
     static constexpr int kGiTimerStage = 14;
     static constexpr int kFlareTimerStage = 10;
     static constexpr int kFogTimerStage = 9;

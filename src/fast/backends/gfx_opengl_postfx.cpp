@@ -2461,6 +2461,276 @@ void main() {
 )GLSL";
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Water caustics and underwater rendering. Both read the WaterBox planes (kWaterPlaneLib), the sun shadow map and one
+// self-rendered 32-frame seamless caustics flipbook (a texture array on kCausticUnit, see tools/newdawn/caustics).
+// ---------------------------------------------------------------------------------------------------------------------
+static const char* kCausticLib = R"GLSL(
+uniform sampler2DArray uCausticTex;
+uniform float uCausticFrame; // playback position, in flipbook frames
+uniform sampler2DShadow uShadowCmp;
+uniform bool uShadowReady;
+uniform mat4 uLightViewProj;
+const float kCausticTile = 320.0;
+#ifdef CSM
+float csmTap(vec3 uvz) {
+    return texture(uShadowCmp, uvz);
+}
+#endif
+// Photon density (mean 1) at a world xz position, two flipbook layers at different scale/rotation/phase so the
+// repetition is not readable. lod blurs the pattern for the soft god rays.
+float causticSample(vec2 uv, float frame, float lod) {
+    float f0 = floor(frame);
+    float a = mod(f0, 32.0);
+    float b = mod(f0 + 1.0, 32.0);
+    return mix(textureLod(uCausticTex, vec3(uv, a), lod).r, textureLod(uCausticTex, vec3(uv, b), lod).r, frame - f0) * 4.0;
+}
+float causticPattern(vec2 xz, float lod) {
+    float a = causticSample(xz / kCausticTile, uCausticFrame, lod);
+    vec2 r = vec2(xz.x * 0.866 - xz.y * 0.5, xz.x * 0.5 + xz.y * 0.866);
+    float b = causticSample(r / (kCausticTile * 0.62) + 0.37, uCausticFrame * 0.8 + 11.0, lod);
+    return a * (0.35 + 0.65 * b);
+}
+float sunVisibility(vec3 pos) {
+    if (!uShadowReady) {
+        return 1.0;
+    }
+#ifdef CSM
+    float s = csmLit(pos, vec3(0.0), csmViewDepth(pos), 0.0, 0.004);
+    return s < 0.0 ? 1.0 : s;
+#else
+    vec4 lc = uLightViewProj * vec4(pos, 1.0);
+    vec3 sc = lc.xyz / lc.w * 0.5 + 0.5;
+    if (any(lessThan(sc, vec3(0.0))) || any(greaterThan(sc, vec3(1.0)))) {
+        return 1.0;
+    }
+    float edge = smoothstep(0.0, 0.04, min(min(sc.x, 1.0 - sc.x), min(sc.y, 1.0 - sc.y)));
+    return mix(1.0, texture(uShadowCmp, vec3(sc.xy, sc.z - 0.003)), edge);
+#endif
+}
+float rectMask(vec2 w, vec4 rect, float soft) {
+    vec2 m = min(w - rect.xy, rect.zw - w);
+    return smoothstep(0.0, soft, min(m.x, m.y));
+}
+)GLSL";
+
+// Caustics: runs at the opaque end, before the opaque colour capture, so refraction/absorption of the bed includes them.
+// Output is a gain g, blended as dst * (1 + g). Below a plane the sun enters the surface at W and reaches the surface
+// along the refracted direction; just above a plane the surface reflects the light onto it (reflected direction).
+static const char* kCausticsShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform float uStrength;
+uniform float uPixelAngle;
+uniform float uFogMul;
+uniform float uFogOff;
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform vec3 uAbsorb;
+
+vec3 normalFromDepth(ivec2 p, vec3 P) {
+    vec3 L = worldPos(p - ivec2(1, 0), fetchDepth(p - ivec2(1, 0)));
+    vec3 R = worldPos(p + ivec2(1, 0), fetchDepth(p + ivec2(1, 0)));
+    vec3 B = worldPos(p - ivec2(0, 1), fetchDepth(p - ivec2(0, 1)));
+    vec3 T = worldPos(p + ivec2(0, 1), fetchDepth(p + ivec2(0, 1)));
+    vec3 dx = length(R - P) < length(P - L) ? R - P : P - L;
+    vec3 dy = length(T - P) < length(P - B) ? T - P : P - B;
+    vec3 N = normalize(cross(dx, dy) + vec3(0.0, 1e-6, 0.0));
+    return dot(N, uEye - P) < 0.0 ? -N : N;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    oColor = vec4(0.0);
+    float d = fetchDepth(p);
+    if (d >= 0.99999) {
+        return;
+    }
+    vec3 P = worldPos(p, d);
+    vec3 Lt = normalize(uLightDir);
+    if (Lt.y < 0.12) {
+        return;
+    }
+    vec3 up = normalize(-refract(-Lt, vec3(0.0, 1.0, 0.0), 1.0 / 1.33)); // refracted light, towards the surface
+    vec3 Rf = vec3(-Lt.x, Lt.y, -Lt.z);                                    // mirror-reflected light, away from it
+    float fres = 0.02 + 0.98 * pow(1.0 - Lt.y, 5.0);
+    float dist = length(P - uEye);
+    vec3 N = normalFromDepth(p, P);
+    float gain = 0.0;
+    vec3 tint = vec3(1.0);
+    for (int i = 0; i < uBoxCount; i++) {
+        float y = uBoxY[i];
+        float below = y - P.y;
+        if (below > 2.0 && below < 700.0) {
+            float t = below / up.y;
+            vec2 W = P.xz + up.xz * t;
+            float inside = rectMask(W, uBoxRect[i], 14.0);
+            if (inside <= 0.0) {
+                continue;
+            }
+            float facing = clamp(dot(N, up) / max(up.y, 0.4), 0.0, 1.0);
+            float vis = min(sunVisibility(vec3(W.x, y + 1.0, W.y)), sunVisibility(P + N * 2.0));
+            float lod = clamp(log2(max(dist * uPixelAngle / kCausticTile * 256.0, 1.0)), 0.0, 5.0);
+            float c = causticPattern(W, lod);
+            float fade = exp(-below / 130.0);
+            gain = c * facing * vis * fade * inside * 1.1;
+            tint = exp(-t * uAbsorb * 0.8);
+            break;
+        } else if (below < -2.0 && below > -90.0) {
+            float h = P.y - y;
+            float t = h / Rf.y;
+            vec2 W = P.xz - Rf.xz * t;
+            float inside = rectMask(W, uBoxRect[i], 8.0);
+            if (inside <= 0.0) {
+                continue;
+            }
+            float facing = clamp(dot(N, -Rf) * 1.2, 0.0, 1.0);
+            float vis = sunVisibility(vec3(W.x, y + 1.0, W.y));
+            float c = causticPattern(W * 0.8, clamp(log2(max(dist * uPixelAngle / kCausticTile * 256.0, 1.0)), 0.0, 5.0));
+            gain = c * facing * vis * exp(-h / 40.0) * inside * (0.12 + 3.0 * fres);
+            break;
+        }
+    }
+    if (gain <= 0.0) {
+        return;
+    }
+    // Light colour normalised to a unit luminance; its brightness (the sun fade) lives in uLightColor's length.
+    float lum = max(dot(uLightColor, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    vec3 col = uLightColor / lum * min(lum, 1.0);
+    float fog = clamp(clamp(d * 2.0 - 1.0, -1.0, 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
+    oColor = vec4(col * tint * gain * uStrength * (1.0 - fog), 0.0);
+}
+)GLSL";
+
+// Underwater: camera below a plane. One ray march per pixel through the water between the camera and the geometry
+// (or the surface above), accumulating depth-dependent ambient in-scatter and sun shafts that follow the surface
+// caustic pattern and the sun shadow map, and attenuating the scene with the palette's absorption. A small
+// time-varying screen displacement gives the wavy refraction. uUnder cross-fades the whole thing.
+static const char* kUnderwaterShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform sampler2D uUwShafts;
+uniform float uTime;
+uniform float uUnder;
+uniform float uPlaneY;
+uniform vec4 uEyeRect;
+uniform vec3 uScatter;
+uniform vec3 uAbsorb;
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform vec3 uSky;
+uniform float uShaftStrength;
+
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// Water interval [t0, t1] (distance from the eye) along the view ray through pixel q.
+vec3 rayDir(ivec2 q, out float s, out float t0, out float t1) {
+    float dq = fetchDepth(q);
+    bool sky = dq >= 0.99999;
+    vec3 ray = worldPos(q, sky ? 0.9999 : dq) - uEye;
+    vec3 dir = ray / max(length(ray), 1e-3);
+    s = sky ? 2200.0 : length(ray);
+    t0 = 0.0;
+    t1 = s;
+    float tp = abs(dir.y) > 1e-4 ? (uPlaneY - uEye.y) / dir.y : 1e9;
+    if (uEye.y < uPlaneY) {
+        if (dir.y > 0.0) {
+            t1 = min(t1, tp);
+        }
+    } else if (dir.y < 0.0) {
+        t0 = min(max(tp, 0.0), s);
+    } else {
+        t1 = 0.0;
+    }
+    return dir;
+}
+
+vec3 sigmaCoefficient() {
+    return uAbsorb * 0.5 + vec3(1.0 / 2600.0);
+}
+
+#ifdef SHAFT_PASS
+// Half resolution: the sunlit light shafts only (the expensive, texture and shadow bound part).
+void main() {
+    ivec2 q = min(ivec2(gl_FragCoord.xy) * 2, uSize - 1);
+    float s, t0, t1;
+    vec3 dir = rayDir(q, s, t0, t1);
+    vec3 Lt = normalize(uLightDir);
+    oColor = vec4(0.0);
+    if (Lt.y <= 0.12 || dot(uLightColor, vec3(1.0)) <= 1e-3 || uShaftStrength <= 0.0) {
+        return;
+    }
+    vec3 up = normalize(-refract(-Lt, vec3(0.0, 1.0, 0.0), 1.0 / 1.33));
+    float g = 0.55;
+    float cosT = dot(-up, -dir);
+    float phase = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * cosT, 0.05), 1.5);
+    float lumSun = dot(uLightColor, vec3(0.2126, 0.7152, 0.0722));
+    vec3 sunCol = uLightColor / max(lumSun, 1e-4) * min(lumSun, 1.0);
+    vec3 sigma = sigmaCoefficient();
+    const int kSteps = 16;
+    float ds = max(t1 - t0, 0.0) / float(kSteps);
+    float jitter = ign(gl_FragCoord.xy);
+    float lod = clamp(log2(max(ds * 0.35, 1.0)), 2.0, 6.0);
+    vec3 T = vec3(1.0);
+    vec3 scat = vec3(0.0);
+    for (int i = 0; i < kSteps; ++i) {
+        vec3 X = uEye + dir * (t0 + (float(i) + jitter) * ds);
+        float depthX = max(uPlaneY - X.y, 0.0);
+        vec2 W = X.xz + up.xz * (depthX / up.y);
+        float vis = rectMask(W, uEyeRect, 16.0);
+        vec3 stepT = exp(-sigma * ds);
+        if (vis > 0.0) {
+            vis *= sunVisibility(vec3(W.x, uPlaneY + 1.0, W.y));
+            float pat = causticPattern(W, lod);
+            vec3 sunAtt = exp(-depthX / up.y * uAbsorb);
+            scat += T * (1.0 - stepT) * sunCol * sunAtt * (pat * pat * vis * phase * 0.9 * uShaftStrength);
+        }
+        T *= stepT;
+    }
+    oColor = vec4(scat, 1.0);
+}
+#else
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec2 sz = vec2(uSize);
+    vec2 uv = (vec2(p) + 0.5) / sz;
+    vec3 C0 = texelFetch(uScene, p, 0).rgb;
+    // Wavy refraction: slow broad swell plus finer ripple, about 3 px.
+    vec2 w = vec2(sin(uv.y * 17.0 + uTime * 1.3) + 0.6 * sin(uv.y * 43.0 - uTime * 2.1 + uv.x * 9.0),
+                  sin(uv.x * 21.0 + uTime * 1.1) + 0.6 * sin(uv.x * 51.0 + uTime * 1.9 - uv.y * 7.0));
+    vec2 suv = clamp(uv + w * 0.0016 * uUnder * vec2(1.0, sz.x / sz.y), 0.5 / sz, 1.0 - 0.5 / sz);
+    ivec2 q = ivec2(suv * sz);
+    vec3 C = texture(uScene, suv).rgb;
+    float s, t0, t1;
+    vec3 dir = rayDir(q, s, t0, t1);
+    vec3 Lt = normalize(uLightDir);
+    vec3 sigma = sigmaCoefficient();
+    vec3 lit = uSky * 0.55 + uLightColor * (0.25 + 0.75 * max(Lt.y, 0.0)) * 0.45;
+    float lumLit = dot(lit, vec3(0.2126, 0.7152, 0.0722));
+    float E = clamp(lumLit, 0.45, 1.4);
+    vec3 tintLight = mix(vec3(1.0), lit / max(lumLit, 1e-3), 0.3);
+    const int kSteps = 8;
+    float ds = max(t1 - t0, 0.0) / float(kSteps);
+    float jitter = ign(gl_FragCoord.xy);
+    vec3 T = vec3(1.0);
+    vec3 scat = vec3(0.0);
+    vec3 stepT = exp(-sigma * ds);
+    for (int i = 0; i < kSteps; ++i) {
+        float depthX = max(uPlaneY - (uEye.y + dir.y * (t0 + (float(i) + jitter) * ds)), 0.0);
+        vec3 S = uScatter * tintLight * E * max(exp(-depthX / 260.0), 0.18);
+        scat += T * (1.0 - stepT) * S;
+        T *= stepT;
+    }
+    scat += texture(uUwShafts, suv).rgb;
+    vec3 result = C * T + scat;
+    oColor = vec4(mix(C0, result, clamp(uUnder, 0.0, 1.0)), 1.0);
+}
+#endif
+)GLSL";
+
+// ---------------------------------------------------------------------------------------------------------------------
 // GL helpers
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -2530,7 +2800,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
                           { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
-                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 } }) {
+                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 }, { "uCausticTex", PostFxGL::kCausticUnit }, { "uUwShafts", 10 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -2651,7 +2921,7 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units <= kFlareCloudUnit) {
+    if (units <= kCausticUnit) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
@@ -2816,6 +3086,37 @@ void main() { fragColor = texture(uScene, vUv); }
     mWaterReflectionApply.id = BuildProgram("water reflection upsample", waterApply, 4, mWaterReflectionApply.uniforms);
     const char* waterSurface[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterSurfaceShader };
     mWaterSurface.id = BuildProgram("water surface shader", waterSurface, 4, mWaterSurface.uniforms);
+    {
+        // Caustics/underwater: optional. Their texture array lives on its own unit (kCausticUnit) with a complete dummy
+        // bound from creation on, so no program ever observes unit 0 for that sampler.
+        GLint previousActiveCaustic;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveCaustic);
+        glActiveTexture(GL_TEXTURE0 + kCausticUnit);
+        glGenTextures(1, &mCausticDummy);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, mCausticDummy);
+        const uint8_t zero = 0;
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R8, 1, 1, 1, 0, GL_RED, GL_UNSIGNED_BYTE, &zero);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(previousActiveCaustic);
+        const char* kCsmDefine = "#define CSM 1\n";
+        const char* caustics[] = { kVersion, kDepthLib, kWaterPlaneLib, kCausticLib, kCausticsShader };
+        const char* causticsCsm[] = { kVersion, kCsmDefine, kDepthLib, kWaterPlaneLib, kNewDawnCsmLib, kCausticLib,
+                                      kCausticsShader };
+        const char* underwater[] = { kVersion, kDepthLib, kWaterPlaneLib, kUnderwaterShader };
+        const char* kShaftDefine = "#define SHAFT_PASS 1\n";
+        const char* underwaterShaft[] = { kVersion, kShaftDefine, kDepthLib, kWaterPlaneLib, kCausticLib,
+                                          kUnderwaterShader };
+        const char* kShaftCsmDefine = "#define SHAFT_PASS 1\n#define CSM 1\n";
+        const char* underwaterShaftCsm[] = { kVersion, kShaftCsmDefine, kDepthLib, kWaterPlaneLib, kNewDawnCsmLib,
+                                             kCausticLib, kUnderwaterShader };
+        mCaustics.id = BuildProgram("water caustics", caustics, 5, mCaustics.uniforms);
+        mCausticsCsm.id = BuildProgram("water caustics (cascades)", causticsCsm, 7, mCausticsCsm.uniforms);
+        mUnderwater.id = BuildProgram("underwater", underwater, 4, mUnderwater.uniforms);
+        mUnderwaterShaft.id = BuildProgram("underwater shafts", underwaterShaft, 6, mUnderwaterShaft.uniforms);
+        mUnderwaterShaftCsm.id =
+            BuildProgram("underwater shafts (cascades)", underwaterShaftCsm, 7, mUnderwaterShaftCsm.uniforms);
+    }
     if (mWaterSurface.id) {
         // Reuse the four dedicated postfx 2D lanes (8..11). Every sampler is distinct at creation, and each
         // lane has a complete dummy until a pass supplies its target. Never leave a new sampler on unit 0.
@@ -2985,6 +3286,8 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 14) ? "screen-space GI"
                                 : (stage == 15) ? "VFX sprites"
                                 : (stage == 16) ? "local lights"
+                                : (stage == 17) ? "water caustics"
+                                : (stage == 18) ? "underwater"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -3581,6 +3884,12 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doCaustics = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterCaustics > 0.0f &&
+                            params.waterBoxCount > 0 && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
+                            s.shadowDebug == 0;
+    const bool doUnderwater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterUnderwater > 0.0f &&
+                              params.waterUnderwaterState > 0.0f && params.shadowUseExactProj && mUnderwater.id &&
+                              s.debugView == 0 && s.shadowDebug == 0;
     const bool doShafts = CvInt("gNewDawn.SunShafts.Mode", 0) == 0 && !doFog && doShadow &&
                           params.shaftEnabled != 0 && params.shaftStrength > 0.0f && s.debugView != 2 &&
                           s.shadowDebug == 0;
@@ -3588,7 +3897,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi &&
-        !doVfx && !doLocal) {
+        !doVfx && !doLocal && !doCaustics && !doUnderwater) {
         return;
     }
 
@@ -3609,10 +3918,16 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
 
-    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal) {
+    if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal || doCaustics ||
+        doUnderwater) {
         PrepareDepth(fb);
     }
-    if (doWater) {
+    if (doUnderwater) {
+        BeginTimer(kUnderwaterTimerStage);
+        RunUnderwater(params, fb);
+        EndTimer(kUnderwaterTimerStage);
+    }
+    if (doWater && !(doUnderwater && params.waterUnderwaterState >= 1.0f)) {
         BeginTimer(kWaterTimerStage);
         RunWaterSurface(params, fb);
         if (params.waterStrength > 0.0f || params.waterReflections != 0) {
@@ -3643,6 +3958,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(kLocalTimerStage);
         RunLocalLights(params, fb, frameIndex);
         EndTimer(kLocalTimerStage);
+    }
+    if (doCaustics) {
+        BeginTimer(kCausticsTimerStage);
+        RunCaustics(params, fb);
+        EndTimer(kCausticsTimerStage);
     }
     if (doShafts) {
         BeginTimer(kShaftTimerStage);
@@ -4031,6 +4351,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform1i(Loc("uDebug"), debug);
     Draw(fb.fbo, w, h);
     glBindSampler(kFirstUnit + 3, 0);
+    mShadowReadyFrame = mSettingsFrame;
     CheckError("shadow apply");
 }
 
@@ -4119,6 +4440,176 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
     CheckError("water surface");
 }
 
+
+bool PostFxGL::EnsureCausticAssets() {
+    const std::string root = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString(
+        "gNewDawn.Assets.Path", "assets/newdawn");
+    if (root == mCausticAssetPath)
+        return mCausticTex != 0;
+    mCausticAssetPath = root;
+    if (mCausticTex) {
+        glDeleteTextures(1, &mCausticTex);
+        mCausticTex = 0;
+    }
+    constexpr int dim = 256, cols = 8, rows = 4;
+    const auto path = std::filesystem::path(root) / "caustics" / "caustics_8x4.png";
+    int w = 0, h = 0, components = 0;
+    auto* data = stbi_load(path.string().c_str(), &w, &h, &components, 1);
+    if (!data || w != dim * cols || h != dim * rows) {
+        stbi_image_free(data);
+        SPDLOG_WARN("NewDawnCaustics: missing/unsupported flipbook {} (expected {}x{} grey); caustics and underwater "
+                    "shafts are skipped. Set gNewDawn.Assets.Path to the asset root.",
+                    path.string(), dim * cols, dim * rows);
+        return false;
+    }
+    std::vector<uint8_t> layers((size_t)dim * dim * cols * rows);
+    for (int f = 0; f < cols * rows; ++f) {
+        for (int row = 0; row < dim; ++row) {
+            std::memcpy(layers.data() + ((size_t)f * dim + row) * dim,
+                        data + ((size_t)(f / cols) * dim + row) * w + (size_t)(f % cols) * dim, dim);
+        }
+    }
+    stbi_image_free(data);
+    glActiveTexture(GL_TEXTURE0 + kCausticUnit);
+    glGenTextures(1, &mCausticTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, mCausticTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R8, dim, dim, cols * rows, 0, GL_RED, GL_UNSIGNED_BYTE, layers.data());
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    SPDLOG_INFO("NewDawnCaustics: loaded the {} caustics frames from {}", cols * rows, path.string());
+    return true;
+}
+
+// Shared by the caustics and underwater passes: plane/camera uniforms, the shadow sampler and the flipbook clock.
+void PostFxGL::RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if (!EnsureCausticAssets()) {
+        return;
+    }
+    const int w = fb.width, h = fb.height;
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    float rect[NEWDAWN_MAX_WATER_BOXES * 4] = {};
+    float surfaceY[NEWDAWN_MAX_WATER_BOXES] = {};
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 4; j++) {
+            rect[i * 4 + j] = params.waterBoxes[i][j];
+        }
+        surfaceY[i] = params.waterBoxes[i][4];
+    }
+    const bool shadowReady = params.waterCausticSun != 0 && mShadowReadyFrame == mSettingsFrame && mShadowMap.tex != 0;
+    const bool csm = shadowReady && mCsm.count > 1;
+    glDisable(GL_SCISSOR_TEST);
+    Bind(1, mDepth.tex);
+    Bind(3, shadowReady ? mShadowMap.tex : mDepth.tex);
+    glBindSampler(kFirstUnit + 3, mCmpSampler);
+    Use(csm ? mCausticsCsm : mCaustics);
+    SetCascadeUniforms();
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+    glUniform1i(Loc("uBoxCount"), count);
+    glUniform4fv(Loc("uBoxRect"), count, rect);
+    glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    glUniform1i(Loc("uShadowReady"), shadowReady);
+    if (shadowReady && !csm) {
+        float lightViewProj[16];
+        BuildLightViewProj(params, lightViewProj);
+        glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+    }
+    glUniform1f(Loc("uCausticFrame"), params.waterTime * 12.0f);
+    glUniform1f(Loc("uStrength"), params.waterCaustics);
+    glUniform1f(Loc("uPixelAngle"), 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h);
+    glUniform3fv(Loc("uLightDir"), 1, params.waterCausticDir);
+    glUniform3fv(Loc("uLightColor"), 1, params.waterCausticColor);
+    glUniform3fv(Loc("uAbsorb"), 1, params.waterAbsorb);
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
+    glUniform1f(Loc("uFogMul"), fogMul);
+    glUniform1f(Loc("uFogOff"), fogOff);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_DST_COLOR, GL_ONE); // dst * (1 + gain)
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    glBindSampler(kFirstUnit + 3, 0);
+    CheckError("water caustics");
+}
+
+void PostFxGL::RunUnderwater(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if (!EnsureCausticAssets() || !mUnderwaterShaft.id) {
+        return;
+    }
+    const int w = fb.width, h = fb.height;
+    const int hw = std::max(w / 2, 1), hh = std::max(h / 2, 1);
+    const bool shadowReady = params.waterCausticSun != 0 && mShadowReadyFrame == mSettingsFrame && mShadowMap.tex != 0;
+    const bool csm = shadowReady && mCsm.count > 1;
+    glDisable(GL_SCISSOR_TEST);
+    EnsureTarget(mScene, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA, mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE,
+                 false, true);
+    EnsureTarget(mUwShaft, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mScene.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    float light[3], sky[3];
+    for (int i = 0; i < 3; ++i) {
+        light[i] = mHdrActive ? DecodeColor(params.waterCausticColor[i]) *
+                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                              : params.waterCausticColor[i];
+        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                            : params.waterSkyColor[i];
+    }
+    const auto setCommon = [&]() {
+        glUniform2i(Loc("uSize"), w, h);
+        glUniform1f(Loc("uNear"), params.zNear);
+        glUniform1f(Loc("uFar"), params.zFar);
+        glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+        glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+        glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+        glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+        glUniform1f(Loc("uCausticFrame"), params.waterTime * 12.0f);
+        glUniform1f(Loc("uTime"), params.waterTime);
+        glUniform1f(Loc("uUnder"), params.waterUnderwater * params.waterUnderwaterState);
+        glUniform1f(Loc("uPlaneY"), params.waterEyeSurfaceY);
+        glUniform4fv(Loc("uEyeRect"), 1, params.waterEyeRect);
+        glUniform3fv(Loc("uScatter"), 1, params.waterScatter);
+        glUniform3fv(Loc("uAbsorb"), 1, params.waterAbsorb);
+        glUniform3fv(Loc("uLightDir"), 1, params.waterCausticDir);
+        glUniform3fv(Loc("uLightColor"), 1, light);
+        glUniform3fv(Loc("uSky"), 1, sky);
+        glUniform1f(Loc("uShaftStrength"), 0.4f);
+    };
+    // 1. Half resolution sunlit shafts.
+    Bind(1, mDepth.tex);
+    Bind(3, shadowReady ? mShadowMap.tex : mDepth.tex);
+    glBindSampler(kFirstUnit + 3, mCmpSampler);
+    Use(csm ? mUnderwaterShaftCsm : mUnderwaterShaft);
+    SetCascadeUniforms();
+    setCommon();
+    glUniform1i(Loc("uShadowReady"), shadowReady);
+    if (shadowReady && !csm) {
+        float lightViewProj[16];
+        BuildLightViewProj(params, lightViewProj);
+        glUniformMatrix4fv(Loc("uLightViewProj"), 1, GL_FALSE, lightViewProj);
+    }
+    Draw(mUwShaft);
+    glBindSampler(kFirstUnit + 3, 0);
+    // 2. Full resolution absorption, ambient in-scatter, refraction, plus the upsampled shafts.
+    Bind(0, mScene.tex);
+    Bind(2, mUwShaft.tex);
+    Use(mUnderwater);
+    setCommon();
+    Draw(fb.fbo, w, h);
+    CheckError("underwater");
+}
 void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     const int w = fb.width, h = fb.height;
     const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
