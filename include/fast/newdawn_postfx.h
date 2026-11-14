@@ -6,6 +6,7 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_WATER_XLU 14 /* actors drawn, soft-sprite effects (splashes, ripples) not yet: the water surface pass runs here so those draw above it */
 #define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
 #define NEWDAWN_POSTFX_STAGE_WIND_END 12
