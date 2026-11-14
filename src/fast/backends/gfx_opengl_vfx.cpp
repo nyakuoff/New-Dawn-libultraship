@@ -206,10 +206,10 @@ void main() {
     } else {
         // Game colours keep per-flame hues (yellow/red torch, blue and green variants); HDR gain is added on top.
         vec3 cool = max(vEnv.rgb, vec3(0.05)) * 1.4;
-        vec3 hot = vPrim.rgb * vec3(3.3, 2.5, 3.3);
+        vec3 hot = mix(vPrim.rgb, vEnv.rgb + vec3(0.15), 0.45) * 3.2;
         rgb = mix(cool, hot, smoothstep(0.12, 0.62, v));
         rgb += mix(vec3(1.0), normalize(hot + 0.05) * 1.7, 0.6) * smoothstep(0.75, 1.0, v) * (vLayerKind > 1.5 ? 1.4 : 0.7);
-        a = clamp(t.a * (vLayerKind > 1.5 ? 0.9 : 0.75), 0.0, 1.0) * vAlpha;
+        a = clamp(t.a * (vLayerKind > 1.5 ? 0.8 : 0.62), 0.0, 1.0) * vAlpha;
     }
     a *= soft * uStrength;
     if (uDebug == 1) { oColor = vec4(t.rgb * t.a * 3.0, 0.0); return; }
