@@ -1030,7 +1030,7 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 
 // ---- New Dawn VFX: native effect sprites are recognised by texture path, recorded in clip space and drawn again by the
 // renderer as HD HDR sprites. Everything here is render-side; no game state is read beyond the draw stream.
-enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2 };
+enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARK = 7 };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1041,16 +1041,30 @@ void Interpreter::BeginVfxRecording(bool enabled) {
 }
 
 uint8_t Interpreter::VfxClassify(std::string_view path) {
+    // Prefix -> class. Numbered animation frames (gEffDust1..8Tex) carry their frame in the high nibble.
     static const std::pair<std::string_view, uint8_t> kTable[] = {
         { "gEffFireTex", VFX_FLAME },
+        { "gEffEnemyDeathFlame", VFX_FLAME },
         { "gameplay_keep_Tex_08FBE0", VFX_GLOW }, // Lights_DrawGlow: the hard-edged light disc
+        { "gEffDust", VFX_DUST },
+        { "gEffHitmarkDust", VFX_DUST },
+        { "gEffBombExplosion", VFX_BOMB },
+        { "gEffHitmarkRed", VFX_HIT },
+        { "gEffHitmarkWhiteMetal", VFX_HIT },
+        { "gElectricSpark", VFX_SPARK },
     };
     uint8_t cls = VFX_NONE;
     for (const auto& [name, c] : kTable) {
-        if (path.find(name) != std::string_view::npos) {
-            cls = c;
-            break;
+        const size_t pos = path.find(name);
+        if (pos == std::string_view::npos) {
+            continue;
         }
+        cls = c;
+        const size_t digit = pos + name.size();
+        if (c >= VFX_DUST && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
+            cls |= (uint8_t)((path[digit] - '1') << 4);
+        }
+        break;
     }
     if (mVfxDebug) {
         static std::unordered_set<std::string> seen;
@@ -1061,7 +1075,7 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
     return cls;
 }
 
-void Interpreter::RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, uint32_t tile) {
+void Interpreter::RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, float frame) {
     float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f, w = 0, wx = 0, wy = 0, wz = 0;
     for (int i = 0; i < 3; i++) {
         if (v[i]->w < 1.0f) {
@@ -1109,7 +1123,7 @@ void Interpreter::RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls,
     mVfxLastCount = merged ? 2 : 1; // a quad is exactly two triangles
     for (int i = 0; i < 3; i++)
         mVfxLastVerts[i] = v[i];
-    (void)tile;
+    inst[15] = frame;
 }
 
 void Interpreter::SubmitVfx() {
@@ -2556,7 +2570,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         const uint32_t t0 = mRdp->first_tile_index;
         const auto& lt0 = mRdp->loaded_texture[mRdp->texture_tile[t0].tmem_index];
         const auto& lt1 = mRdp->loaded_texture[mRdp->texture_tile[t0 + 1 < 8 ? t0 + 1 : t0].tmem_index];
-        uint8_t cls = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
+        const uint8_t raw = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
+        uint8_t cls = raw & 15;
+        const float frame = (raw >> 4) / 7.0f;
         if (cls == VFX_GLOW && mRdp->prim_color.a > 80) {
             cls = VFX_NONE; // only Lights_DrawGlow's alpha-50 discs; other users of the texture keep their draw
         }
@@ -2581,7 +2597,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
         if (cls != VFX_NONE) {
-            RecordVfxTriangle(v_arr, cls, t0);
+            RecordVfxTriangle(v_arr, cls, frame);
             if (mRapi->VfxReplacing()) {
                 return; // the renderer draws this effect as an HD sprite
             }

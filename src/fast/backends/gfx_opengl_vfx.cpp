@@ -79,6 +79,26 @@ void main() {
         vAlpha = aPrim.a;
         return;
     }
+    if (uMode == 3) { // puffs: dust, bomb fireball/smoke, hit sparks, electric sparks (2 layers per recorded quad)
+        int cls = int(aA.x + 0.5);
+        int l = gl_InstanceID % 2;
+        float p = aWorld.w;
+        vLayerKind = float(cls * 10 + l);
+        vSeed = p;
+        float rot = seed * 6.2831 + float(l) * 1.9 + p * (cls == 3 ? 0.5 : 0.25) * (0.5 + hash(seed));
+        float scale = cls == 3 ? 0.95 : (cls == 4 ? (l == 0 ? 1.0 : 1.5) : 1.0);
+        vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
+        float r = max(hp.x, hp.y) * scale;
+        vec2 local = vec2(cos(rot) * q.x - sin(rot) * q.y, sin(rot) * q.x + cos(rot) * q.y) * r;
+        vec2 ndc = vec2(aA.y, aA.z) + local / (uSize * 0.5);
+        vUv = vec2(u01.x, 1.0 - u01.y);
+        vLayer = cls == 3 ? (l == 0 ? 5 : 6) : (cls == 4 ? (hash(seed) < 0.5 ? (l == 0 ? 2 : 4) : (l == 0 ? 3 : 4)) : (l == 0 ? 7 : 8));
+        gl_Position = vec4(ndc.x * w, ndc.y * uFlipY * w, 0.0, w);
+        vViewZ = w;
+        vSize = H;
+        vAlpha = aPrim.a;
+        return;
+    }
     if (uMode == 2) { // light glow: the native quad's footprint, soft halo sprite
         vLayer = 10;
         vLayerKind = 5.0;
@@ -128,6 +148,7 @@ uniform sampler2DArray uSprite;
 uniform sampler2D uDepth;
 uniform vec2 uSize, uNearFar;
 uniform float uStrength;
+uniform vec3 uLit;
 uniform int uMode, uDebug;
 float linearDepth(float d) {
     return 2.0*uNearFar.x*uNearFar.y / max(uNearFar.y+uNearFar.x-(2.0*d-1.0)*(uNearFar.y-uNearFar.x),0.001);
@@ -136,11 +157,42 @@ void main() {
     if (vViewZ <= 0.0 || vAlpha < 0.002) discard;
     float scene = linearDepth(texture(uDepth, gl_FragCoord.xy / uSize).r);
     // Geometry nearer than the flame hides it; the sprite is allowed to sit slightly inside its own holder.
-    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + 0.6, 0.0, 1.0);
+    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + (uMode == 3 ? 0.35 : 0.6), 0.0, 1.0);
     vec4 t = texture(uSprite, vec3(vUv, float(vLayer)));
     float v = t.r * t.a;
     vec3 rgb;
     float a;
+    if (uMode == 3) {
+        int cls = int(vLayerKind / 10.0 + 0.01);
+        int l = int(vLayerKind + 0.5) - cls * 10;
+        float p = vSeed;
+        if (cls == 3) { // dust: soft lit smoke, composited over the scene
+            vec3 c = mix(vEnv.rgb, vPrim.rgb, 0.6) * uLit * (0.6 + 0.4 * t.r);
+            float al = clamp(t.a * vAlpha * 0.95, 0.0, 0.6) * soft * uStrength;
+            if (uDebug == 1) { oColor = vec4(t.rgb * t.a * 3.0, 0.0); return; }
+            oColor = vec4(c * al, al);
+            return;
+        }
+        if (cls == 4 && l == 1) { // bomb smoke: grows in as the fireball cools
+            float al = clamp(t.a * 1.5 * smoothstep(0.2, 0.75, p) * (1.0 - 0.45 * p), 0.0, 0.9) * soft * uStrength;
+            oColor = vec4(vec3(0.075, 0.065, 0.058) * uLit * al, al);
+            return;
+        }
+        vec3 c;
+        float al;
+        if (cls == 4) { // bomb fireball, white-hot to deep orange
+            c = mix(vec3(7.0, 4.0, 1.4), vec3(2.2, 0.5, 0.08), smoothstep(0.0, 0.8, p)) * (1.0 - 0.6 * p);
+            al = t.a * (0.4 + 0.6 * t.r) * (1.0 - smoothstep(0.55, 1.0, p));
+        } else if (cls == 5) { // hit spark
+            c = max(vPrim.rgb, vec3(0.2)) * 5.0 * (1.0 - 0.6 * p);
+            al = t.a * t.r * vAlpha * (l == 0 ? 0.9 : 0.6);
+        } else { // electric
+            c = vec3(2.2, 3.4, 7.0);
+            al = t.a * t.r * vAlpha * (l == 0 ? 0.9 : 0.5);
+        }
+        oColor = vec4(c * al * soft * uStrength, 0.0);
+        return;
+    }
     if (uMode == 2) {
         rgb = vPrim.rgb * vec3(2.2, 1.9, 1.5);
         a = pow(t.a * t.r, 1.8) * vAlpha * 1.1;
@@ -295,16 +347,26 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
     glUniform1f(Loc("uTime"), static_cast<float>(std::fmod(seconds, 3600.0)));
 
-    std::vector<float> flames, glows;
+    std::vector<float> flames, glows, puffs;
     for (uint32_t i = 0; i < mVfxCount; ++i) {
         const float* f = mVfxData + (size_t)i * NEWDAWN_VFX_FLOATS;
         if (f[0] == 1.0f)
             flames.insert(flames.end(), f, f + NEWDAWN_VFX_FLOATS);
         else if (f[0] == 2.0f)
             glows.insert(glows.end(), f, f + NEWDAWN_VFX_FLOATS);
+        else if (f[0] >= 3.0f)
+            puffs.insert(puffs.end(), f, f + NEWDAWN_VFX_FLOATS);
     }
-    if (flames.empty() && glows.empty())
+    if (flames.empty() && glows.empty() && puffs.empty())
         return;
+    if (p.shadowEnabled) {
+        float lit[3];
+        for (int i = 0; i < 3; ++i)
+            lit[i] = std::clamp(p.shadowAmbient[i] + 0.6f * p.shadowDirColor[i], 0.1f, 1.4f);
+        glUniform3f(Loc("uLit"), lit[0], lit[1], lit[2]);
+    } else {
+        glUniform3f(Loc("uLit"), 1.0f, 1.0f, 1.0f);
+    }
     const GLsizei n = (GLsizei)(flames.size() / NEWDAWN_VFX_FLOATS);
     const GLsizei ng = (GLsizei)(glows.size() / NEWDAWN_VFX_FLOATS);
     if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0)) {
@@ -327,6 +389,13 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
         for (int i = 0; i < 5; ++i)
             glVertexAttribDivisor(i, 1);
         glDrawArraysInstanced(GL_TRIANGLES, 0, 6, ng);
+    }
+    if (!puffs.empty()) {
+        glBufferData(GL_ARRAY_BUFFER, puffs.size() * sizeof(float), puffs.data(), GL_STREAM_DRAW);
+        glUniform1i(Loc("uMode"), 3);
+        for (int i = 0; i < 5; ++i)
+            glVertexAttribDivisor(i, 2);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)(puffs.size() / NEWDAWN_VFX_FLOATS) * 2);
     }
     if (n == 0) {
         for (int i = 0; i < 5; ++i)

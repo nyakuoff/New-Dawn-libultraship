@@ -472,7 +472,7 @@ class Interpreter {
     void TextureCacheDelete(const uint8_t* origAddr);
     void BeginVfxRecording(bool enabled);
     uint8_t VfxClassify(std::string_view path);
-    void RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, uint32_t tile);
+    void RecordVfxTriangle(const LoadedVertex* const v[3], uint8_t cls, float frame);
     void SubmitVfx();
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
