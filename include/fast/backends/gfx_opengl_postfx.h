@@ -138,6 +138,9 @@ class PostFxGL {
     static constexpr int kWaveBufUnit = 31;   // per-pixel displaced surface (height, slope, foam)
     static constexpr int kWaveDepthUnit = 32; // eighth-resolution blurred water depth (the wave taper)
     static constexpr int kRippleUnit = 33;    // GPU ripple height field around the player
+    // Point-light shadow cubes (dedicated lanes, a complete dummy cube bound at program creation).
+    static constexpr int kPointShadowUnit0 = 34;
+    static constexpr int kPointShadowUnit1 = 35;
     static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
     static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
@@ -322,7 +325,31 @@ class PostFxGL {
     Target mAoRaw, mAoBlur;
     Program mGiGather, mGiFilter, mGiApply;
     // HDR local lighting (gfx_opengl_postfx.cpp RunLocalLights)
+    void PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t frameIndex);
     void RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
+    static constexpr int kMaxLocal = 24;
+    float mLocalPos[kMaxLocal][4] = {}; // this frame's lights: world position, range
+    float mLocalRgb[kMaxLocal][3] = {};
+    bool mLocalFairy[kMaxLocal] = {};
+    int mLocalCount = 0;
+    // Point-light shadows (gNewDawn.Shadows.PointLights, docs/LOCAL_LIGHTS.md): a distance cube map for the one or two
+    // lights that matter most near the player, rendered from the recorded casters only when they or the light change.
+    void RunPointShadows(const NewDawnPostFxParams& params);
+    struct PointShadow {
+        GLuint tex = 0, fbo = 0, depth = 0;
+        int size = 0;
+        float pos[3] = {}, range = 0.0f; // the cube's own light (range quantised so it does not change every frame)
+        uint64_t hash = 0;
+        bool valid = false, assigned = false;
+        int light = -1; // index into mLocalPos this frame, -1 when the slot is idle
+    } mPointShadow[2];
+    Program mPointShadowDepth;
+    GLuint mPointShadowDummy = 0, mPointShadowVao = 0, mPointShadowVbo = 0;
+    std::vector<float> mPointCasters;
+    std::vector<float> mPointChunkBox; // per 64-triangle chunk of the casters: min xyz, max xyz
+    const float* mCasterPositions = nullptr; // this frame's recorded casters (valid for the opaque-end stage)
+    uint32_t mCasterVertexCount = 0;
+    int mPointLastRendered = 0, mPointLastTriangles = 0; // diagnostics
     Program mLocalLight;
     Target mLocalSource;
     std::vector<float> mFlameLights; // previous frame's VFX flames: world xyz + warm rgb
@@ -395,7 +422,8 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 22;
+    static constexpr int kQueryStages = 23;
+    static constexpr int kPointTimerStage = 22;
     static constexpr int kNightTimerStage = 20;
     static constexpr int kTaaTimerStage = 21;
     static constexpr int kLocalTimerStage = 16;

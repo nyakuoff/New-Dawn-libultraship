@@ -918,6 +918,8 @@ static bool Invert4x4(const float m[4][4], float out[16]) {
 
 void Interpreter::BeginShadowRecording(bool enabled, bool captureCamera) {
     mShadowRecording = enabled;
+    mShadowOnlyTris = 0;
+    mShadowOnlyNs = 0;
     mShadowVertices.clear();
     mShadowOverflowLogged = false;
     mShadowSerial++; // expires last frame's texture pins
@@ -957,6 +959,30 @@ void Interpreter::EndShadowRecording() {
 }
 
 void Interpreter::SubmitShadowCasters() {
+    if (const int dbg = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.CoverageDebug", 0)) {
+        // 1: a line every 30 frames; 2: every frame, with the camera yaw (the measurement fixture of docs/CASCADED_SHADOWS.md)
+        static uint32_t sFrame = 0;
+        if (dbg >= 2 || sFrame++ % 30 == 0) {
+            float a[4] = { 0, 0, -1, 1 }, b[4] = { 0, 0, 1, 1 }, wa[4] = {}, wb[4] = {};
+            for (int j = 0; j < 4; j++) {
+                for (int i = 0; i < 4; i++) {
+                    wa[j] += a[i] * mShadowInvViewProj[i * 4 + j];
+                    wb[j] += b[i] * mShadowInvViewProj[i * 4 + j];
+                }
+            }
+            const float fx = wb[0] / wb[3] - wa[0] / wa[3], fz = wb[2] / wb[3] - wa[2] / wa[3];
+            SPDLOG_INFO("NewDawn shadow casters: {} triangles ({} from the coverage pass) yaw {:.2f}",
+                        mShadowVertices.size() / 9, mShadowOnlyTris, std::atan2(fx, fz) * 57.29578f);
+            static double sNs = 0.0;
+            static int sN = 0;
+            sNs += mShadowOnlyNs;
+            if (++sN == 120) {
+                SPDLOG_INFO("NewDawn coverage pass CPU: {:.4f} ms/frame (120 frames)", sNs / sN / 1.0e6);
+                sNs = 0.0;
+                sN = 0;
+            }
+        }
+    }
     mRapi->SetShadowCasterGeometry(mShadowVertices.empty() ? nullptr : mShadowVertices.data(),
                                    (uint32_t)(mShadowVertices.size() / 3));
     mShadowFoliageVerts.clear();
@@ -2647,6 +2673,17 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
+        if (mShadowOnly) {
+            // Coverage pass: only the world position (casters) and z/w (a branch-by-depth command may read them).
+            d->view_pos[0] = world_pos[0];
+            d->view_pos[1] = world_pos[1];
+            d->view_pos[2] = world_pos[2];
+            d->z = z;
+            d->w = w;
+            d->clip_rej = 0;
+            continue;
+        }
+
         x = AdjXForAspectRatio(x);
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
@@ -2847,7 +2884,44 @@ void Interpreter::SyncViewportScissor() {
 
 }
 
+// The opaque, depth-writing draws that cast shadows (render state only).
+static inline bool OpaqueCasterMode(uint32_t om) {
+    return (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC && (om & CVG_X_ALPHA) != CVG_X_ALPHA &&
+           (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD && (om & G_ZS_PRIM) == 0 &&
+           !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+}
+
+void Interpreter::BeginShadowOnly() {
+    mShadowOnlyRsp = *mRsp;
+    mShadowOnlyRdp = *mRdp;
+    memcpy(mShadowOnlySegments, mSegmentPointers, sizeof(mSegmentPointers));
+    mShadowOnlyMatrixLoads = mMatrixLoadsSinceLights;
+    mShadowOnly = true;
+    mShadowOnlyStart = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Interpreter::EndShadowOnly() {
+    if (!mShadowOnly) {
+        return;
+    }
+    *mRsp = mShadowOnlyRsp;
+    *mRdp = mShadowOnlyRdp;
+    memcpy(mSegmentPointers, mShadowOnlySegments, sizeof(mSegmentPointers));
+    mMatrixLoadsSinceLights = mShadowOnlyMatrixLoads;
+    mShadowOnly = false;
+    mShadowOnlyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - mShadowOnlyStart;
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    if (mShadowOnly) {
+        // Culled room entry (coverage pass): record it as a caster, never draw it.
+        if (!is_rect && mShadowRecording && OpaqueCasterMode(mRdp->other_mode_l)) {
+            RecordShadowTriangle(&mRsp->loaded_vertices[vtx1_idx], &mRsp->loaded_vertices[vtx2_idx],
+                                 &mRsp->loaded_vertices[vtx3_idx]);
+            mShadowOnlyTris++;
+        }
+        return;
+    }
     if (mMM3DSuppress && !is_rect) {
         return; // Preserve state/vertices/rectangles, suppress only room triangles and their old casters.
     }
@@ -2862,12 +2936,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // frustum rejection and culling: a caster outside the view, or facing away from the camera, still shadows the
     // visible ground. All of these conditions are render-state only.
     if (mShadowRecording && !is_rect) {
-        const uint32_t om = mRdp->other_mode_l;
-        const bool caster = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC &&
-                            (om & CVG_X_ALPHA) != CVG_X_ALPHA && (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD &&
-                            (om & G_ZS_PRIM) == 0 &&
-                            !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
-        if (caster) {
+        if (OpaqueCasterMode(mRdp->other_mode_l)) {
             RecordShadowTriangle(v1, v2, v3);
         }
     }
@@ -5562,6 +5631,20 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         gfx->mWindRoom = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_ROOM_SHIFT) & 1);
         return false;
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN) {
+        // w1 is a display list of room entries the game culled. It only runs while casters are being recorded (never on
+        // another backend or with the effect off, where it would draw the entries), and the end marker restores state.
+        gfx->Flush();
+        if (gfx->mPostFxActive && gfx->mShadowRecording && !gfx->mShadowOnly) {
+            gfx->BeginShadowOnly();
+            g_exec_stack.call(cmd, reinterpret_cast<F3DGfx*>(cmd->words.w1));
+        }
+        return false;
+    }
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_END) {
+        gfx->EndShadowOnly();
+        return false;
+    }
     gfx->Flush();
     const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
 
@@ -5569,7 +5652,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginVfxRecording(gfx->mPostFxActive && params.vfxEnabled != 0);
         gfx->BeginGrassRecording(gfx->mPostFxActive && params.grassEnabled != 0);
-        gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
+        gfx->BeginShadowRecording(gfx->mPostFxActive &&
+                                      (params.shadowEnabled != 0 || params.atmosWeather || params.localShadows != 0),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
                                                          params.fogVolumetric != 0 || params.giEnabled != 0 ||
                                                          params.vfxEnabled != 0 || params.grassEnabled != 0));
@@ -6630,6 +6714,7 @@ GfxExecStack g_exec_stack = {};
 void Interpreter::RunGuiOnly() {
     SpReset();
 
+    mShadowOnly = false;
     mWindSway = false;
 
     mGetPixelDepthPending.clear();
