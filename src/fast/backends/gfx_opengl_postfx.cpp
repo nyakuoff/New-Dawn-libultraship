@@ -1167,13 +1167,19 @@ void main() {
         vec3 L = V / max(dist, 0.001);
         // Smooth range window (Karis) over a softened inverse-square core; ~1 at the flame, 0 at the range.
         float x = dist / R, window = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+        // Fires: a steeper window, (1 - x^2)^3 after squaring, so the pool is gone well before its range and never ends in a rim.
+        if (uLightFlame[i] > 0.5) window = pow(clamp(1.0 - x * x, 0.0, 1.0), 1.5);
         float core = R * (uLightFlame[i] > 0.5 ? 0.13 : 0.2); // fires fall off faster: a pool, not a wash
         float atten = window * window * core * core / (d2 + core * core);
         // Wrapped Lambert: the depth-derived normal is faceted, so the terminator is softened.
         float wrap = mix(0.3, 0.7, uSoft);
         float diffuse = clamp((dot(N, L) + wrap) / (1.0 + wrap), 0.0, 1.0);
         float lit = atten * diffuse;
-        if (lit < 0.002) continue;
+        // Fires carry a high intensity, so the early-out below would leave a ring where it cuts in: subtract the
+        // threshold instead of clipping at it, which makes the pool end continuously.
+        if (uLightFlame[i] > 0.5) lit = max(lit - 0.0018, 0.0);
+        if (lit < 0.002 && uLightFlame[i] < 0.5) continue;
+        if (lit <= 0.0) continue;
         float vis = localVisibility(P, uLight[i].xyz, jitter);
         if (i == uPsIdx0) vis *= pointShadowVis(uPsCube0, uPsLight0, P, N, jitter);
         else if (i == uPsIdx1) vis *= pointShadowVis(uPsCube1, uPsLight1, P, N, jitter);
@@ -6991,12 +6997,12 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
         if (flameH > 0.0f && boost >= 0.99f) {
             // Reach follows the flame's size (a candle a few steps, a brazier a few body lengths); the colour is the
             // game's own pulled toward a warm fire colour; intensity is raised for fires only.
-            pos[count][3] = std::clamp(std::max(pos[count][3], std::clamp(flameH * 6.0f, 110.0f, 330.0f) * flameReach), 90.0f, 700.0f);
+            pos[count][3] = std::clamp(std::clamp(flameH * 10.0f, 130.0f, 300.0f) * flameReach, 90.0f, 700.0f); // the flame's own size, not the game's (large, soft) light radius
             const float warmFire[3] = { 1.0f, 0.60f, 0.28f };
             const float lum = 0.2126f * lightRgb[0] + 0.7152f * lightRgb[1] + 0.0722f * lightRgb[2];
             for (int i = 0; i < 3; ++i)
                 lightRgb[i] = lightRgb[i] * 0.35f + warmFire[i] * (lum / 0.662f) * 0.65f; // 0.662: the luminance of warmFire
-            gain = 3.0f * flameGain;
+            gain = 6.0f * flameGain;
         }
         for (int i = 0; i < 3; ++i)
             rgb[count][i] = lightRgb[i] * k * f * boost * gain * params.localStrength * params.localGain * 4.0f;
@@ -7130,7 +7136,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         for (int i = 0; i < kMax; ++i)
             flame[i] = mLocalFlame[i] ? 1.0f : 0.0f;
         glUniform1fv(Loc("uLightFlame"), kMax, flame);
-        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.16f), 0.0f, 0.6f));
+        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.26f), 0.0f, 0.6f));
     }
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
@@ -7665,7 +7671,7 @@ void PostFxGL::RunPointShadows(const NewDawnPostFxParams& params) {
                         (int)candidates.size(), mPointLastTriangles, mPointLastRendered);
             for (int i = 0; i < mLocalCount; ++i)
                 SPDLOG_INFO("  local light {}: ({:.0f},{:.0f},{:.0f}) range {:.0f}{}", i, mLocalPos[i][0], mLocalPos[i][1],
-                            mLocalPos[i][2], mLocalPos[i][3], mLocalFairy[i] ? " (fairy)" : "");
+                            mLocalPos[i][2], mLocalPos[i][3], mLocalFairy[i] ? " (fairy)" : (mLocalFlame[i] ? " (flame)" : ""));
         }
     }
     CheckError("point shadows");

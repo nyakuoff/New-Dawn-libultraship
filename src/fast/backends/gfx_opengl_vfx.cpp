@@ -36,6 +36,7 @@ uniform float uNdcXScale, uFlipY, uTime;
 uniform vec2 uProjection, uSize;
 uniform vec3 uWind;
 uniform float uEmbers, uGlowRadius;
+uniform int uFlameGlow; // gNewDawn.Lighting.FlameLight: the analytic flame bloom instead of the flat disc sprite
 uniform int uMode; // 0 flame layers, 1 embers
 out vec2 vUv;
 out float vViewZ, vAlpha, vLayerKind, vSeed, vSize;
@@ -137,7 +138,7 @@ void main() {
     if (uMode == 2) { // light glow: an analytic core + halo profile (fragment shader) on a quad uGlowRadius x the native disc
         vLayer = 10;
         vLayerKind = 5.0;
-        vec2 halfExt = vec2(aB.y, aB.z) * uGlowRadius;
+        vec2 halfExt = vec2(aB.y, aB.z) * (uFlameGlow != 0 ? uGlowRadius : 2.0); // off: the old sprite quad (its disc fills half)
         vUv = vec2(u01.x, 1.0 - u01.y);
         gl_Position = vec4((aA.y + q.x * halfExt.x) * w, (aA.z + q.y * halfExt.y) * uFlipY * w, 0.0, w);
         vViewZ = w;
@@ -184,7 +185,7 @@ uniform sampler2D uDepth;
 uniform vec2 uSize, uNearFar;
 uniform float uStrength;
 uniform vec3 uLit;
-uniform int uMode, uDebug;
+uniform int uMode, uDebug, uFlameGlow;
 float linearDepth(float d) {
     return 2.0*uNearFar.x*uNearFar.y / max(uNearFar.y+uNearFar.x-(2.0*d-1.0)*(uNearFar.y-uNearFar.x),0.001);
 }
@@ -266,7 +267,10 @@ void main() {
         oColor = vec4(c * al * soft * uStrength, 0.0);
         return;
     }
-    if (uMode == 2) {
+    if (uMode == 2 && uFlameGlow == 0) {
+        rgb = vPrim.rgb * vec3(2.2, 1.9, 1.5);
+        a = pow(t.a * t.r, 1.8) * vAlpha * 0.8;
+    } else if (uMode == 2) {
         // Flame bloom, not a disc: a small hot core and a falloff-shaped halo that reaches zero smoothly at the quad edge
         // (HDR bloom adds the rest). The game's glow alpha (about 50/255, flickering) scales it; warm lights get the
         // flame ramp (white-yellow core, orange halo), other colours (Tatl, fairies) keep their hue, much dimmer.
@@ -464,6 +468,7 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glUniform1i(Loc("uDebug"), Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.DebugView", 0));
     glUniform1f(Loc("uStrength"), std::clamp(p.vfxStrength, 0.0f, 4.0f));
     // The light glow quad: this fraction of the native disc's radius (the old flat disc was 1).
+    glUniform1i(Loc("uFlameGlow"), Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.FlameLight", 0) != 0 ? 1 : 0);
     glUniform1f(Loc("uGlowRadius"), std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Vfx.GlowRadius", 0.5f), 0.1f, 2.0f));
     glUniform3f(Loc("uWind"), 0.0f, 0.0f, 0.0f);
     static const auto epoch = std::chrono::steady_clock::now();
