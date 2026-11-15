@@ -136,6 +136,17 @@ typedef struct NewDawnPostFxParams {
     int32_t waterCausticSun;      /* 1: the caustic light is the sun/moon the shadow map was built for */
     float waterEyeRect[4];        /* XZ rect (minX, minZ, maxX, maxZ) of that WaterBox */
     float waterUnderwaterState;   /* smoothed 0..1: 1 once the camera is below a surface, ramps down after leaving it */
+    /* New Dawn water simulation (render only: the WaterBox height stays the game's authority for swimming/collision).
+       Ocean swell displaces the drawn surface around the box plane; the ripple height field is simulated on the GPU
+       around the player from the read-only sources below. Needs Restyle (the surface is re-lit from the wave normal). */
+#define NEWDAWN_MAX_WATER_RIPPLES 16
+    float waterWaves;          /* 0..2 swell amplitude scale (ocean scenes only), 0 = off, flat plane */
+    float waterWaveDir[2];     /* unit XZ direction the swell travels (the shared wind) */
+    float waterWaveGust;       /* 0..1 wind strength: whitecaps */
+    float waterRipples;        /* 0..2 interaction strength, 0 = off */
+    float waterRippleFocus[2]; /* XZ the simulated window follows (the player) */
+    int32_t waterRippleCount;
+    float waterRippleSrc[NEWDAWN_MAX_WATER_RIPPLES][4]; /* world x, z, radius, strength (height velocity per second) */
     /* New Dawn art-directed grade, applied in display space after the base grade at the scene-end marker. The game
        computes the final (time-of-day interpolated, scene cross-faded, strength-scaled) look; 0 = skipped entirely. */
     int32_t artEnabled;
