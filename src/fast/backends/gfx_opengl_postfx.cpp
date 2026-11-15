@@ -1459,6 +1459,7 @@ uniform float uFeedback;
 uniform int uReset;
 uniform int uUseMask;
 uniform int uDebug;
+uniform vec4 uGrassTune; // blend cap, clip width, filter sharpness (Gaussian exponent), unused
 
 const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
 vec3 compressC(vec3 c) { c = max(c, vec3(0.0)); return c / (1.0 + dot(c, kLuma)); }
@@ -1498,9 +1499,12 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
     vec3 sum = vec3(0.0), sum2 = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
-    float actor = 0.0;
+    float actor = 0.0, grass = 0.0;
     vec3 cur = vec3(0.0);
     float curW = 0.0;
+    // Tuft pixels (stencil 2, written by the grass pass): thin blades that sway, so no history can follow them.
+    float grassHere = uUseMask != 0 ? texelFetch(uTaaMask, p, 0).g : 0.0;
+    float kFilter = mix(2.29, uGrassTune.z, grassHere);
     for (int j = -1; j <= 1; j++) {
         for (int i = -1; i <= 1; i++) {
             ivec2 q = clampP(p + ivec2(i, j));
@@ -1510,14 +1514,18 @@ void main() {
             // gives a current-frame estimate that no longer depends on the jitter phase, which is what makes a
             // converged still image pulse once per jitter cycle.
             vec2 dd = vec2(i, j) - uJitter;
-            float wt = exp(-2.29 * dot(dd, dd));
+            float wt = exp(-kFilter * dot(dd, dd));
             cur += s * wt;
             curW += wt;
             sum += s;
             sum2 += s * s;
             lo = min(lo, s);
             hi = max(hi, s);
-            if (uUseMask != 0) actor = max(actor, texelFetch(uTaaMask, q, 0).r);
+            if (uUseMask != 0) {
+                vec2 mk = texelFetch(uTaaMask, q, 0).rg;
+                actor = max(actor, mk.r);
+                grass = max(grass, mk.g);
+            }
         }
     }
     cur /= curW;
@@ -1559,7 +1567,7 @@ void main() {
         if (ok) {
             vec3 hist = toYCoCg(sampleHistory(hUv));
             // Clip the history towards the neighbourhood: what the current frame cannot explain is not kept.
-            float gamma = mix(1.1, 0.6, actor);
+            float gamma = mix(mix(1.1, uGrassTune.y, grass), 0.6, actor);
             vec3 ext = gamma * sigma + 0.002;
             vec3 bl = max(lo, mean - ext), bh = min(hi, mean + ext);
             vec3 ctr = 0.5 * (bl + bh), half_ = 0.5 * (bh - bl) + 1e-5;
@@ -1572,6 +1580,7 @@ void main() {
             blend = uFeedback;
             blend -= 0.12 * smoothstep(0.0, 2.0, speed);  // resampling under motion softens, so trust history less
             blend *= 1.0 - 0.6 * clipAmt;                 // history that had to be clipped is suspect
+            blend = mix(blend, min(blend, uGrassTune.x), grass); // tufts sway without motion vectors: short memory
             blend = mix(blend, min(blend, 0.5), actor);   // actors move without motion vectors: short memory
             outC = mix(cur, clipped, blend);
             tint = clipAmt;
@@ -1581,7 +1590,7 @@ void main() {
     oHistory = vec4(rgb, w);
     oScene = vec4(expandC(rgb), 1.0);
     if (uDebug == 1) oScene = vec4(vec3(blend), 1.0);
-    else if (uDebug == 2) oScene = vec4(tint, actor, blend, 1.0);
+    else if (uDebug == 2) oScene = vec4(tint, actor, grass, 1.0);
 }
 )GLSL";
 
@@ -1595,6 +1604,9 @@ out vec4 oColor;
 uniform sampler2D uScene;
 uniform ivec2 uSize;
 uniform float uSharpen;
+uniform sampler2D uTaaMask;
+uniform int uUseMask;
+uniform vec4 uSharpTune; // grass sharpness, dark fade start, dark fade end, unused
 const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
 vec3 percept(ivec2 q) {
     vec3 c = max(texelFetch(uScene, clamp(q, ivec2(0), uSize - 1), 0).rgb, vec3(0.0));
@@ -1607,9 +1619,16 @@ void main() {
     vec3 mn = min(min(min(B, D), min(F, H)), E);
     vec3 mx = max(max(max(B, D), max(F, H)), E);
     vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
-    vec3 w = amp * (-1.0 / mix(8.0, 5.0, uSharpen));
+    float g = 0.0;
+    if (uUseMask != 0) {
+        g = max(max(texelFetch(uTaaMask, p, 0).g, texelFetch(uTaaMask, clamp(p + ivec2(1, 0), ivec2(0), uSize - 1), 0).g),
+                max(texelFetch(uTaaMask, clamp(p - ivec2(1, 0), ivec2(0), uSize - 1), 0).g,
+                    max(texelFetch(uTaaMask, clamp(p + ivec2(0, 1), ivec2(0), uSize - 1), 0).g,
+                        texelFetch(uTaaMask, clamp(p - ivec2(0, 1), ivec2(0), uSize - 1), 0).g)));
+    }
+    vec3 w = amp * (-1.0 / mix(8.0, 5.0, mix(uSharpen, uSharpTune.x, g)));
     vec3 S = clamp(((B + D + F + H) * w + E) / (1.0 + 4.0 * w), 0.0, 1.0);
-    S = mix(E, S, smoothstep(0.12, 0.35, dot(E, kLuma))); // nothing in the darks
+    S = mix(E, S, smoothstep(uSharpTune.y, uSharpTune.z, dot(E, kLuma))); // nothing in the darks
     vec3 c = S * S;
     oColor = vec4(c / max(1.0 - dot(c, kLuma), 1e-3), 1.0);
 }
@@ -3811,8 +3830,9 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     // Only swap colour; game depth, stencil, coverage and query scheduling stay intact.
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (CvInt("gNewDawn.Lighting.Local", 0)) {
-        // Fresh actor mask for this frame; the game never uses stencil.
+    if (CvInt("gNewDawn.Lighting.Local", 0) || CvInt("gNewDawn.TAA.Enabled", 0)) {
+        // Fresh actor mask for this frame (TAA reads it too, and the grass pass marks its tufts in it); the game never
+        // uses stencil.
         glStencilMask(0xFF);
         glClearStencil(0);
         glClear(GL_STENCIL_BUFFER_BIT);
@@ -6193,7 +6213,7 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
     EnsureTarget(mTaaOut, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
     EnsureTarget(mTaaDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
     if (useMask)
-        EnsureTarget(mTaaMask, w, h, GL_R8, GL_RED, GL_UNSIGNED_BYTE, false, false);
+        EnsureTarget(mTaaMask, w, h, GL_RG8, GL_RG, GL_UNSIGNED_BYTE, false, false);
     if (!mUsable) {
         return nullptr;
     }
@@ -6238,13 +6258,19 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
         glEnable(GL_STENCIL_TEST);
         glStencilMask(0);
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        glStencilFunc(GL_EQUAL, 1, 0xFF);
         Use(mTaaMaskFill);
+        // Stencil 1 (characters) lands in red, stencil 2 (grass tufts) in green.
+        glColorMask(GL_TRUE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        glColorMask(GL_FALSE, GL_TRUE, GL_FALSE, GL_FALSE);
+        glStencilFunc(GL_EQUAL, 2, 0xFF);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDisable(GL_STENCIL_TEST);
         glStencilMask(0xFF);
         glStencilFunc(GL_ALWAYS, 0, 0xFF);
-        CheckError("TAA actor mask");
+        CheckError("TAA actor and grass mask");
     }
 
     float invVP[16];
@@ -6276,6 +6302,10 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
     glUniform1f(Loc("uFeedback"), std::clamp(CvFloat("gNewDawn.TAA.Feedback", 0.9f), 0.0f, 0.98f));
     glUniform1i(Loc("uReset"), reset ? 1 : 0);
     glUniform1i(Loc("uUseMask"), useMask ? 1 : 0);
+    // Tuft pixels (stencil 2) are thin swaying blades that no reprojection can follow, and the soft Gaussian that suits
+    // surfaces blurs them: history weight capped at 0.85, a narrower current-frame filter (exponent 5 against 2.29),
+    // and a full-strength sharpen below. Tuned on Termina and Swamp grass against the 2x2-averaged gradient of TAA off.
+    glUniform4f(Loc("uGrassTune"), 0.85f, 1.1f, 5.0f, 0.0f);
     glUniform1i(Loc("uDebug"), CvInt("gNewDawn.TAA.Debug", 0));
     Draw(mTaaHist[write]);
     CheckError("TAA resolve");
@@ -6296,10 +6326,16 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
             return &mTaaOut;
         }
         Bind(0, mTaaOut.tex);
+        Bind(3, useMask ? mTaaMask.tex : mFogNeutral);
         Use(mTaaSharpen);
         glUniform1i(Loc("uScene"), kFirstUnit + 0);
+        glUniform1i(Loc("uTaaMask"), kFirstUnit + 3);
+        glUniform1i(Loc("uUseMask"), useMask ? 1 : 0);
         glUniform2i(Loc("uSize"), w, h);
         glUniform1f(Loc("uSharpen"), sharpen);
+        // Grass gets the full sharpen; the fade keeps true darks (perceptual luma below about 0.04, display below
+        // ~0.05) untouched and reaches full strength by 0.14 (display ~0.15), so mid-dark grass is sharpened.
+        glUniform4f(Loc("uSharpTune"), 1.0f, 0.04f, 0.14f, 0.0f);
         Draw(mTaaSharp);
         CheckError("TAA sharpen");
         return &mTaaSharp;
