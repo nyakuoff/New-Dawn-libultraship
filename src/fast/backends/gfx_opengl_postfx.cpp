@@ -1025,6 +1025,28 @@ void main() {
 }
 )GLSL";
 
+
+// Point-light shadows: a distance cube map. Each fragment writes its distance to the light, depth-tested against the
+// nearest one, so the lookup in the local-light pass is a plain compare in world units (no projection maths).
+static const char* kPointShadowVertex = R"GLSL(
+layout(location = 0) in vec3 aPos;
+uniform mat4 uVP;
+out vec3 vWorld;
+void main() {
+    vWorld = aPos;
+    gl_Position = uVP * vec4(aPos, 1.0);
+}
+)GLSL";
+
+static const char* kPointShadowFragment = R"GLSL(
+in vec3 vWorld;
+uniform vec3 uLight;
+out float oDist;
+void main() {
+    oDist = length(vWorld - uLight);
+}
+)GLSL";
+
 static const char* kLocalLightShader = R"GLSL(
 in vec2 vUv;
 // Dual-source blend (GL_ONE, GL_SRC1_COLOR): result = oColor + framebuffer * oFactor, per MSAA sample.
@@ -1040,6 +1062,15 @@ uniform float uDarken;
 uniform float uFogMul;
 uniform float uFogOff;
 uniform float uSoft; // 1 for the stencil-marked characters: their low-poly depth normals are smoothed
+// Point-light shadow cubes (one per shadow-casting light; -1 = unused). Each holds the distance to the nearest caster.
+uniform samplerCube uPsCube0;
+uniform samplerCube uPsCube1;
+uniform int uPsIdx0;
+uniform int uPsIdx1;
+uniform vec4 uPsLight0; // the cube's light: world position, far range
+uniform vec4 uPsLight1;
+uniform vec3 uPsParams; // light radius (penumbra size), cube texel angle, bias scale
+uniform float uPsDebug;
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 // Screen-space contact shadow along the segment to the light, from the opaque depth buffer: walls and actors between
 // the surface and the flame occlude it. Samples outside the screen count as visible.
@@ -1059,6 +1090,41 @@ float localVisibility(vec3 P, vec3 L, float jitter) {
     }
     return 1.0 - min(1.0, hits * 0.22);
 }
+// Contact-hardening soft shadow from a distance cube: a few taps search for blockers, whose distance sets the
+// penumbra (wide far behind the occluder, sharp where it touches), then a rotated Vogel-disc PCF filters it.
+float pointShadowVis(samplerCube cube, vec4 Lr, vec3 P, vec3 N, float rnd) {
+    vec3 v = P + N * 1.5 - Lr.xyz;
+    float dist = length(v);
+    if (dist < 3.0 || dist >= Lr.w) return 1.0;
+    vec3 dir = v / dist;
+    float texel = uPsParams.y * dist;
+    float cosN = clamp(dot(N, -dir), 0.0, 1.0);
+    float bias = texel * (1.2 + 2.5 * (1.0 - cosN)) + 0.8 * uPsParams.z;
+    vec3 up = abs(dir.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, dir));
+    vec3 B = cross(dir, T);
+    float rot = rnd * 6.2831853;
+    float lightAng = uPsParams.x / dist;
+    float searchAng = clamp(lightAng * 3.0, 0.03, 0.22);
+    float blocker = 0.0, nb = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        float r = sqrt((float(i) + 0.5) / 6.0), a = float(i) * 2.399963 + rot;
+        float ds = texture(cube, normalize(dir + (T * cos(a) + B * sin(a)) * (r * searchAng))).r;
+        if (ds < dist - bias) { blocker += ds; nb += 1.0; }
+    }
+    if (nb < 0.5) return 1.0;
+    float avg = blocker / nb;
+    float pen = uPsParams.x * (dist - avg) / max(avg, 1.0);
+    float ang = clamp(pen / dist, uPsParams.y * 1.5, 0.25);
+    float soft = texel * 2.0 + 1.0;
+    float lit = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        float r = sqrt((float(i) + 0.5) / 12.0), a = float(i) * 2.399963 + rot;
+        float ds = texture(cube, normalize(dir + (T * cos(a) + B * sin(a)) * (r * ang))).r;
+        lit += 1.0 - smoothstep(0.0, soft, dist - bias - ds);
+    }
+    return lit / 12.0;
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 scene = texelFetch(uScene, p, 0);
@@ -1076,6 +1142,20 @@ void main() {
         N = normalize(wide);
     }
     float jitter = ign(gl_FragCoord.xy);
+    if (uPsDebug > 0.5) {
+        // gNewDawn.Shadows.PointDebug=1: the first cube's visibility on its own (white lit, black shadowed, blue outside
+        // its range, nothing else drawn); 2 shows the cube's stored distance.
+        vec3 dv = P - uPsLight0.xyz;
+        float dd = length(dv);
+        vec3 c = vec3(0.0, 0.0, 0.4);
+        if (uPsIdx0 >= 0 && dd < uPsLight0.w) {
+            float vis = pointShadowVis(uPsCube0, uPsLight0, P, N, jitter);
+            c = uPsDebug < 1.5 ? vec3(vis) : vec3(texture(uPsCube0, dv / max(dd, 0.001)).r / uPsLight0.w);
+        }
+        oColor = vec4(c, 0.0);
+        oFactor = vec4(0.0);
+        return;
+    }
     vec3 E = vec3(0.0);
     for (int i = 0; i < uLightCount; ++i) {
         vec3 V = uLight[i].xyz - P;
@@ -1092,7 +1172,10 @@ void main() {
         float diffuse = clamp((dot(N, L) + wrap) / (1.0 + wrap), 0.0, 1.0);
         float lit = atten * diffuse;
         if (lit < 0.002) continue;
-        E += uLightRgb[i] * (lit * localVisibility(P, uLight[i].xyz, jitter));
+        float vis = localVisibility(P, uLight[i].xyz, jitter);
+        if (i == uPsIdx0) vis *= pointShadowVis(uPsCube0, uPsLight0, P, N, jitter);
+        else if (i == uPsIdx1) vis *= pointShadowVis(uPsCube1, uPsLight1, P, N, jitter);
+        E += uLightRgb[i] * (lit * vis);
     }
     // Bounded: walls beside a torch glow without clipping, and the cap is per channel so the hue survives.
     const float cap = 2.4;
@@ -3848,7 +3931,9 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uUwShafts", 10 },
                           { "uWaveBuf", PostFxGL::kWaveBufUnit },
                           { "uWaveDepth", PostFxGL::kWaveDepthUnit },
-                          { "uRipple", PostFxGL::kRippleUnit } }) {
+                          { "uRipple", PostFxGL::kRippleUnit },
+                          { "uPsCube0", PostFxGL::kPointShadowUnit0 },
+                          { "uPsCube1", PostFxGL::kPointShadowUnit1 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -3969,7 +4054,7 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units <= kRippleUnit) {
+    if (units <= kPointShadowUnit1) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
@@ -4113,7 +4198,35 @@ bool PostFxGL::BuildPrograms() {
     mGiGatherCsm.id = BuildProgram("GI gather (cascades)", giGatherCsm, 6, mGiGatherCsm.uniforms);
     mGiFilter.id = BuildProgram("GI spatial temporal filter", giFilter, 4, mGiFilter.uniforms);
     mGiApply.id = BuildProgram("GI bilateral composite", giApply, 4, mGiApply.uniforms);
-    // Local lights reuse the colour (8) and depth (9) lanes bound to dummies above; no new sampler.
+    {
+        // Point-light shadow lanes: a complete one-texel cube (distance "far away") on both units, bound before the
+        // local-light program that declares the samplers is built and put back after every pass that binds real cubes.
+        GLint previousActivePs;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActivePs);
+        glGenTextures(1, &mPointShadowDummy);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, mPointShadowDummy);
+        const float far = 1.0e6f;
+        for (int face = 0; face < 6; ++face)
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_R32F, 1, 1, 0, GL_RED, GL_FLOAT, &far);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        for (int unit : { kPointShadowUnit0, kPointShadowUnit1 }) {
+            glActiveTexture(GL_TEXTURE0 + unit);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, mPointShadowDummy);
+        }
+        glActiveTexture(previousActivePs);
+        const char* psVs[] = { kVersion, kPointShadowVertex };
+        const char* psFs[] = { kVersion, kPointShadowFragment };
+        mPointShadowDepth.id = BuildProgramWithVertex("point shadow depth", psVs, 2, psFs, 2, mPointShadowDepth.uniforms);
+        glGenVertexArrays(1, &mPointShadowVao);
+        glGenBuffers(1, &mPointShadowVbo);
+        glBindVertexArray(mPointShadowVao);
+        glBindBuffer(GL_ARRAY_BUFFER, mPointShadowVbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glBindVertexArray(0);
+    }
+    // Local lights reuse the colour (8) and depth (9) lanes bound to dummies above; the shadow cubes use their own.
     const char* localLight[] = { kVersion, kDepthLib, kGiGeometryLib, kLocalLightShader };
     mLocalLight.id = BuildProgram("local lights", localLight, 4, mLocalLight.uniforms);
     // Interior polish reuses the same colour (8) and depth (9) lanes.
@@ -4376,8 +4489,8 @@ static const char* const kStageNames[NEWDAWN_PERF_STAGES] = {
     "opaque end / AO", "scene end / bloom+grade", "shadows", "sun shafts", "water", "water opaque copy",
     "physical sky", "volumetric clouds", "sky ambient cube", "volumetric fog", "textured sun flare",
     "ambient particles", "wet surfaces and rain shelter", "rain and snow", "screen-space GI", "VFX sprites",
-    "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "interior window light",
-    "emissive surfaces" };
+    "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "point-light shadows",
+    "interior window light", "emissive surfaces" };
 static float sStageMs[NEWDAWN_PERF_STAGES] = {};
 float gNewDawnGpuFrameMs = 0.0f; // written by GfxRenderingAPIOGL
 
@@ -5238,6 +5351,9 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
                 fwrite(pixels.data(), 1, pixels.size(), f);
                 fclose(f);
             }
+            if (CvInt("gNewDawn.Shadows.CoverageDebug", 0) >= 2) {
+                SPDLOG_INFO("NewDawn dump f{:04d}", mDumpDone); // pairs the frame with the preceding caster line
+            }
             mDumpDone++;
         }
     } else {
@@ -5406,6 +5522,17 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(kGiTimerStage);
     }
     if (doLocal) {
+        PrepareLocalLights(params, frameIndex);
+        mCasterPositions = shadowPositions;
+        mCasterVertexCount = shadowVertexCount;
+        if (params.localShadows > 0 && mPointShadowDepth.id) {
+            BeginTimer(kPointTimerStage);
+            RunPointShadows(params);
+            EndTimer(kPointTimerStage);
+        } else {
+            for (auto& ps : mPointShadow)
+                ps.light = -1;
+        }
         BeginTimer(kLocalTimerStage);
         RunLocalLights(params, fb, frameIndex);
         EndTimer(kLocalTimerStage);
@@ -6750,11 +6877,18 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     CheckError("screen-space GI");
 }
 
-void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
+// The CPU half of the local lights: the game's lights plus the VFX flames, smoothed and flickered, into mLocalPos and
+// mLocalRgb. No GL calls, so the point-shadow pass can pick its lights from the result before the lights are drawn.
+void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t frameIndex) {
     constexpr int kMax = 24;
-    float pos[kMax][4] = {};
-    float rgb[kMax][3] = {};
-    int count = 0;
+    float (&pos)[kMax][4] = mLocalPos;
+    float (&rgb)[kMax][3] = mLocalRgb;
+    bool (&fairy)[kMax] = mLocalFairy;
+    int& count = mLocalCount;
+    std::fill(&pos[0][0], &pos[0][0] + kMax * 4, 0.0f);
+    std::fill(&rgb[0][0], &rgb[0][0] + kMax * 3, 0.0f);
+    std::fill(fairy, fairy + kMax, false);
+    count = 0;
     static const auto epoch = std::chrono::steady_clock::now();
     const float seconds =
         static_cast<float>(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
@@ -6806,6 +6940,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         const float f = 1.0f + amp * (0.60f * std::sin(seconds * 8.2f + seed) +
                                       0.30f * std::sin(seconds * 18.2f + seed * 1.7f + 1.0f) +
                                       0.10f * std::sin(seconds * 32.0f + seed * 2.3f + 2.0f));
+        fairy[count] = boost < 0.99f; // Tatl and other fairies: moving glows, never shadow-casting lights
         pos[count][0] = p[0], pos[count][1] = p[1], pos[count][2] = p[2];
         pos[count][3] = std::clamp(radius * 1.3f, 90.0f, 700.0f);
         for (int i = 0; i < 3; ++i)
@@ -6869,6 +7004,14 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     }
     for (auto it = smoothed.begin(); it != smoothed.end();)
         it = (now - it->second[4] > 2.0) ? smoothed.erase(it) : std::next(it);
+}
+
+void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
+    constexpr int kMax = 24;
+    const float (&pos)[kMax][4] = mLocalPos;
+    const float (&rgb)[kMax][3] = mLocalRgb;
+    const int count = mLocalCount;
+    const bool smoothLights = CvInt("gNewDawn.Lighting.LocalSmooth", 1) != 0; // 0: the unfiltered game values (A/B)
     if (count == 0 && params.localDarken <= 0.0f)
         return;
     if (!mUsable)
@@ -6892,6 +7035,22 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
     glUniform1f(Loc("uFlipY"), params.shadowFlipY);
     glUniform1i(Loc("uLightCount"), count);
+    {
+        const int units[2] = { kPointShadowUnit0, kPointShadowUnit1 };
+        for (int k = 0; k < 2; ++k) {
+            const PointShadow& ps = mPointShadow[k];
+            const bool on = ps.light >= 0 && ps.valid;
+            glActiveTexture(GL_TEXTURE0 + units[k]);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, on ? ps.tex : mPointShadowDummy);
+            glUniform1i(Loc(k == 0 ? "uPsIdx0" : "uPsIdx1"), on ? ps.light : -1);
+            glUniform4f(Loc(k == 0 ? "uPsLight0" : "uPsLight1"), ps.pos[0], ps.pos[1], ps.pos[2], on ? ps.range : 0.0f);
+        }
+        const float soft = std::clamp(CvFloat("gNewDawn.Shadows.PointSoftness", 1.0f), 0.0f, 3.0f);
+        const int size = mPointShadow[0].size > 0 ? mPointShadow[0].size : 256;
+        // light radius, cube texel angle (a 90 degree face), bias scale
+        glUniform3f(Loc("uPsParams"), 7.0f * soft, 2.0f / (float)size, 1.0f);
+        glUniform1f(Loc("uPsDebug"), (float)CvInt("gNewDawn.Shadows.PointDebug", 0));
+    }
     glUniform4fv(Loc("uLight"), kMax, &pos[0][0]);
     glUniform3fv(Loc("uLightRgb"), kMax, &rgb[0][0]);
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
@@ -6921,6 +7080,10 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glStencilMask(0xFF);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
+    for (int unit : { kPointShadowUnit0, kPointShadowUnit1 }) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, mPointShadowDummy);
+    }
     if (debug > 0.0f) {
         static int logged = 0;
         if (logged++ % 400 < 1) {
@@ -7128,6 +7291,303 @@ void PostFxGL::RunEmissive(const NewDawnPostFxParams& params, const FramebufferO
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     CheckError("emissive");
+// Point-light shadows. Picks the one or two lights that matter most around the player (bright, close, not a moving
+// fairy), culls the frame's recorded casters to each light's range, and, only when that caster set or the light
+// changed, renders them into a distance cube map. The cube is sampled by the local-light pass. Nothing here touches
+// the game's data, and it only ever removes light.
+void PostFxGL::RunPointShadows(const NewDawnPostFxParams& params) {
+    const int want = std::clamp(params.localShadows, 0, 2);
+    for (auto& ps : mPointShadow)
+        ps.light = -1;
+    if (want == 0 || mCasterPositions == nullptr || mCasterVertexCount < 3 || mLocalCount == 0 || !mUsable) {
+        return;
+    }
+    const int size = std::clamp(CvInt("gNewDawn.Shadows.PointSize", 256), 64, 1024);
+
+    // Candidates: nearest to the player, scaled by brightness and range; a light already holding a slot gets a margin so
+    // two similar lights never swap every frame.
+    struct Candidate {
+        int index;
+        float score;
+    };
+    std::vector<Candidate> candidates;
+    for (int i = 0; i < mLocalCount; ++i) {
+        if (mLocalFairy[i])
+            continue;
+        const float range = mLocalPos[i][3];
+        const float lum = 0.2126f * mLocalRgb[i][0] + 0.7152f * mLocalRgb[i][1] + 0.0722f * mLocalRgb[i][2];
+        if (lum < 0.05f)
+            continue;
+        float d2 = 0.0f;
+        for (int a = 0; a < 3; ++a)
+            d2 += (mLocalPos[i][a] - params.localFocus[a]) * (mLocalPos[i][a] - params.localFocus[a]);
+        const float d = std::sqrt(d2);
+        if (d > range + 500.0f)
+            continue;
+        float score = range / std::max(d, 40.0f);
+        for (const auto& ps : mPointShadow) {
+            if (ps.assigned) {
+                float e2 = 0.0f;
+                for (int a = 0; a < 3; ++a)
+                    e2 += (mLocalPos[i][a] - ps.pos[a]) * (mLocalPos[i][a] - ps.pos[a]);
+                if (e2 < 12.0f * 12.0f)
+                    score *= 1.5f;
+            }
+        }
+        candidates.push_back({ i, score });
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    if ((int)candidates.size() > want)
+        candidates.resize(want);
+
+    // A light that already owns a slot keeps it; the others take the free slots.
+    int slotOf[2] = { -1, -1 };
+    bool taken[2] = {};
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        const int i = candidates[c].index;
+        for (int k = 0; k < 2; ++k) {
+            if (taken[k] || !mPointShadow[k].assigned)
+                continue;
+            float e2 = 0.0f;
+            for (int a = 0; a < 3; ++a)
+                e2 += (mLocalPos[i][a] - mPointShadow[k].pos[a]) * (mLocalPos[i][a] - mPointShadow[k].pos[a]);
+            if (e2 < 12.0f * 12.0f) {
+                slotOf[c] = k;
+                taken[k] = true;
+                break;
+            }
+        }
+    }
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        if (slotOf[c] >= 0)
+            continue;
+        for (int k = 0; k < 2; ++k) {
+            if (!taken[k]) {
+                slotOf[c] = k;
+                taken[k] = true;
+                mPointShadow[k].valid = false; // a different light: its old cube is meaningless
+                break;
+            }
+        }
+    }
+    for (int k = 0; k < 2; ++k) {
+        if (!taken[k])
+            mPointShadow[k].assigned = false;
+    }
+
+    GLint previousActive;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+    bool stateSet = false;
+    GLboolean depthClamp = GL_FALSE;
+    mPointLastRendered = 0;
+    mPointLastTriangles = 0;
+    const float* tris = mCasterPositions;
+    const uint32_t triCount = mCasterVertexCount / 3;
+    const auto cpuStart = std::chrono::steady_clock::now();
+    // 64-triangle chunks of the recorded casters (consecutive triangles are spatially coherent): their boxes are shared by
+    // every light, so they are computed once per frame.
+    const uint32_t chunkCount = (triCount + 63) / 64;
+    mPointChunkBox.resize((size_t)chunkCount * 6);
+    for (uint32_t ch = 0; ch < chunkCount; ++ch) {
+        const uint32_t t1 = std::min((ch + 1) * 64u, triCount);
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (uint32_t v = ch * 64u * 3; v < t1 * 3; ++v) {
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = std::min(lo[a], tris[v * 3 + a]);
+                hi[a] = std::max(hi[a], tris[v * 3 + a]);
+            }
+        }
+        std::copy(lo, lo + 3, &mPointChunkBox[(size_t)ch * 6]);
+        std::copy(hi, hi + 3, &mPointChunkBox[(size_t)ch * 6 + 3]);
+    }
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        const int i = candidates[c].index;
+        PointShadow& ps = mPointShadow[slotOf[c]];
+        // Cube range: the light's range rounded up to 32 units so the smoothed value does not re-render it each frame.
+        const float lightPos[3] = { std::round(mLocalPos[i][0] * 2.0f) * 0.5f, std::round(mLocalPos[i][1] * 2.0f) * 0.5f,
+                                    std::round(mLocalPos[i][2] * 2.0f) * 0.5f };
+        const float range = std::min(std::ceil(mLocalPos[i][3] / 32.0f) * 32.0f + 32.0f, 800.0f);
+        const float r2 = range * range;
+
+        // Cull to the light's sphere: 64-triangle chunks first (their boxes), then each triangle's box.
+        mPointCasters.clear();
+        auto overlaps = [&](const float* lo, const float* hi) {
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; ++a) {
+                const float e = std::max(std::max(lo[a] - lightPos[a], lightPos[a] - hi[a]), 0.0f);
+                d2 += e * e;
+            }
+            return d2 < r2;
+        };
+        for (uint32_t ch = 0; ch < chunkCount; ++ch) {
+            const uint32_t t0 = ch * 64u, t1 = std::min(t0 + 64u, triCount);
+            if (!overlaps(&mPointChunkBox[(size_t)ch * 6], &mPointChunkBox[(size_t)ch * 6 + 3]))
+                continue;
+            for (uint32_t t = t0; t < t1; ++t) {
+                const float* q = tris + t * 9;
+                float tlo[3], thi[3];
+                for (int a = 0; a < 3; ++a) {
+                    tlo[a] = std::min(q[a], std::min(q[3 + a], q[6 + a]));
+                    thi[a] = std::max(q[a], std::max(q[3 + a], q[6 + a]));
+                }
+                if (overlaps(tlo, thi))
+                    mPointCasters.insert(mPointCasters.end(), q, q + 9);
+            }
+        }
+        uint64_t hash = 1469598103934665603ull;
+        auto mix = [&](const void* data, size_t bytes) {
+            const uint8_t* b = static_cast<const uint8_t*>(data);
+            for (size_t n = 0; n < bytes; ++n)
+                hash = (hash ^ b[n]) * 1099511628211ull;
+        };
+        mix(mPointCasters.data(), mPointCasters.size() * sizeof(float));
+        mix(lightPos, sizeof(lightPos));
+        mix(&range, sizeof(range));
+        mix(&size, sizeof(size));
+
+        ps.light = i;
+        ps.assigned = true;
+        for (int a = 0; a < 3; ++a)
+            ps.pos[a] = lightPos[a];
+        ps.range = range;
+        mPointLastTriangles += (int)(mPointCasters.size() / 9);
+        if (ps.valid && ps.hash == hash && ps.size == size)
+            continue; // nothing near the light moved: keep last frame's cube
+
+        if (!stateSet) {
+            stateSet = true;
+            glDisable(GL_BLEND);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_STENCIL_TEST);
+            glDisable(GL_CULL_FACE);
+            depthClamp = glIsEnabled(GL_DEPTH_CLAMP); // the game's renderer keeps it on; the near plane must clip here
+            glDisable(GL_DEPTH_CLAMP);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LESS);
+            glDepthMask(GL_TRUE);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            Use(mPointShadowDepth);
+            glBindVertexArray(mPointShadowVao);
+        }
+        if (ps.tex == 0 || ps.size != size) {
+            if (ps.tex == 0) {
+                glGenTextures(1, &ps.tex);
+                glGenFramebuffers(1, &ps.fbo);
+                glGenRenderbuffers(1, &ps.depth);
+            }
+            glActiveTexture(GL_TEXTURE0 + kPointShadowUnit0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, ps.tex);
+            for (int face = 0; face < 6; ++face)
+                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_R32F, size, size, 0, GL_RED, GL_FLOAT, nullptr);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, mPointShadowDummy);
+            glBindRenderbuffer(GL_RENDERBUFFER, ps.depth);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, size, size);
+            glBindFramebuffer(GL_FRAMEBUFFER, ps.fbo);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, ps.depth);
+            ps.size = size;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, ps.fbo);
+        glViewport(0, 0, size, size);
+        glBindBuffer(GL_ARRAY_BUFFER, mPointShadowVbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(mPointCasters.size() * sizeof(float)), mPointCasters.data(),
+                     GL_STREAM_DRAW);
+        glUniform3fv(Loc("uLight"), 1, lightPos);
+        // The six faces of the GL cube map convention: right, up and forward axes of each face.
+        static const float kFaces[6][9] = {
+            { 0, 0, -1, 0, -1, 0, 1, 0, 0 },  { 0, 0, 1, 0, -1, 0, -1, 0, 0 }, { 1, 0, 0, 0, 0, 1, 0, 1, 0 },
+            { 1, 0, 0, 0, 0, -1, 0, -1, 0 },  { 1, 0, 0, 0, -1, 0, 0, 0, 1 },  { -1, 0, 0, 0, -1, 0, 0, 0, -1 },
+        };
+        // Near plane: the fixture the light is mounted in (a brazier's rim, a lamp's shade) sits within a few tens of units
+        // of the flame and must not close the light in; anything nearer than this does not cast.
+        const float zNear = std::clamp(CvFloat("gNewDawn.Shadows.PointNear", 24.0f), 1.0f, 100.0f), zFar = range;
+        for (int face = 0; face < 6; ++face) {
+            const float* r = kFaces[face];
+            const float* u = r + 3;
+            const float* f = r + 6;
+            // clip = P * V, column-major: V rows (right, up, -forward), P a 90 degree perspective.
+            const float a = -(zFar + zNear) / (zFar - zNear), b = -2.0f * zFar * zNear / (zFar - zNear);
+            float vp[16];
+            const float* rows[3] = { r, u, f };
+            for (int col = 0; col < 3; ++col) {
+                vp[col * 4 + 0] = rows[0][col];
+                vp[col * 4 + 1] = rows[1][col];
+                vp[col * 4 + 2] = -a * rows[2][col];
+                vp[col * 4 + 3] = rows[2][col];
+            }
+            float tr[3];
+            for (int row = 0; row < 3; ++row)
+                tr[row] = -(rows[row][0] * lightPos[0] + rows[row][1] * lightPos[1] + rows[row][2] * lightPos[2]);
+            vp[12] = tr[0];
+            vp[13] = tr[1];
+            vp[14] = -a * tr[2] + b;
+            vp[15] = tr[2];
+            glUniformMatrix4fv(Loc("uVP"), 1, GL_FALSE, vp);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, ps.tex, 0);
+            static const GLfloat kFar[4] = { 1.0e6f, 0, 0, 0 };
+            glClearBufferfv(GL_COLOR, 0, kFar);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            if (!mPointCasters.empty())
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mPointCasters.size() / 3));
+        }
+        ps.hash = hash;
+        ps.valid = true;
+        mPointLastRendered++;
+        if (const char* dumpDir = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Shadows.PointDumpDir", "");
+            dumpDir != nullptr && *dumpDir != '\0' && c == 0) {
+            // Measurement/debug fixture: write the six faces of the first cube once as raw R32F (distance, world units).
+            static bool dumped = false;
+            if (!dumped && !mPointCasters.empty()) {
+                dumped = true;
+                std::vector<float> face((size_t)size * size);
+                glActiveTexture(GL_TEXTURE0 + kPointShadowUnit0);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, ps.tex);
+                for (int f = 0; f < 6; ++f) {
+                    glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_RED, GL_FLOAT, face.data());
+                    char name[512];
+                    snprintf(name, sizeof(name), "%s/face%d_%d.f32", dumpDir, f, size);
+                    if (FILE* fp = fopen(name, "wb")) {
+                        fwrite(face.data(), sizeof(float), face.size(), fp);
+                        fclose(fp);
+                    }
+                }
+                glBindTexture(GL_TEXTURE_CUBE_MAP, mPointShadowDummy);
+                SPDLOG_INFO("NewDawnPointShadows: dumped cube faces, light ({:.1f},{:.1f},{:.1f}) range {:.0f}, {} triangles",
+                            lightPos[0], lightPos[1], lightPos[2], range, mPointCasters.size() / 9);
+            }
+        }
+    }
+    if (stateSet) {
+        glBindVertexArray(mVao);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        if (depthClamp)
+            glEnable(GL_DEPTH_CLAMP);
+    }
+    glActiveTexture(previousActive);
+    if (mStats) {
+        static int logged = 0;
+        static double cpuMs = 0.0;
+        cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count();
+        if (logged++ % 300 == 299) {
+            SPDLOG_INFO("NewDawnPointShadows: CPU {:.3f} ms/frame (culling {} caster triangles per light, 300 frames)",
+                        cpuMs / 300.0, triCount);
+            cpuMs = 0.0;
+        }
+        static int logged2 = 0;
+        if (logged2++ % 300 == 0) {
+            SPDLOG_INFO("NewDawnPointShadows: {} lights, {} caster triangles, {} cube(s) re-rendered this frame",
+                        (int)candidates.size(), mPointLastTriangles, mPointLastRendered);
+            for (int i = 0; i < mLocalCount; ++i)
+                SPDLOG_INFO("  local light {}: ({:.0f},{:.0f},{:.0f}) range {:.0f}{}", i, mLocalPos[i][0], mLocalPos[i][1],
+                            mLocalPos[i][2], mLocalPos[i][3], mLocalFairy[i] ? " (fairy)" : "");
+        }
+    }
+    CheckError("point shadows");
 }
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
