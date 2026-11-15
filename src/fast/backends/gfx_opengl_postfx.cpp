@@ -1,6 +1,7 @@
 #if defined(ENABLE_OPENGL) && !defined(USE_OPENGLES)
 
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_perf.h"
 #include "fast/newdawn_wind.h"
 
 #include <algorithm>
@@ -3325,8 +3326,52 @@ void PostFxGL::CheckError(const char* where) {
     }
 }
 
+static const char* const kStageNames[NEWDAWN_PERF_STAGES] = {
+    "opaque end / AO", "scene end / bloom+grade", "shadows", "sun shafts", "water", "water opaque copy",
+    "physical sky", "volumetric clouds", "sky ambient cube", "volumetric fog", "textured sun flare",
+    "ambient particles", "wet surfaces and rain shelter", "rain and snow", "screen-space GI", "VFX sprites",
+    "local lights", "water caustics", "underwater", "grass" };
+static float sStageMs[NEWDAWN_PERF_STAGES] = {};
+float gNewDawnGpuFrameMs = 0.0f; // written by GfxRenderingAPIOGL
+
+const char* NewDawnPerfStageName(int stage) {
+    return stage >= 0 && stage < NEWDAWN_PERF_STAGES ? kStageNames[stage] : "";
+}
+
+void NewDawnPerfGet(NewDawnPerfInfo* out) {
+    std::copy(sStageMs, sStageMs + NEWDAWN_PERF_STAGES, out->stageMs);
+    out->gpuFrameMs = gNewDawnGpuFrameMs;
+    out->vramTotalMB = out->vramFreeMB = -1;
+#ifndef USE_OPENGLES
+    static int mode = -1; // 0 none, 1 NVX, 2 ATI
+    if (mode < 0) {
+        mode = 0;
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n; i++) {
+            const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+            if (e && !strcmp(e, "GL_NVX_gpu_memory_info")) {
+                mode = 1;
+            } else if (e && !strcmp(e, "GL_ATI_meminfo") && mode == 0) {
+                mode = 2;
+            }
+        }
+    }
+    GLint v[4] = {};
+    if (mode == 1) {
+        glGetIntegerv(0x9048, &v[0]); // GPU_MEM_INFO_TOTAL_AVAILABLE_MEM_NVX (KB)
+        glGetIntegerv(0x9049, &v[1]); // GPU_MEM_INFO_CURRENT_AVAILABLE_VIDMEM_NVX (KB)
+        out->vramTotalMB = v[0] / 1024;
+        out->vramFreeMB = v[1] / 1024;
+    } else if (mode == 2) {
+        glGetIntegerv(0x87FB, v); // VBO_FREE_MEMORY_ATI: [0] = total free KB
+        out->vramFreeMB = v[0] / 1024;
+    }
+#endif
+}
+
 void PostFxGL::BeginTimer(int stage) {
-    if (!mStats) {
+    if (!mTimers) {
         return;
     }
     int slot = mQueryNext[stage];
@@ -3334,39 +3379,22 @@ void PostFxGL::BeginTimer(int stage) {
         GLuint64 ns = 0;
         glGetQueryObjectui64v(mQueries[stage][slot], GL_QUERY_RESULT, &ns);
         mQueryPending[stage][slot] = false;
-        mQueryTotalMs[stage] += ns / 1e6;
-        if (++mQueryCount[stage] == 300) {
-            const char* label = (stage == 0)   ? "opaque end / AO"
-                                : (stage == 1) ? "scene end / bloom+grade"
-                                : (stage == 2) ? "shadows"
-                                : (stage == 3) ? "sun shafts"
-                                : (stage == 4) ? "water"
-                                : (stage == 5) ? "water opaque copy"
-                                : (stage == 6) ? "physical sky"
-                                : (stage == 7) ? "volumetric clouds"
-                                : (stage == 9) ? "volumetric fog"
-                                : (stage == 10) ? "textured sun flare"
-                                : (stage == 11) ? "ambient particles"
-                                : (stage == 12) ? "wet surfaces and rain shelter"
-                                : (stage == 13) ? "rain and snow"
-                                : (stage == 14) ? "screen-space GI"
-                                : (stage == 15) ? "VFX sprites"
-                                : (stage == 16) ? "local lights"
-                                : (stage == 17) ? "water caustics"
-                                : (stage == 18) ? "underwater"
-                                : (stage == 19) ? "grass"
-                                               : "sky ambient cube";
-            SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
-                        mQueryTotalMs[stage] / 300.0, 300);
-            mQueryTotalMs[stage] = 0.0;
-            mQueryCount[stage] = 0;
+        sStageMs[stage] += (static_cast<float>(ns / 1e6) - sStageMs[stage]) * 0.1f;
+        if (mStats) {
+            mQueryTotalMs[stage] += ns / 1e6;
+            if (++mQueryCount[stage] == 300) {
+                SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage,
+                            kStageNames[stage], mQueryTotalMs[stage] / 300.0, 300);
+                mQueryTotalMs[stage] = 0.0;
+                mQueryCount[stage] = 0;
+            }
         }
     }
     glBeginQuery(GL_TIME_ELAPSED, mQueries[stage][slot]);
 }
 
 void PostFxGL::EndTimer(int stage) {
-    if (!mStats) {
+    if (!mTimers) {
         return;
     }
     glEndQuery(GL_TIME_ELAPSED);
@@ -3594,6 +3622,7 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     guard.Neutralise();
     glBindVertexArray(mVao);
     mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    mTimers = mStats || CvInt("gNewDawn.Perf.Overlay", 0) != 0;
     BeginTimer(kSkyTimerStage);
     // Smooth atmospheric radiance needs no full-resolution raymarch or temporal history. Bilinear
     // reconstruction is stable under camera motion and cannot ghost at scene cuts or the Moon's edge.
@@ -3880,6 +3909,7 @@ GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
     guard.Neutralise();
     glBindVertexArray(mVao);
     mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    mTimers = mStats || CvInt("gNewDawn.Perf.Overlay", 0) != 0;
     Settings s = ReadSettings();
     if (!s.postFxOn)
         s.bloomOn = s.gradeOn = false;
@@ -3984,6 +4014,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     }
 
     mStats = s.stats;
+    mTimers = mStats || CvInt("gNewDawn.Perf.Overlay", 0) != 0;
     if (mStats) {
         if (fb.width != mStatsW || fb.height != mStatsH || fb.msaa_level != mStatsMsaa) {
             mStatsW = fb.width;
@@ -4846,6 +4877,7 @@ void PostFxGL::RunSunFlare(const NewDawnPostFxParams& params, const FramebufferO
     if (uv[0] < -0.02f || uv[0] > 1.02f || uv[1] < -0.02f || uv[1] > 1.02f)
         return;
     mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    mTimers = mStats || CvInt("gNewDawn.Perf.Overlay", 0) != 0;
     GlStateGuard guard;
     guard.Neutralise();
     glBindVertexArray(mVao);

@@ -168,6 +168,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
 
     std::vector<TextureInfo> textures;
     // Optional nonblocking timers measure all world draw batches equally with materials on/off.
+    int mFrameStamp = -1; // overlay timestamp slot for the frame in flight, -1 = none
+    GLuint* mFrameStampQueries = nullptr;
     static constexpr int kDrawTimerCount = 512;
     GLuint mDrawTimers[kDrawTimerCount] = {};
     bool mDrawTimerPending[kDrawTimerCount] = {};
