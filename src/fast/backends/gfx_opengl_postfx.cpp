@@ -11,6 +11,7 @@
 #include <limits>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
 #include <cstring>
 #include <stb_image.h>
 #include <string>
@@ -3743,7 +3744,7 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
                 static_cast<float>(std::fmod(drift * 0.009 * look.windMul, 1024.0)));
 }
 
-// Night sky assets (never committed): `<gNewDawn.Assets.Path>/nightsky/{stars.bin,milkyway_eq.f16}`, baked by
+// Night sky assets (committed under mm/assets/newdawn/nightsky, CC BY-SA): `<gNewDawn.Assets.Path>/nightsky/{stars.bin,milkyway_eq.jpg,milkyway_eq.txt}`, baked by
 // tools/newdawn/nightsky/prep_nightsky.py from the HYG v4.1 catalogue and NASA SVS Deep Star Maps 2020.
 bool PostFxGL::EnsureNightSkyAssets() {
     const std::string root = CvString("gNewDawn.Assets.Path", "assets/newdawn");
@@ -3759,27 +3760,43 @@ bool PostFxGL::EnsureNightSkyAssets() {
     GLint previousActive;
     glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
     {
-        std::ifstream f(dir / "milkyway_eq.f16", std::ios::binary);
-        char magic[4];
-        uint32_t w = 0, h = 0;
-        float scale = 1.0f;
-        if (f.read(magic, 4) && std::memcmp(magic, "NDMW", 4) == 0 && f.read((char*)&w, 4) && f.read((char*)&h, 4) &&
-            f.read((char*)&scale, 4) && w > 0 && h > 0 && w <= 8192 && h <= 4096) {
-            std::vector<uint16_t> data((size_t)w * h * 3);
-            if (f.read((char*)data.data(), data.size() * 2)) {
-                glActiveTexture(GL_TEXTURE0 + kMilkyWayUnit);
-                glGenTextures(1, &mMilkyWayTex);
-                glBindTexture(GL_TEXTURE_2D, mMilkyWayTex);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_HALF_FLOAT, data.data());
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glGenerateMipmap(GL_TEXTURE_2D);
-                mMilkyWayScale = scale;
-            }
+        // 8-bit JPEG, pixel = 255 * (linear / scale)^(1/gamma); the sidecar carries gamma and scale
+        // (tools/newdawn/nightsky/prep_nightsky.py). Decoded to half-float strip by strip to keep the temporary small.
+        float gamma = 3.0f, scale = 0.0f;
+        if (std::ifstream meta(dir / "milkyway_eq.txt"); meta) {
+            std::string line;
+            std::getline(meta, line);
+            std::sscanf(line.c_str(), "gamma=%f scale=%f", &gamma, &scale);
         }
+        int w = 0, h = 0, n = 0;
+        auto* pixels = scale > 0.0f && gamma > 0.0f ? stbi_load((dir / "milkyway_eq.jpg").string().c_str(), &w, &h, &n, 3)
+                                                    : nullptr;
+        if (pixels && w > 0 && h > 0 && w <= 8192 && h <= 4096) {
+            float lut[256];
+            for (int i = 0; i < 256; ++i)
+                lut[i] = std::pow(i / 255.0f, gamma);
+            glActiveTexture(GL_TEXTURE0 + kMilkyWayUnit);
+            glGenTextures(1, &mMilkyWayTex);
+            glBindTexture(GL_TEXTURE_2D, mMilkyWayTex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_FLOAT, nullptr);
+            constexpr int strip = 128;
+            std::vector<float> linear((size_t)w * strip * 3);
+            for (int y = 0; y < h; y += strip) {
+                const int rows = std::min(strip, h - y);
+                const uint8_t* src = pixels + (size_t)y * w * 3;
+                for (size_t i = 0; i < (size_t)w * rows * 3; ++i)
+                    linear[i] = lut[src[i]];
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, w, rows, GL_RGB, GL_FLOAT, linear.data());
+            }
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glGenerateMipmap(GL_TEXTURE_2D);
+            mMilkyWayScale = scale;
+        }
+        stbi_image_free(pixels);
     }
     {
         std::ifstream f(dir / "stars.bin", std::ios::binary);
@@ -3810,7 +3827,7 @@ bool PostFxGL::EnsureNightSkyAssets() {
     if (mMilkyWayTex && mStarCount > 0) {
         SPDLOG_INFO("NewDawnNightSky: loaded {} stars and the Milky Way panorama from {}", mStarCount, dir.string());
     } else {
-        SPDLOG_WARN("NewDawnNightSky: missing/unsupported assets in {} (stars.bin, milkyway_eq.f16); the native stars "
+        SPDLOG_WARN("NewDawnNightSky: missing/unsupported assets in {} (stars.bin, milkyway_eq.jpg/.txt); the native stars "
                     "stay. Set gNewDawn.Assets.Path to the asset root.",
                     dir.string());
     }
