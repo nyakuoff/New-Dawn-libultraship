@@ -2585,11 +2585,14 @@ void main() {
         foamCol = foamTint(H);
     }
     if (wave && uFoam > 0.0) {
-        // Crest whitecaps and the wake foam of the ripple field (both are in the trace pass's alpha).
+        // Crest whitecaps and the wake foam of the ripple field (both are in the trace pass's alpha). Foam is only opaque where
+        // two fine noises agree, so it reads as thin, broken streaks and lace, never as a solid sheet.
         float cf = clamp(wv.a - 1.0, 0.0, 1.0);
         if (cf > 0.0) {
-            float lace = 0.5 + 0.5 * vnoise(H.xz / 2.3 + vec2(0.3, -0.2) * uTime);
-            float fw = cf * (0.3 + 0.7 * lace) * (0.45 + 0.55 * graze) * (1.0 - 0.6 * smoothstep(3.0, 12.0, footprint)) * uFoam * 0.85;
+            float n1 = vnoise(H.xz / 2.6 + vec2(0.3, -0.2) * uTime);
+            float n2 = vnoise(H.xz / 7.5 - vec2(0.15, 0.1) * uTime + 4.0);
+            float broken = smoothstep(0.3, 0.85, cf * (0.3 + 1.0 * (0.6 * n1 + 0.4 * n2)));
+            float fw = broken * (1.0 - smoothstep(5.0, 16.0, footprintS)) * uFoam * 0.65;
             if (fw > f) {
                 f = fw;
                 foamCol = foamTint(H);
@@ -2688,16 +2691,18 @@ void main() {
 
 static const char* kWaterWaveLib = R"GLSL(
 uniform float uTime;
-uniform vec2 uWaveDirs[3]; // direction each swell travels: the wind, fanned by fixed angles
+uniform vec2 uWaveDirs[6]; // direction each swell travels: the wind, fanned out by fixed angles
 uniform float uWaveAmp;    // swell amplitude (world units)
 uniform vec4 uRippleWin;   // window min X, min Z, 1 / size, active
 uniform sampler2D uRipple; // R height, G velocity, B foam
 
-const vec3 WV_LEN = vec3(470.0, 270.0, 160.0);
-const vec3 WV_FRAC = vec3(1.0, 0.55, 0.3);
-const vec3 WV_PH = vec3(0.0, 1.9, 4.1);
+// Six swell trains. The first three carry the displacement the march sees; the finer three only shape the normal.
+const float WV_LEN[6] = float[6](470.0, 270.0, 160.0, 105.0, 68.0, 44.0);
+const float WV_FRAC[6] = float[6](1.0, 0.55, 0.3, 0.16, 0.09, 0.05);
+const float WV_PH[6] = float[6](0.0, 1.9, 4.1, 0.7, 2.6, 5.3);
 const float WV_SHARP = 1.4;
 const float WV_MEAN = 0.3831; // mean of exp(1.4 (sin - 1)): the WaterBox plane stays the mean sea level
+const float WV_ENV_MAX = 1.6; // upper bound of waveEnvelope
 
 float wvHash(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
@@ -2711,32 +2716,52 @@ float wvNoise(vec2 x) {
     return mix(mix(wvHash(i), wvHash(i + vec2(1.0, 0.0)), f.x), mix(wvHash(i + vec2(0.0, 1.0)), wvHash(i + vec2(1.0, 1.0)), f.x), f.y);
 }
 
-// Swell groups: a slow envelope makes sets of larger waves with lulls between them (1.45 is its upper bound).
-float waveEnvelope(vec2 x) {
-    return 0.45 + 1.0 * wvNoise(x * (1.0 / 900.0) + uWaveDirs[0] * (uTime * 0.012) + 5.3);
+// Every train has its own slowly drifting envelope (a product of two long sines, 0.2 .. 1.6): trains come and go, so the
+// crests break up into irregular patches instead of one set of parallel lines.
+float waveEnvelope(int i, vec2 x) {
+    float fi = float(i);
+    float a = dot(x, vec2(0.0043 + 0.0011 * fi, -0.0021 - 0.0007 * fi)) + 1.7 * fi + 0.021 * uTime * (1.0 + 0.3 * fi);
+    float b = dot(x, vec2(-0.0019 - 0.0005 * fi, 0.0039 + 0.0009 * fi)) + 3.1 * fi - 0.017 * uTime;
+    return 0.2 + 0.7 * (1.0 + sin(a) * sin(b));
 }
 
-float oceanHeight(vec2 x, float amp, vec3 fade) {
+// detail = false: the three displacing trains only (used by the march); true: all six (normals, foam).
+float oceanHeight(vec2 x, float amp, vec3 fadeA, vec3 fadeB, bool detail) {
     // A slow phase warp bends the crest lines so the swell never reads as a perfect set of straight stripes.
     float warp = 1.7 * sin(0.0011 * x.x - 0.0017 * x.y + 0.05 * uTime) + 1.1 * sin(0.0023 * x.x + 0.0009 * x.y - 0.03 * uTime) +
                  3.5 * (wvNoise(x * (1.0 / 520.0) + 11.7) - 0.5);
-    amp *= waveEnvelope(x);
     float h = 0.0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 6; i++) {
+        if (i >= 3 && !detail) {
+            break;
+        }
+        float fade = i < 3 ? fadeA[i] : fadeB[i - 3];
+        if (fade <= 0.0) {
+            continue;
+        }
         float k = 6.2831853 / WV_LEN[i];
         // Deep-water dispersion: phase speed grows with the square root of the wavelength.
         float th = k * (dot(uWaveDirs[i], x) - 3.455 * sqrt(WV_LEN[i]) * uTime) + WV_PH[i] + warp * (0.5 + 0.35 * float(i));
-        h += amp * WV_FRAC[i] * fade[i] * (exp(WV_SHARP * (sin(th) - 1.0)) - WV_MEAN);
+        h += amp * WV_FRAC[i] * fade * waveEnvelope(i, x) * (exp(WV_SHARP * (sin(th) - 1.0)) - WV_MEAN);
     }
     return h;
+}
+
+// Crest height of the same sum (the foam's reference): 0.617 of every train's local amplitude.
+float oceanCrest(vec2 x, float amp, vec3 fadeA, vec3 fadeB) {
+    float c = 0.0;
+    for (int i = 0; i < 6; i++) {
+        c += amp * WV_FRAC[i] * (i < 3 ? fadeA[i] : fadeB[i - 3]) * waveEnvelope(i, x);
+    }
+    return 0.617 * c;
 }
 
 vec3 rippleAt(vec2 x) {
     return texture(uRipple, (x - uRippleWin.xy) * uRippleWin.z).rgb;
 }
 
-float surfaceHeight(vec2 x, float amp, vec3 fade, float simW) {
-    float h = oceanHeight(x, amp, fade);
+float surfaceHeight(vec2 x, float amp, vec3 fadeA, vec3 fadeB, bool detail, float simW) {
+    float h = oceanHeight(x, amp, fadeA, fadeB, detail);
     if (simW > 0.0) {
         h += simW * rippleAt(x).r;
     }
@@ -2779,8 +2804,12 @@ void main() {
     float taper = smoothstep(10.0, 70.0, bed);
     float camFade = smoothstep(uWaveAmp * 1.5, uWaveAmp * 5.0 + 1.0, uEye.y - planeY);
     float amp = uWaveAmp * taper * camFade;
-    // Wavelengths shorter than a few pixels fade out so a far crest can neither alias nor be missed by the march.
-    vec3 fade = 1.0 - smoothstep(0.08, 0.3, vec3(footprint) / WV_LEN);
+    // A train fades out once a pixel covers a good fraction of its wavelength along the view direction (footprint stretched by
+    // 1 / sin(elevation)): distant water converges to a smooth, glossy surface instead of banding, and a far crest can neither
+    // alias nor be missed by the march.
+    float footprintS = footprint / max(-dir.y, 0.06);
+    vec3 fadeA = 1.0 - smoothstep(0.03, 0.3, vec3(footprintS) / vec3(WV_LEN[0], WV_LEN[1], WV_LEN[2]));
+    vec3 fadeB = 1.0 - smoothstep(0.03, 0.3, vec3(footprintS) / vec3(WV_LEN[3], WV_LEN[4], WV_LEN[5]));
     float simW = 0.0;
     if (uRippleWin.w > 0.5) {
         vec2 win = (H0.xz - uRippleWin.xy) * uRippleWin.z;
@@ -2788,10 +2817,10 @@ void main() {
             simW = smoothstep(2.0, 16.0, bed); // no displacement on the beach; the normal still ripples
         }
     }
-    float sumF = dot(WV_FRAC, fade);
+    float sumF = WV_FRAC[0] * fadeA.x + WV_FRAC[1] * fadeA.y + WV_FRAC[2] * fadeA.z;
     float simBound = simW > 0.0 ? 4.0 : 0.0;
-    float hi = amp * 1.45 * 0.617 * sumF + simBound;
-    float lo = amp * 1.45 * 0.32 * sumF + simBound;
+    float hi = amp * WV_ENV_MAX * 0.617 * sumF + simBound;
+    float lo = amp * WV_ENV_MAX * 0.32 * sumF + simBound;
     if (hi + lo < 0.05) {
         return;
     }
@@ -2804,7 +2833,7 @@ void main() {
     float dt = (tOut - tIn) / float(N);
     float ta = tIn;
     vec3 pa = uEye + dir * ta;
-    float fa = pa.y - planeY - surfaceHeight(pa.xz, amp, fade, simW);
+    float fa = pa.y - planeY - surfaceHeight(pa.xz, amp, fadeA, fadeB, false, simW);
     if (fa <= 0.0) {
         return; // the camera is inside the swell
     }
@@ -2812,13 +2841,13 @@ void main() {
     for (int i = 1; i <= N; i++) {
         float tb = tIn + dt * float(i);
         vec3 pb = uEye + dir * tb;
-        float fb = pb.y - planeY - surfaceHeight(pb.xz, amp, fade, simW);
+        float fb = pb.y - planeY - surfaceHeight(pb.xz, amp, fadeA, fadeB, false, simW);
         if (fb <= 0.0) {
             float a = ta, b = tb, fA = fa, fB = fb;
             for (int j = 0; j < 4; j++) {
                 float m = a + (b - a) * fA / (fA - fB);
                 vec3 pm = uEye + dir * m;
-                float fm = pm.y - planeY - surfaceHeight(pm.xz, amp, fade, simW);
+                float fm = pm.y - planeY - surfaceHeight(pm.xz, amp, fadeA, fadeB, false, simW);
                 if (fm > 0.0) {
                     a = m;
                     fA = fm;
@@ -2838,19 +2867,20 @@ void main() {
     }
     vec3 H = uEye + dir * tHit;
     float e = 3.0 + footprint * 0.6;
-    float h0 = surfaceHeight(H.xz, amp, fade, simW);
-    float hx = surfaceHeight(H.xz + vec2(e, 0.0), amp, fade, simW);
-    float hz = surfaceHeight(H.xz + vec2(0.0, e), amp, fade, simW);
+    float h0 = surfaceHeight(H.xz, amp, fadeA, fadeB, true, simW);
+    float hx = surfaceHeight(H.xz + vec2(e, 0.0), amp, fadeA, fadeB, true, simW);
+    float hz = surfaceHeight(H.xz + vec2(0.0, e), amp, fadeA, fadeB, true, simW);
     vec2 slope = vec2(hx - h0, hz - h0) / e;
     float hOff = H.y - planeY;
-    // Whitecaps ride the crest tops, broken up by noise drifting with the swell; stronger wind, more caps.
-    float crestH = amp * waveEnvelope(H.xz) * 0.617 * sumF;
-    float hn = crestH > 0.01 ? oceanHeight(H.xz, amp, fade) / crestH : 0.0;
+    // Whitecaps ride the crest tops of the strongest trains, broken up by noise and gated into patches; stronger wind, more
+    // caps. They only exist where the pixel still resolves them (no stretched white smears at a grazing angle).
+    float crestH = oceanCrest(H.xz, amp, fadeA, fadeB);
+    float hn = crestH > 0.01 ? oceanHeight(H.xz, amp, fadeA, fadeB, true) / crestH : 0.0;
     float breakup = 0.6 * wvNoise(H.xz / 11.0 + uWaveDirs[0] * uTime * 4.0) + 0.4 * wvNoise(H.xz / 3.7 - uWaveDirs[1] * uTime * 6.0);
-    // Caps come in patches (a coarse noise gates which stretches of crest break) rather than along whole crest lines.
     float patch = wvNoise(H.xz / 85.0 + uWaveDirs[0] * uTime * 2.0 + 17.0);
-    float cap = smoothstep(0.6, 0.95, hn + (breakup - 0.5) * 0.5 + (patch - 0.5) * 1.0) * (0.25 + 0.75 * uWaveGust) * taper;
-    float wake = simW > 0.0 || uRippleWin.w > 0.5 ? rippleAt(H.xz).b : 0.0;
+    float capFade = 1.0 - smoothstep(6.0, 18.0, footprintS);
+    float cap = smoothstep(0.68, 1.0, hn + (breakup - 0.5) * 0.5 + (patch - 0.5) * 1.1) * (0.25 + 0.75 * uWaveGust) * taper * capFade;
+    float wake = uRippleWin.w > 0.5 ? rippleAt(H.xz).b : 0.0;
     float foam = clamp(max(cap, wake), 0.0, 1.0);
     if (any(isnan(vec4(hOff, slope, foam))) || any(isinf(vec4(hOff, slope, foam)))) {
         return;
@@ -2888,7 +2918,10 @@ void main() {
     vec4 c = st(p);
     float lap = st(p + ivec2(-1, 0)).r + st(p + ivec2(1, 0)).r + st(p + ivec2(0, -1)).r + st(p + ivec2(0, 1)).r - 4.0 * c.r;
     float v = c.g + (uC2 * lap - uDamp * c.g) * uDt;
-    float foam = c.b * exp(-uDt / 2.0);
+    // Wake foam is thin and short lived: it is raised where the surface is being agitated hard (the ring crests) plus a narrow
+    // line right under a moving source, and it fades in about a second.
+    float foam = c.b * exp(-uDt / 1.1);
+    foam += smoothstep(18.0, 70.0, abs(c.g)) * 1.6 * uDt;
     vec2 world = uWin.xy + (vec2(p) + 0.5) * uWin.z;
     for (int i = 0; i < 16; i++) {
         if (i >= uSrcCount) {
@@ -2897,12 +2930,13 @@ void main() {
         vec2 dl = world - uSrc[i].xy;
         float g = exp(-dot(dl, dl) / (uSrc[i].z * uSrc[i].z));
         v += uSrc[i].w * g * uDt;
-        foam += g * clamp(uSrc[i].w / 400.0, 0.0, 1.0) * 4.0 * uDt;
+        float gn = exp(-dot(dl, dl) / (0.2 * uSrc[i].z * uSrc[i].z));
+        foam += gn * clamp(abs(uSrc[i].w) / 450.0, 0.0, 1.0) * 1.6 * uDt;
     }
     float h = c.r + v * uDt;
     int edge = min(min(p.x, p.y), min(s.x - 1 - p.x, s.y - 1 - p.y));
     float a = smoothstep(0.0, 14.0, float(edge));
-    oColor = vec4(clamp(h, -4.0, 4.0) * a, clamp(v, -400.0, 400.0) * a, min(foam, 1.0) * a, 0.0);
+    oColor = vec4(clamp(h, -4.0, 4.0) * a, clamp(v, -400.0, 400.0) * a, min(foam, 0.8) * a, 0.0);
 }
 )GLSL";
 
@@ -4988,15 +5022,16 @@ void PostFxGL::RunWaterWaves(const NewDawnPostFxParams& params, const Framebuffe
     glBindTexture(GL_TEXTURE_2D, rippleLive ? mRipple[mRippleRead].tex : mWaveDummy);
     Use(mWaterWaves);
     setPlane();
-    float dirs[6];
-    const float angles[3] = { 0.0f, 0.42f, -0.6f }; // each swell is the wind rotated by a fixed angle
+    float dirs[12];
+    // Each swell train is the wind rotated by a fixed angle; the angles are wide and uneven so crests never run parallel.
+    const float angles[6] = { 0.0f, 0.55f, -0.85f, 1.15f, -1.4f, 0.28f };
     const float wl = std::sqrt(params.waterWaveDir[0] * params.waterWaveDir[0] + params.waterWaveDir[1] * params.waterWaveDir[1]);
     const float bx = wl > 1e-4f ? params.waterWaveDir[0] / wl : 1.0f, bz = wl > 1e-4f ? params.waterWaveDir[1] / wl : 0.0f;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 6; i++) {
         dirs[i * 2 + 0] = bx * std::cos(angles[i]) - bz * std::sin(angles[i]);
         dirs[i * 2 + 1] = bx * std::sin(angles[i]) + bz * std::cos(angles[i]);
     }
-    glUniform2fv(Loc("uWaveDirs"), 3, dirs);
+    glUniform2fv(Loc("uWaveDirs"), 6, dirs);
     glUniform1f(Loc("uTime"), params.waterTime);
     glUniform1f(Loc("uWaveAmp"), kWaveBaseAmp * params.waterWaves);
     glUniform1f(Loc("uWaveGust"), params.waterWaveGust);
