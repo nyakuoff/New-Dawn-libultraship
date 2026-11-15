@@ -153,6 +153,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
                                   uint32_t batchCount) override;
     void SetVfxSprites(const float* data, uint32_t count) override;
     void SetGrassTriangles(const float* data, uint32_t count) override;
+    void SetStencilMark(uint8_t mark) override {
+        mStencilMarkClass = mark;
+    }
     bool VfxReplacing() const override;
     bool SupportsAlphaToCoverage() const override {
         return true;
@@ -204,6 +207,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     // was last uploaded for, so a program switch re-applies the uniforms.
     GfxPerPixelLightingState mPerPixelLightState{};
     bool mStencilMarkOn = false;
+    uint8_t mStencilMarkClass = 0, mStencilMarkRef = 1;
     int32_t mPerPixelUploadedSerial = -1;
     ShaderProgram* mPerPixelUploadedProgram = nullptr;
 

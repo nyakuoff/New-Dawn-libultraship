@@ -317,6 +317,7 @@ struct RDP {
         uint8_t vfxClass; // New Dawn VFX: classification of the loaded texture's path (0 = none)
         uint16_t grassId; // New Dawn grass: 1 + index into the grass texture table (0 = not grass)
         bool swayPlant;   // New Dawn wind: a plant cut-out texture (only meaningful inside a room wind scope)
+        uint8_t interiorIdx; // New Dawn interior: 1 + index into the window/emissive texture table (0 = none)
     } loaded_texture[2];
     struct {
         uint8_t fmt;
@@ -482,6 +483,10 @@ class Interpreter {
     bool SwayClassify(std::string_view path);
     void RecordGrassTriangle(const LoadedVertex* const v[3]);
     void SubmitGrass();
+    void BeginInteriorRecording(bool enabled, bool debug);
+    uint8_t InteriorClassify(std::string_view path);
+    void RecordInteriorTriangle(const LoadedVertex* const v[3], uint8_t idx);
+    void SubmitInterior(NewDawnPostFxParams& params);
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
@@ -664,6 +669,11 @@ class Interpreter {
     // New Dawn grass: world-space ground triangles with a grass texture (NEWDAWN_GRASS_TRI_FLOATS floats each).
     bool mGrass = false, mGrassDebug = false;
     std::vector<float> mGrassTris;
+    // New Dawn interior polish: world-space triangles of window/emissive textures (11 floats each, see RecordInteriorTriangle).
+    bool mInterior = false, mInteriorDebug = false;
+    std::vector<float> mInteriorTris;
+    uint8_t mBufMark = 0, mBufMarkNext = 0;
+    float mInteriorBBox[6] = { 1e9f, 1e9f, 1e9f, -1e9f, -1e9f, -1e9f }; // stencil class of the batch being built (emissive glass 4, lamps and signs 8)
     // Debug.Stats profiles only displacement work (including timer overhead), averaged over 300 frames.
     bool mWindProfile = false;
     uint32_t mWindProfileFrames = 0;

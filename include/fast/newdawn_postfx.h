@@ -192,4 +192,25 @@ typedef struct NewDawnPostFxParams {
     float grassFocus[3];     /* the player's position: blades close to it are laid low (read-only snapshot) */
     float grassSunDir[3];    /* unit vector towards the sun; all zero when there is none */
     float grassSunColor[3];  /* sRGB 0..1 */
+    /* New Dawn interior polish (render only). Window and doorway openings are recorded by the interpreter from the draw
+       stream (textures named in newdawn_interior_textures.inc) and submitted at the opaque-end marker; the game side fills
+       the light (time of day, weather). Light through the openings: shafts in the air and pools on the surfaces. */
+#define NEWDAWN_INTERIOR_WINDOWS 12
+#define NEWDAWN_INTERIOR_WINDOW_FLOATS 16
+#define NEWDAWN_EMISSIVE_LIGHTS 8
+    int32_t interiorEnabled;       /* window light on (interiors only) */
+    float interiorStrength;        /* user multiplier */
+    float interiorSinElevation;    /* sin of the elevation of the beams (0 horizon .. 1 overhead) */
+    float interiorColor[3];        /* linear light colour including intensity (sun, dusk, moon), 0 = no light */
+    float interiorMotes;           /* dust in the beams, 0..1 */
+    int32_t interiorDebug;         /* 1: log recorded openings and texture draws */
+    int32_t interiorWindowCount;   /* filled by the interpreter */
+    /* Per opening: centre xyz, inward normal xyz, horizontal axis xyz, half width, half height, panes x, panes y, kind. */
+    float interiorWindows[NEWDAWN_INTERIOR_WINDOWS][NEWDAWN_INTERIOR_WINDOW_FLOATS];
+    /* Emissive surfaces: draws of the classified textures write stencil bits; the renderer adds HDR emission there. */
+    int32_t emissiveEnabled;
+    float emissiveStrength;        /* user multiplier */
+    float emissiveNight;           /* 0 day .. 1 night: how far the night-only glass glows */
+    int32_t emissiveLightCount;    /* filled by the interpreter: lamp/sign/window lights for the local-light pass */
+    float emissiveLights[NEWDAWN_EMISSIVE_LIGHTS][8]; /* world xyz, radius, linear rgb, intensity */
 } NewDawnPostFxParams;
