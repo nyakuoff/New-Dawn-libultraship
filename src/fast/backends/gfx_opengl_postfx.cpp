@@ -5435,6 +5435,56 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
     mHdrActive = false;
 }
 
+// True when at least one water box's surface (its rectangle plus a 300 unit margin for waves and shore foam, and from
+// just below the plane to 300 above it for wave crests) touches the camera's view pyramid. A bed, caustics or a
+// refracted shore are only ever seen through the surface's own screen footprint, so the surface is what to test.
+// The scene's nearest 16 boxes are always submitted, so a field with a pond far behind the camera used to run the water
+// passes and the opaque colour/depth copy for nothing. Only the four side planes are tested (conservative).
+static bool WaterBoxInView(const NewDawnPostFxParams& params) {
+    if (!params.shadowUseExactProj || params.waterUnderwaterState > 0.0f) { // submerged: the bed is seen from below the surface
+        return params.waterBoxCount > 0;
+    }
+    const float* M = params.shadowViewProj;
+    const float invScale = params.shadowNdcXScale > 1e-6f ? 1.0f / params.shadowNdcXScale : 1.0f;
+    float planes[4][4];
+    // clip = M * (x, y, z, 1) with M[4 * column + row]; row r of the matrix is (M[r], M[4 + r], M[8 + r], M[12 + r]).
+    auto row = [&](int r, float s, float* out) {
+        for (int c = 0; c < 4; c++) {
+            out[c] = M[4 * c + r] * s;
+        }
+    };
+    float r0[4], r1[4], r3[4];
+    row(0, invScale, r0);
+    row(1, 1.0f, r1);
+    row(3, 1.0f, r3);
+    for (int c = 0; c < 4; c++) {
+        planes[0][c] = r3[c] + r0[c];
+        planes[1][c] = r3[c] - r0[c];
+        planes[2][c] = r3[c] + r1[c];
+        planes[3][c] = r3[c] - r1[c];
+    }
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    for (int i = 0; i < count; i++) {
+        const float* b = params.waterBoxes[i];
+        const float lo[3] = { b[0] - 300.0f, b[4] - 60.0f, b[1] - 300.0f };
+        const float hi[3] = { b[2] + 300.0f, b[4] + 300.0f, b[3] + 300.0f };
+        bool outside = false;
+        for (const auto& p : planes) {
+            const float x = p[0] >= 0.0f ? hi[0] : lo[0];
+            const float y = p[1] >= 0.0f ? hi[1] : lo[1];
+            const float z = p[2] >= 0.0f ? hi[2] : lo[2];
+            if (p[0] * x + p[1] * y + p[2] * z + p[3] < 0.0f) {
+                outside = true;
+                break;
+            }
+        }
+        if (!outside) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
                    const float* shadowPositions, uint32_t shadowVertexCount) {
     if (!mUsable || fb.width < 8 || fb.height < 8) {
@@ -5464,12 +5514,14 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                       params.giEnabled && params.giStrength > 0.0f && params.shadowUseExactProj &&
                       mGiGather.id && mGiFilter.id && mGiApply.id && s.debugView == 0 && s.shadowDebug == 0;
     if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGi) mGiValid = false;
+    // No water box in view: skip the water passes and the opaque copy (gNewDawn.Perf.WaterCull=0 turns this off).
+    const bool waterInView = params.waterBoxCount > 0 && (CvInt("gNewDawn.Perf.WaterCull", 1) == 0 || WaterBoxInView(params));
     const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END &&
                               (params.waterReflections != 0 || params.waterFoam > 0.0f ||
                                params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
-                              params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
+                              waterInView && params.shadowUseExactProj != 0;
     // The water surface runs before the soft-sprite effects (NEWDAWN_POSTFX_STAGE_WATER_XLU) so splashes and ripples draw above it
-    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
+    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && waterInView &&
                          params.shadowUseExactProj != 0;
     // Waterfalls do not need a water plane: a fall can have no WaterBox near it (docs/WATER_SIM.md).
     const bool doFalls = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 &&
@@ -5512,7 +5564,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGrass)
         mGrassGroundReady = false;
     const bool doCaustics = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterCaustics > 0.0f &&
-                            params.waterBoxCount > 0 && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
+                            waterInView && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
                             s.shadowDebug == 0;
     const bool doUnderwater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterUnderwater > 0.0f &&
                               params.waterUnderwaterState > 0.0f && params.shadowUseExactProj && mUnderwater.id &&

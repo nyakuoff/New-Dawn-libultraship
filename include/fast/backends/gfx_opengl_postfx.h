@@ -292,6 +292,7 @@ class PostFxGL {
         float lightPos[24][4] = {}, lightRgb[24][3] = {};
         int lightCount = 0;
         uint32_t lightFrame = UINT32_MAX;
+        double lastUpdateT = 0.0; // wall clock of the last radiance/probe update (see gNewDawn.GI.WorldUpdateHz)
     } mWgi;
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa = false);
     // Resolves this frame's jittered world against the reprojected history; returns the resolved linear target, or

@@ -771,7 +771,15 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     }
     const bool lights = g.lightFrame == frameIndex;
     float hysteresis = 0.0f;
-    if (!frozen) {
+    // The radiance and probe update runs at most gNewDawn.GI.WorldUpdateHz times a second of wall-clock time (default
+    // 30, 0 = every displayed frame), so its cost no longer grows with the interpolated frame rate: the probes follow
+    // the sun and the lamps over seconds, a 60 or 144 Hz update bought nothing visible. The first frames of a scene and
+    // of a window move always update.
+    const double nowT = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const float updateHz = std::clamp(CvF("gNewDawn.GI.WorldUpdateHz", 30.0f), 0.0f, 1000.0f);
+    const bool step = !frozen && (warm || g.want > 0 || updateHz <= 0.0f || nowT - g.lastUpdateT >= 0.9 / updateHz);
+    if (step) {
+    g.lastUpdateT = nowT;
     Use(g.inject);
     grid();
     glUniform3fv(Loc("uSunDir"), 1, params.giWorldSunDir);
@@ -852,7 +860,7 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
         ++g.sweeps;
     }
     ++g.updates;
-    } // !frozen
+    } // step
     ++g.frames;
     g.lastFrame = frameIndex;
     if (mStats && g.frames % 300 == 0)
