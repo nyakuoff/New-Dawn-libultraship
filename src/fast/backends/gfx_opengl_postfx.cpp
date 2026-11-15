@@ -2974,6 +2974,13 @@ float vnoise(vec2 x) {
     return mix(mix(hash1(i), hash1(i + vec2(1.0, 0.0)), f.x), mix(hash1(i + vec2(0.0, 1.0)), hash1(i + vec2(1.0, 1.0)), f.x), f.y);
 }
 
+// Continuity of the waterline foam along the shore: 1 = foam, 0 = a gap. Two scales of noise so the line thickens, thins and
+// breaks in places (it must never read as a painted stripe).
+float shoreBreak(vec2 xz) {
+    float n = 0.6 * vnoise(xz / 9.0 + 17.3) + 0.4 * vnoise(xz / 2.7);
+    return smoothstep(0.28, 0.62, n);
+}
+
 // Slope of a few warped travelling waves; each is faded out as its wavelength approaches the pixel footprint.
 vec2 refractSlope(vec2 x, float footprint) {
     const vec2 dirs[6] = vec2[6](vec2(0.8, 0.6), vec2(-0.5, 0.866), vec2(0.2, -0.98), vec2(-0.9, -0.436), vec2(0.95, -0.312), vec2(-0.64, 0.768));
@@ -3060,6 +3067,34 @@ void swashOverlay(ivec2 p, float d, vec3 P, float lvl, float gslope) {
     oColor = vec4(foamTint(P) * foam, a);
 }
 
+// Horizontal distance from a water point to the nearest bank, found by probing the opaque depth around its pixel at three world
+// radii in eight directions. A probe counts as bank when it is a surface above the plane that is also close to the point on the plane (so
+// a wading actor or the foreground in front of far water is not mistaken for the shore). 1e4 = none within about 16 units.
+float shoreDist(ivec2 p, vec3 H, float planeY, float footprint) {
+    const vec2 dirs[8] = vec2[8](vec2(1, 0), vec2(-1, 0), vec2(0, 1), vec2(0, -1), vec2(0.7, 0.7), vec2(-0.7, 0.7), vec2(0.7, -0.7), vec2(-0.7, -0.7));
+    const float rw[3] = float[3](3.0, 8.0, 16.0);
+    float best = 1.0e4;
+    for (int k = 0; k < 3; k++) {
+        float rpx = clamp(rw[k] / max(footprint, 1e-3), 1.5, 28.0);
+        for (int i = 0; i < 8; i++) {
+            ivec2 q = clamp(p + ivec2(round(dirs[i] * rpx)), ivec2(0), uSize - 1);
+            float dq = fetchDepth(q);
+            if (dq >= 0.99999) {
+                continue;
+            }
+            vec3 Q = worldPos(q, dq);
+            float dh = length(Q.xz - H.xz); // horizontal only: a tall wall seen at a grazing angle is far away in 3D but right at the bank
+            if (Q.y >= planeY - 0.3 && dh < rw[k] * 2.5 + 4.0) {
+                best = min(best, dh);
+            }
+        }
+        if (best < 1.0e3) {
+            break;
+        }
+    }
+    return best;
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     oColor = vec4(0.0);
@@ -3088,9 +3123,11 @@ void main() {
         } else if (uFoam > 0.0 && P.y < planeY + 1.4 && lvl < 1.0) {
             // Meniscus: bank pixels a hair above the plane are the waterline itself; without foam on them the line is peppered
             // with the dark bank showing through (depth quantisation).
-            float fm = (1.0 - smoothstep(0.3, 1.4, P.y - planeY)) * (1.0 - smoothstep(2.5, 8.0, length(ray) * uPixelAngle)) * uFoam * uSurfaceVisibility;
+            float fm = (1.0 - smoothstep(0.2, 1.4, P.y - planeY)) * (1.0 - smoothstep(2.5, 8.0, length(ray) * uPixelAngle)) * uFoam * uSurfaceVisibility;
+            float brk = shoreBreak(P.xz);
+            fm *= 0.2 + 0.8 * brk;
             vec3 tintM = mix(vec3(1.0), uScatter / max(max(uScatter.r, uScatter.g), max(uScatter.b, 1e-3)), 0.2);
-            oColor = vec4(foamTint(P) * 1.2 * tintM * fm * 0.9, fm * 0.9);
+            oColor = vec4(foamTint(P) * (0.55 + 0.5 * brk) * tintM * fm * 0.6, fm * 0.6);
         }
         return;
     }
@@ -3256,30 +3293,39 @@ void main() {
         float n1 = vnoise(H.xz / 38.0 + vec2(0.05, -0.03) * uTime);
         float grad = length(vec2(dFdx(depthY), dFdy(depthY))) / max(footprint, 1e-3);
         float edge = depthY / clamp(grad, 0.12, 1.0);
+        if (uSwash <= 0.0 && footprint < 3.0 && edge > 1.0) {
+            edge = min(edge, shoreDist(p, H, planeY, footprint) * 0.9); // a wall bank has no depth ramp: measure to the bank itself
+        }
         // The waterline surges in and out slowly (staggered along the shore), and the foam texture drifts with the river flow
         // or a slow wind drift; two layers half a cycle apart hide the loop.
         float surge = 0.5 + 0.5 * sin(uTime * 0.8 + n1 * 6.2831853 + dot(H.xz, vec2(0.013, 0.009)));
-        edge = max(edge - surge * 2.2, 0.0);
+        edge = max(edge - surge * 0.9, 0.0);
         vec2 drift = river ? flowV * 0.5 : vec2(1.6, -1.0);
-        vec2 gF = dFdx(H.xz) / 40.0, gF2 = dFdy(H.xz) / 40.0;
+        vec2 gF = dFdx(H.xz) / 90.0, gF2 = dFdy(H.xz) / 90.0;
         float ph0 = fract(uTime / 3.0), ph1 = fract(uTime / 3.0 + 0.5);
-        vec4 ft0 = textureGrad(uFoamTex, H.xz / 40.0 - drift * ph0 * 3.0 / 40.0, gF, gF2);
-        vec4 ft1 = textureGrad(uFoamTex, H.xz / 40.0 + vec2(0.37, 0.61) - drift * ph1 * 3.0 / 40.0, gF, gF2);
+        vec4 ft0 = textureGrad(uFoamTex, H.xz / 90.0 - drift * ph0 * 3.0 / 90.0, gF, gF2);
+        vec4 ft1 = textureGrad(uFoamTex, H.xz / 90.0 + vec2(0.37, 0.61) - drift * ph1 * 3.0 / 90.0, gF, gF2);
         float w0 = 1.0 - abs(2.0 * ph0 - 1.0);
         vec4 ft = mix(ft1, ft0, w0);
-        float lineW = max(1.0, footprint * 1.4);
-        float line = (1.0 - smoothstep(0.3 * lineW, lineW, edge)) * (0.8 + 0.2 * ft.r);
-        float reach = 7.0 + 8.0 * n1;
+        // Waterline: thin, variable thickness, broken by the shore noise and the lace pattern, soft on the water side.
+        float brk = shoreBreak(H.xz);
+        float lineW = max(0.8, footprint * 1.2) * (0.45 + 1.1 * brk);
+        float line = pow(1.0 - smoothstep(0.0, lineW, edge), 1.5) * smoothstep(0.2, 0.6, 0.6 * brk + 0.52 * ft.r);
+        // Lace beyond the line: a fading net, clearly visible, thinning out over 9-20 units.
+        float reach = 10.0 + 8.0 * n1;
         float fall = 1.0 - smoothstep(0.0, reach, edge);
-        fall *= fall;
-        float dens = clamp(ft.a * 1.5 + ft.r * 0.6 + ft.b * 0.6, 0.0, 1.0);
-        float lacy = smoothstep(1.0 - fall, 1.0 - fall + 0.3, dens * 1.15) * smoothstep(0.0, 0.2, fall);
-        float core = max(line, lacy);
+        float dens = clamp(ft.a * 1.7 + ft.r * 0.8 + ft.b * 0.6, 0.0, 1.0);
+        float thr = 0.9 - 0.55 * fall; // dense near the line, only the thickest lace far out
+        float lacy = smoothstep(thr, thr + 0.3, dens) * smoothstep(0.0, 0.15, fall);
+        float core = max(line, lacy * 0.9);
         float foam = core * (1.0 - smoothstep(3.0, 9.0, footprint));
-        f = min(foam, 0.95) * uFoam;
-        // HDR white; the thin fringe (low alpha) picks up the water's own scatter colour, a cheap subsurface tint.
+        f = min(foam, 0.9) * uFoam;
+        // Brightness follows the lace pattern: most of the foam sits at 55-70 %, only the dense peaks reach HDR white. The
+        // colour is the scene's own sun/sky/fog light (foamTint), so it is dim in shade and at night. The low-alpha fringe picks
+        // up the water's scatter colour as a cheap subsurface tint.
+        float peak = smoothstep(0.35, 0.95, ft.r * 0.6 + ft.a * 0.6 + lacy * 0.3);
         vec3 tint = mix(vec3(1.0), uScatter / max(max(uScatter.r, uScatter.g), max(uScatter.b, 1e-3)), 0.45);
-        foamCol = foamTint(H) * 1.2 * mix(tint, vec3(1.0), smoothstep(0.35, 0.9, core));
+        foamCol = foamTint(H) * mix(0.4, 1.25, peak) * mix(tint, vec3(1.0), smoothstep(0.35, 0.9, core));
     }
     if (river && uFoam > 0.0 && !sky) {
         // Streak foam: the thick ridges of the flowing mask, strongest where the water is shallow (banks, rocks in the
