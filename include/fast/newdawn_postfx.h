@@ -194,6 +194,7 @@ typedef struct NewDawnPostFxParams {
     int32_t vfxEnabled;
     float vfxStrength;  /* HDR emission multiplier */
     float vfxEmbers;    /* ember density 0..2 */
+    float vfxFlash[4];  /* mask-transformation flash: the game's screen-fill colour (0..1) and alpha; alpha 0 = none */
     /* New Dawn local lighting: the game's own point lights (read-only snapshot, nearest first) lit per pixel from the
        depth buffer in HDR at the opaque-end marker. The renderer appends the VFX flames that have no game light. */
 #define NEWDAWN_LOCAL_LIGHTS 16

@@ -1060,7 +1060,10 @@ static bool AlphaCombinerUsesTexel0(uint64_t combineMode, bool twoCycle) {
 enum { VFX_NONE = 0, VFX_FLAME = 1, VFX_GLOW = 2, VFX_DUST = 3, VFX_BOMB = 4, VFX_HIT = 5, VFX_SPARKLE = 6, VFX_SPARK = 7,
        VFX_CANDLE = 8 /* recorded as a flame whose alpha is forced: its draw leaves prim alpha at 0 */,
        VFX_ARROW_FIRE = 9, VFX_ARROW_ICE = 10, VFX_ARROW_LIGHT = 11 /* whole 3D model, accumulated into one instance */,
-       VFX_WATER_SPLASH = 12, VFX_WATER_RIPPLE = 13 /* native draw kept, only dimmed (see mVfxDim) */ };
+       VFX_WATER_SPLASH = 12, VFX_WATER_RIPPLE = 13 /* native draw kept, only dimmed (see mVfxDim) */,
+       // Overlay classes: the native draw stays (crisp, exact shape), the renderer adds HDR light on top. (A gain on the native
+        // draw does not work: the N64 colour combiner wraps values above 1, which turns hot colours into the wrong hue.)
+       VFX_ICE = 17, VFX_POP = 18 /* popped Deku bubble */ };
 
 void Interpreter::BeginVfxRecording(bool enabled) {
     mVfx = enabled;
@@ -1069,6 +1072,13 @@ void Interpreter::BeginVfxRecording(bool enabled) {
     mVfxLastClass = 0;
     mVfxArrowPts.clear();
     mVfxArrowInst = -1;
+    mVfxIceCount = 0;
+    if (enabled) {
+        const auto cv = Ship::Context::GetRawInstance()->GetConsoleVariables();
+        mVfxFxMask = (cv->GetInteger("gNewDawn.Vfx.Sparkles", 1) ? 1u : 0u) |
+                     (cv->GetInteger("gNewDawn.Vfx.Frost", 1) ? 4u : 0u) |
+                     (cv->GetInteger("gNewDawn.Vfx.BubblePop", 1) ? 8u : 0u);
+    }
     mVfxDebug = enabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0);
 }
 
@@ -1093,9 +1103,11 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         { "gFireArrow", VFX_ARROW_FIRE }, // Tex and MaskTex: the 43-vertex glow model
         { "gIceArrow", VFX_ARROW_ICE },
         { "gLightArrow", VFX_ARROW_LIGHT },
-        // Sparkles are deliberately NOT classified: the native small pink four-point stars are crisper than the Kenney
-        // star_01 replacement (docs/VFX.md). Re-add { "gameplay_keep_Tex_054AF0", VFX_SPARKLE } with a better sprite to enable.
-        // { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
+        // Overlay classes keep the native draw (the crisp native shape, exact size and timing) and add HDR light on top.
+        { "gameplay_keep_Tex_054AF0", VFX_SPARKLE }, // gEffSparklesDL: fairy sparkles, rupee/item glitter
+        { "gEffIceFragment", VFX_ICE },
+        { "gEffPoppedDekuBubbleSliding", VFX_NONE }, // the wall-sliding variant stays native
+        { "gEffPoppedDekuBubble", VFX_POP },
     };
     uint8_t cls = VFX_NONE;
     for (const auto& [name, c] : kTable) {
@@ -1105,8 +1117,8 @@ uint8_t Interpreter::VfxClassify(std::string_view path) {
         }
         cls = c;
         const size_t digit = pos + name.size();
-        if (c >= VFX_DUST && c < VFX_WATER_SPLASH && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
-            cls |= (uint8_t)((path[digit] - '1') << 4);
+        if (((c >= VFX_DUST && c < VFX_WATER_SPLASH) || c >= VFX_ICE) && digit < path.size() && path[digit] >= '1' && path[digit] <= '8') {
+            cls |= (uint8_t)((path[digit] - '1') << 5);
         }
         break;
     }
@@ -3739,8 +3751,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         const auto& lt0 = mRdp->loaded_texture[mRdp->texture_tile[t0].tmem_index];
         const auto& lt1 = mRdp->loaded_texture[mRdp->texture_tile[t0 + 1 < 8 ? t0 + 1 : t0].tmem_index];
         const uint8_t raw = lt0.vfxClass; // tile 1 may hold a stale texture the combiner never samples
-        uint8_t cls = raw & 15;
-        const float frame = (raw >> 4) / 7.0f;
+        uint8_t cls = raw & 31;
+        const float frame = (raw >> 5) / 7.0f;
         if (cls == VFX_GLOW && mRdp->prim_color.a > 80) {
             cls = VFX_NONE; // only Lights_DrawGlow's alpha-50 discs; other users of the texture keep their draw
         }
@@ -3771,6 +3783,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         } else if (cls == VFX_WATER_SPLASH || cls == VFX_WATER_RIPPLE) {
             mVfxDim = cls == VFX_WATER_SPLASH ? 0.5f : 0.8f;
+        } else if (cls == VFX_SPARKLE || cls == VFX_ICE || cls == VFX_POP) {
+            // Overlay: the native triangle is drawn as before , the renderer adds light.
+            const uint32_t bit = cls == VFX_SPARKLE ? 1u : (cls == VFX_ICE ? 4u : 8u);
+            if ((mVfxFxMask & bit) && mRapi->VfxReplacing()) {
+                if (cls != VFX_ICE || (mVfxIceCount++ & 3) == 0) {
+                    RecordVfxTriangle(v_arr, cls, frame);
+                }
+            }
         } else if (cls != VFX_NONE) {
             const bool candle = cls == VFX_CANDLE;
             RecordVfxTriangle(v_arr, candle ? (uint8_t)VFX_FLAME : cls, frame);
