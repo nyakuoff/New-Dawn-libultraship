@@ -370,6 +370,7 @@ uniform float uDay; // 0 no sun (night, interiors) .. 1 full daylight
 uniform float uFogMul;
 uniform float uFogOff;
 uniform int uDebug;
+uniform int uGrass;
 const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
 float fetchDepth(ivec2 p) { return texelFetch(uDepth, clamp(p, ivec2(0), uSize - 1), 0).r; }
 vec3 position(vec2 uv, float d) {
@@ -390,6 +391,9 @@ void main() {
     vec3 dy = dot(T - P, T - P) < dot(P - B, P - B) ? T - P : P - B;
     vec3 N = cross(dx, dy) * uFlipY;
     N /= max(length(N), 1e-6);
+    // Grass tufts (their own stencil class, second draw): thin blades have no usable depth normal, and they stand on
+    // the ground, so they take the light the ground gets.
+    if (uGrass != 0) N = vec3(0.0, 1.0, 0.0);
     vec4 e = wgiIrradiance(P, N);
     // Albedo: the voxel copy of the surface where there is one (static world), otherwise (actors) the hue of the
     // lit pixel at a neutral reflectance. The voxels hold the display-space reflectance the bounce is emitted with;
@@ -903,7 +907,19 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_SRC1_COLOR);
+    // Everything but the grass tufts (stencil 2, written by the grass pass), then the tufts with the ground's normal.
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilFunc(GL_NOTEQUAL, 2, 0xFF);
+    glUniform1i(Loc("uGrass"), 0);
     Draw(fb.fbo, fb.width, fb.height);
+    glStencilFunc(GL_EQUAL, 2, 0xFF);
+    glUniform1i(Loc("uGrass"), 1);
+    Draw(fb.fbo, fb.width, fb.height);
+    glStencilMask(0xFF);
+    glStencilFunc(GL_ALWAYS, 0, 0xFF);
+    glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     CheckError("world GI");
 }
