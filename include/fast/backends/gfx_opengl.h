@@ -65,6 +65,8 @@ struct ShaderProgram {
     GLint material_parallax_location;
     GLint material_eye_location;
     GLint material_mirror_location;
+    // New Dawn foliage light (-1 when the program is not a cut-out one).
+    GLint fol_frame_location, fol_draw_location, fol_inv_location, fol_view_location;
 };
 
 struct FramebufferOGL {
@@ -156,6 +158,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetStencilMark(uint8_t mark) override {
         mStencilMarkClass = mark;
     }
+    void SetFoliageFrame(const float* eye, const float* sunDir, const float* sunColor, float strength) override;
+    void SetFoliageDraw(bool on, const float* origin, const float* invViewProj, float ndcXScale, float flipY,
+                        const int* viewport) override;
     bool VfxReplacing() const override;
     bool SupportsAlphaToCoverage() const override {
         return true;
@@ -190,6 +195,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int8_t mLastActiveTexture = -1;
     int8_t mLastBlendEnabled = -1;
     int8_t mLastAlphaToCoverage = -1;
+    float mFolFrame[12] = {};  // eye, sun dir + strength, sun colour
+    float mFolDraw[4] = {};    // on, origin xyz
+    float mFolInv[16] = {};
+    float mFolView[4] = {};    // viewport x, y, w, h
     int8_t mLastScissorEnabled = -1;
 
     std::map<std::pair<uint64_t, uint32_t>, ShaderProgram> mShaderProgramPool;

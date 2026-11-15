@@ -13,6 +13,8 @@
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
 #define NEWDAWN_POSTFX_STAGE_WIND_END 12
 #define NEWDAWN_POSTFX_WIND_ROOM_SHIFT 8 /* bit of the WIND_BEGIN command word: room geometry (sways plant textures only) */
+#define NEWDAWN_POSTFX_WIND_SWAY_SHIFT 9    /* bit of the WIND_BEGIN command word: displace the cut-outs (gNewDawn.Atmos.Wind) */
+#define NEWDAWN_POSTFX_WIND_FOLIAGE_SHIFT 10 /* bit of the WIND_BEGIN command word: light through the leaves (gNewDawn.Foliage.Light) */
 #define NEWDAWN_POSTFX_STAGE_WEATHER_BEGIN 9 /* native rain draw scope, updates/RNG still run */
 #define NEWDAWN_POSTFX_STAGE_WEATHER_END 10
 #define NEWDAWN_POSTFX_STAGE_SUN_FLARE_BEGIN 7 /* native sun flare draw scope; environment updates still run */
@@ -196,6 +198,23 @@ typedef struct NewDawnPostFxParams {
     float grassFocus[3];     /* the player's position: blades close to it are laid low (read-only snapshot) */
     float grassSunDir[3];    /* unit vector towards the sun; all zero when there is none */
     float grassSunColor[3];  /* sRGB 0..1 */
+    /* Actors that push the grass aside (read-only snapshot of positions; the renderer keeps the short trail that springs
+       back). Slot 0 is the player. xyz = position, w = push radius; the key tells the renderer which actor is which. */
+#define NEWDAWN_GRASS_PUSHERS 12
+    int32_t grassBend;
+    int32_t grassPushCount;
+    float grassPush[NEWDAWN_GRASS_PUSHERS][4];
+    uint32_t grassPushKey[NEWDAWN_GRASS_PUSHERS];
+    /* Ground cover (flowers, clover) where grass spawns; the scene decides how much and which kinds. */
+    int32_t grassFlowers;
+    float grassFlowerDensity;  /* 0..2 user multiplier times the region factor (0 in winter scenes) */
+    float grassFlowerMix[4];   /* weights: daisy, buttercup, wildflower, clover */
+    /* Light through foliage (render only): sun seen through the leaf cut-outs of trees, bushes and plants, and a soft
+       darkening towards the trunk. Needs HDR and a sun. */
+    int32_t foliageLight;
+    float foliageStrength;
+    float foliageSunDir[3];    /* unit vector towards the sun */
+    float foliageSunColor[3];  /* sRGB 0..1; zero when there is no sun */
     /* New Dawn interior polish (render only). Window and doorway openings are recorded by the interpreter from the draw
        stream (textures named in newdawn_interior_textures.inc) and submitted at the opaque-end marker; the game side fills
        the light (time of day, weather). Light through the openings: shafts in the air and pools on the surfaces. */

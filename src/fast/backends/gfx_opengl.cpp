@@ -111,8 +111,44 @@ void GfxRenderingAPIOGL::SetPerPixelLighting(const GfxPerPixelLightingState& sta
     mPerPixelLightState = state;
 }
 
+void GfxRenderingAPIOGL::SetFoliageFrame(const float* eye, const float* sunDir, const float* sunColor, float strength) {
+    for (int i = 0; i < 3; i++) {
+        mFolFrame[i] = eye[i];
+        mFolFrame[4 + i] = sunDir[i];
+        mFolFrame[8 + i] = sunColor[i];
+    }
+    mFolFrame[3] = 0.0f;
+    mFolFrame[7] = strength;
+    mFolFrame[11] = 0.0f;
+}
+
+void GfxRenderingAPIOGL::SetFoliageDraw(bool on, const float* origin, const float* invViewProj, float ndcXScale,
+                                        float flipY, const int* viewport) {
+    mFolDraw[0] = on ? 1.0f : 0.0f;
+    if (on) {
+        for (int i = 0; i < 3; i++) {
+            mFolDraw[1 + i] = origin[i];
+        }
+        mFolFrame[3] = origin[3]; // origin validity rides in the eye's w
+        memcpy(mFolInv, invViewProj, sizeof(mFolInv));
+        for (int i = 0; i < 4; i++) { // fold the NDC x scale and the y flip into the matrix: world = M * ndc
+            mFolInv[i] *= ndcXScale;
+            mFolInv[4 + i] *= flipY;
+        }
+        for (int i = 0; i < 4; i++) {
+            mFolView[i] = (float)viewport[i];
+        }
+    }
+}
+
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
+    if (mCurrentShaderProgram->fol_draw_location >= 0) {
+        glUniform4fv(mCurrentShaderProgram->fol_frame_location, 3, mFolFrame);
+        glUniform4fv(mCurrentShaderProgram->fol_draw_location, 1, mFolDraw);
+        glUniformMatrix4fv(mCurrentShaderProgram->fol_inv_location, 1, GL_FALSE, mFolInv);
+        glUniform4f(mCurrentShaderProgram->fol_view_location, mFolView[0], mFolView[1], mFolView[2], mFolView[3]);
+    }
 
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
         GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
@@ -765,6 +801,10 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->material_eye_location = glGetUniformLocation(shader_program, "uMaterialEye");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
     prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
+    prg->fol_frame_location = glGetUniformLocation(shader_program, "uFolFrame");
+    prg->fol_draw_location = glGetUniformLocation(shader_program, "uFolDraw");
+    prg->fol_inv_location = glGetUniformLocation(shader_program, "uFolInv");
+    prg->fol_view_location = glGetUniformLocation(shader_program, "uFolView");
 
     LoadShader(prg);
     // Sampler types must use distinct units even when their branch is disabled. Set this at creation,
@@ -1212,6 +1252,17 @@ void GfxRenderingAPIOGL::StartFrame() {
                 glGetQueryObjectui64v(stamps[i][1], GL_QUERY_RESULT, &b);
                 gNewDawnGpuFrameMs += (static_cast<float>((b - a) / 1e6) - gNewDawnGpuFrameMs) * 0.1f;
                 stampPending[i] = false;
+                // With gNewDawn.PostFx.Debug.Stats the whole-frame GPU time is also logged (mean of 300 frames).
+                static double frameSum = 0.0;
+                static int frameCount = 0;
+                frameSum += (b - a) / 1e6;
+                if (++frameCount == 300) {
+                    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.PostFx.Debug.Stats", 0)) {
+                        SPDLOG_INFO("NewDawnPostFx: whole frame averages {:.3f} ms GPU over 300 frames", frameSum / 300.0);
+                    }
+                    frameSum = 0.0;
+                    frameCount = 0;
+                }
             }
         }
         if (!stampPending[stampSlot]) {
