@@ -16,6 +16,8 @@ class IResource {
   public:
     /** @brief Path prefix that identifies an "alt asset" override. */
     inline static const std::string gAltAssetPrefix = "alt/";
+    /** @brief New Dawn: path prefix of the generated overlay archive (3DS character models). */
+    inline static const std::string gOverlayAssetPrefix = "mm3d/";
 
     /**
      * @brief Constructs an IResource with the given initialization data.
