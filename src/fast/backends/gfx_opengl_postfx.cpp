@@ -123,6 +123,7 @@ uniform float uMilkyScale;
 uniform float uMilkyGain;  // 0 = off, includes night/variant/weather visibility
 uniform vec3 uMoonDir;
 uniform float uMoonGlowAmt;
+uniform float uMoonRadius;
 float starExtinction(float e) {
     float airmass = 1.0 / (max(e, 0.0) * 0.95 + 0.06);
     return exp(-0.20 * (airmass - 1.0)) * smoothstep(0.0, 0.05, e);
@@ -142,12 +143,14 @@ vec3 nightSky(vec3 ray) {
         vec3 tex = textureGrad(uMilkyWay, vec2(first ? ra0 : ra1, lat), vec2(first ? dFdx(ra0) : dFdx(ra1), dFdx(lat)),
                                vec2(first ? dFdy(ra0) : dFdy(ra1), dFdy(lat))).rgb;
 #endif
-        col += tex * uMilkyScale * uMilkyGain * vec3(0.92, 0.98, 1.08) * starExtinction(ray.y);
+        col += tex * uMilkyScale * uMilkyGain * vec3(0.97, 0.98, 1.02) * starExtinction(ray.y);
     }
     if (uMoonGlowAmt > 0.0) {
+        // Soft cool glow outside the native disc (a world draw that stays), falling off over a few disc radii.
         float ang = acos(clamp(dot(ray, uMoonDir), -1.0, 1.0));
-        float halo = 0.030 * exp(-ang / 0.022) + 0.0060 * exp(-ang / 0.14) + 0.0012 * exp(-ang / 0.6);
-        col += vec3(0.50, 0.64, 1.0) * halo * uMoonGlowAmt * smoothstep(-0.08, 0.12, uMoonDir.y);
+        float x = max(ang - uMoonRadius, 0.0) / uMoonRadius;
+        float halo = 0.22 * exp(-x * 3.0) + 0.05 * exp(-x * 0.9) + 0.006 * exp(-x * 0.3);
+        col += vec3(0.50, 0.64, 1.0) * halo * uMoonGlowAmt * smoothstep(-0.05, 0.12, uMoonDir.y);
     }
     return col;
 }
@@ -1475,6 +1478,7 @@ uniform mat4 uLightViewProj;
 uniform vec3 uSunDir;
 uniform vec3 uAmbient;
 uniform vec3 uDirColor;
+uniform float uMoonLift;
 uniform vec3 uCameraEye;
 uniform float uStrength;
 uniform float uMinFactor;
@@ -1615,13 +1619,18 @@ void main() {
     vec3 shade = ambient + direct * lit;
     vec3 factor = clamp(shade / total, vec3(uMinFactor), vec3(1.0));
     factor = mix(vec3(1.0), factor, uStrength);
+    // Moonlight (night): a faint cool lift where the Moon reaches, so lit surfaces and silhouettes read against the
+    // native dark. uMoonLift is 0 for the sun, which keeps the daytime result bit-identical.
+    vec3 moonLift = vec3(1.0) + uMoonLift * ndl * lit * vec3(0.55, 0.75, 1.0);
     if (uHdr != 0) {
         // Fog has already been composited into scene colour. Do not shadow its in-scatter:
         // otherwise geometry hidden by full fog becomes a dark silhouette against the sky.
         float fog = clamp((d0 * 2.0 - 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
         float coverage = 1.0 - smoothstep(uRadius * 0.8, uRadius, length(P - uCameraEye));
         factor = mix(vec3(1.0), factor, coverage * (1.0 - fog));
+        moonLift = mix(vec3(1.0), moonLift, coverage * (1.0 - fog));
     }
+    factor *= moonLift;
     vec3 result = texture(uColor, vUv).rgb * factor;
 #ifdef CSM
     if (uDebug == 5) {
@@ -3847,9 +3856,9 @@ void PostFxGL::SetNightUniforms(const NewDawnPostFxParams& params) {
     CelestialMatrix(params.skyClock, m);
     glUniformMatrix3fv(Loc("uCelestial"), 1, GL_TRUE, m);
     glUniform1f(Loc("uMilkyScale"), mMilkyWayScale);
-    glUniform1f(Loc("uMilkyGain"), vis * std::clamp(CvFloat("gNewDawn.Sky.MilkyWay", 1.0f), 0.0f, 4.0f) * 0.6f);
-    const float moonDir[3] = { -params.skySunDir[0], -params.skySunDir[1], -params.skySunDir[2] };
-    glUniform3fv(Loc("uMoonDir"), 1, moonDir);
+    glUniform1f(Loc("uMilkyGain"), vis * std::clamp(CvFloat("gNewDawn.Sky.MilkyWay", 1.0f), 0.0f, 4.0f) * 0.75f);
+    glUniform3fv(Loc("uMoonDir"), 1, params.skyMoonDir);
+    glUniform1f(Loc("uMoonRadius"), std::max(params.skyMoonRadius, 0.004f));
     glUniform1f(Loc("uMoonGlowAmt"), moon);
     glUniform1i(Loc("uMilkyWay"), kMilkyWayUnit);
     if (mMilkyWayTex) {
@@ -4746,6 +4755,7 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform3fv(Loc("uDirColor"), 1, direct);
     glUniform3fv(Loc("uCameraEye"), 1, params.shadowCameraEye);
     glUniform1f(Loc("uStrength"), params.shadowStrength);
+    glUniform1f(Loc("uMoonLift"), params.shadowIsMoon ? 0.7f * std::clamp(CvFloat("gNewDawn.Sky.MoonlightLift", 1.0f), 0.0f, 3.0f) : 0.0f);
     glUniform1f(Loc("uMinFactor"), mSettings.shadowFloor);
     glUniform1f(Loc("uRadius"), csm ? mCsm.split[mCsm.count - 1] : params.shadowRadius);
     SetCascadeUniforms();

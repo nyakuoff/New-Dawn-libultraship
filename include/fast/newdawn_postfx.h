@@ -56,6 +56,8 @@ typedef struct NewDawnPostFxParams {
     float skyClock;
     float skyStarVis;
     float skyMoonGlow;
+    float skyMoonDir[3];  /* unit direction from the eye to the visible giant Moon (En_Fall) */
+    float skyMoonRadius;  /* its angular radius, radians */
     int32_t shadowIsMoon; /* shadowSunDir/shadowDirColor describe the Moon, not the sun */
 
     float flareSunPos[3]; /* native sun position, world space, read-only */
