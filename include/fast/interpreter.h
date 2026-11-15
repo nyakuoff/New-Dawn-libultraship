@@ -486,6 +486,8 @@ class Interpreter {
     void EndShadowRecording();
     void SubmitShadowCasters();
     void FillShadowCameraParams(NewDawnPostFxParams& params) const;
+    void BeginTaa(const NewDawnPostFxParams& params);
+    void JitterProjection();
     void UpdateTextureCacheSize(int textureSlot);
     bool TextureCacheNodeInUse(const TextureCacheNode* node) const;
     bool EvictOneTextureCacheEntry(const TextureCacheNode* protect);
@@ -631,6 +633,9 @@ class Interpreter {
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     bool mPostFxActive{}; // New Dawn post-processing is on this frame, forcing the offscreen game framebuffer
+    bool mTaaJitter = false;  // New Dawn TAA: perspective projections loaded now get the sub-pixel jitter
+    float mTaaOffset[2] = {}; // clip-space offset per unit w, in the projection's own (pre-aspect) x/y
+    uint32_t mTaaIndex = 0;   // Halton sequence position
     bool mMM3DSuppress = false;
     int mMM3DSegment = 0;                // segment DL (8..13) currently executing inside a suppressed room
     NewDawnMM3DScroll mMM3DScroll = {};  // live AnimatedMat scroll captured from those segment DLs

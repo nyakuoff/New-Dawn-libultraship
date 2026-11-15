@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <chrono>
 #include <limits>
 #include <filesystem>
@@ -1323,6 +1324,186 @@ void main() {
         c += (ign(gl_FragCoord.xy) - 0.5) / 255.0;
 #endif
     oColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}
+)GLSL";
+
+// New Dawn temporal anti-aliasing. The interpreter jitters the 3D world's projection by a sub-pixel Halton offset, this
+// pass reprojects last frame's resolved image with the (un-jittered) camera matrices and blends. There are no
+// per-object motion vectors: only the static scene is reprojected exactly, everything that moves on its own (actors,
+// wind, water, effects) is controlled by the neighbourhood variance clip, the depth test and the actor mask. Colour is
+// held in a tone-compressed YCoCg space so bright specular glints cannot dominate the blend.
+static const char* kTaaShader = R"GLSL(
+in vec2 vUv;
+layout(location = 0) out vec4 oHistory; // compressed colour, view depth
+layout(location = 1) out vec4 oScene;   // linear HDR colour for bloom and the display transform
+uniform sampler2D uScene;
+uniform sampler2D uDepth;
+uniform sampler2D uTaaHistory;
+uniform sampler2D uTaaMask;
+uniform ivec2 uSize;
+uniform mat4 uInvViewProj;
+uniform mat4 uPrevViewProj;
+uniform vec2 uNdc;
+uniform vec2 uJitter; // this frame's sub-pixel shift of the whole image, in pixels (GL window axes)
+uniform float uNear;
+uniform float uFar;
+uniform float uFeedback;
+uniform int uReset;
+uniform int uUseMask;
+uniform int uDebug;
+
+const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
+vec3 compressC(vec3 c) { c = max(c, vec3(0.0)); return c / (1.0 + dot(c, kLuma)); }
+vec3 expandC(vec3 c) { return c / max(1.0 - dot(c, kLuma), 1e-3); }
+vec3 toYCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 fromYCoCg(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+float linDepth(float d) {
+    float z = d * 2.0 - 1.0;
+    return 2.0 * uNear * uFar / (uFar + uNear - z * (uFar - uNear));
+}
+ivec2 clampP(ivec2 p) { return clamp(p, ivec2(0), uSize - 1); }
+
+// Catmull-Rom history filter in 5 bilinear taps (the corners are dropped and the rest renormalised): sharper than plain
+// bilinear, which would soften every moving frame a little more.
+vec3 sampleHistory(vec2 uv) {
+    vec2 size = vec2(uSize);
+    vec2 pos = uv * size;
+    vec2 c = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - c;
+    vec2 f2 = f * f, f3 = f2 * f;
+    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    vec2 w3 = 0.5 * f3 - 0.5 * f2;
+    vec2 w12 = w1 + w2;
+    vec2 t12 = (c + w2 / w12) / size;
+    vec2 t0 = (c - 1.0) / size;
+    vec2 t3 = (c + 2.0) / size;
+    float k0 = w12.x * w0.y, k1 = w0.x * w12.y, k2 = w12.x * w12.y, k3 = w3.x * w12.y, k4 = w12.x * w3.y;
+    vec3 r = texture(uTaaHistory, vec2(t12.x, t0.y)).rgb * k0 + texture(uTaaHistory, vec2(t0.x, t12.y)).rgb * k1 +
+             texture(uTaaHistory, t12).rgb * k2 + texture(uTaaHistory, vec2(t3.x, t12.y)).rgb * k3 +
+             texture(uTaaHistory, vec2(t12.x, t3.y)).rgb * k4;
+    return r / (k0 + k1 + k2 + k3 + k4);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
+    vec3 sum = vec3(0.0), sum2 = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
+    float actor = 0.0;
+    vec3 cur = vec3(0.0);
+    float curW = 0.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            ivec2 q = clampP(p + ivec2(i, j));
+            vec3 s = toYCoCg(compressC(texelFetch(uScene, q, 0).rgb));
+            // The sample at q was taken uJitter pixels away from its centre, so it describes the scene at q - uJitter:
+            // weighting the 3x3 samples by their distance to this pixel's centre (a Gaussian close to Blackman-Harris)
+            // gives a current-frame estimate that no longer depends on the jitter phase, which is what makes a
+            // converged still image pulse once per jitter cycle.
+            vec2 dd = vec2(i, j) - uJitter;
+            float wt = exp(-2.29 * dot(dd, dd));
+            cur += s * wt;
+            curW += wt;
+            sum += s;
+            sum2 += s * s;
+            lo = min(lo, s);
+            hi = max(hi, s);
+            if (uUseMask != 0) actor = max(actor, texelFetch(uTaaMask, q, 0).r);
+        }
+    }
+    cur /= curW;
+    vec3 mean = sum / 9.0;
+    vec3 sigma = sqrt(max(sum2 / 9.0 - mean * mean, vec3(0.0)));
+
+    float d = texelFetch(uDepth, p, 0).r;
+    float w = linDepth(d);
+    vec3 outC = cur;
+    float blend = 0.0;
+    float tint = 0.0;
+    if (uReset == 0) {
+        vec4 wp = uInvViewProj * vec4((uv * 2.0 - 1.0) * uNdc, d * 2.0 - 1.0, 1.0);
+        vec3 world = wp.xyz / wp.w;
+        vec4 pc = uPrevViewProj * vec4(world, 1.0);
+        vec2 hUv = (pc.xy / pc.w / uNdc) * 0.5 + 0.5;
+        bool ok = pc.w > 0.0 && all(greaterThan(hUv, vec2(0.0))) && all(lessThan(hUv, vec2(1.0)));
+        if (ok) {
+            // Depth agreement. The expected view depth must fall within the range stored around the history texel (plus
+            // room for the slope of the surface): at a silhouette the depth under a pixel flips between the near and
+            // the far surface with the jitter phase, so comparing against one texel would throw the history away exactly
+            // on the edges that need it. A wide disocclusion has no matching depth anywhere in that window.
+            ivec2 hp = clampP(ivec2(hUv * vec2(uSize)));
+            float hMin = 1e9, hMax = -1e9;
+            for (int j = -1; j <= 1; j++) {
+                for (int i = -1; i <= 1; i++) {
+                    float hw = texelFetch(uTaaHistory, clampP(hp + ivec2(i, j)), 0).a;
+                    hMin = min(hMin, hw);
+                    hMax = max(hMax, hw);
+                }
+            }
+            float gw = max(max(abs(linDepth(texelFetch(uDepth, clampP(p + ivec2(1, 0)), 0).r) - w),
+                               abs(linDepth(texelFetch(uDepth, clampP(p - ivec2(1, 0)), 0).r) - w)),
+                           max(abs(linDepth(texelFetch(uDepth, clampP(p + ivec2(0, 1)), 0).r) - w),
+                               abs(linDepth(texelFetch(uDepth, clampP(p - ivec2(0, 1)), 0).r) - w)));
+            float tol = 0.012 * pc.w + 1.5 * gw + 0.5;
+            ok = pc.w >= hMin - tol && pc.w <= hMax + tol;
+        }
+        if (ok) {
+            vec3 hist = toYCoCg(sampleHistory(hUv));
+            // Clip the history towards the neighbourhood: what the current frame cannot explain is not kept.
+            float gamma = mix(1.1, 0.6, actor);
+            vec3 ext = gamma * sigma + 0.002;
+            vec3 bl = max(lo, mean - ext), bh = min(hi, mean + ext);
+            vec3 ctr = 0.5 * (bl + bh), half_ = 0.5 * (bh - bl) + 1e-5;
+            vec3 v = hist - ctr;
+            vec3 a = abs(v / half_);
+            float m = max(a.x, max(a.y, a.z));
+            vec3 clipped = m > 1.0 ? ctr + v / m : hist;
+            float clipAmt = clamp(length(clipped - hist) / (length(hist) + 0.02), 0.0, 1.0);
+            float speed = length((hUv - uv) * vec2(uSize));
+            blend = uFeedback;
+            blend -= 0.12 * smoothstep(0.0, 2.0, speed);  // resampling under motion softens, so trust history less
+            blend *= 1.0 - 0.6 * clipAmt;                 // history that had to be clipped is suspect
+            blend = mix(blend, min(blend, 0.5), actor);   // actors move without motion vectors: short memory
+            outC = mix(cur, clipped, blend);
+            tint = clipAmt;
+        }
+    }
+    vec3 rgb = fromYCoCg(outC);
+    oHistory = vec4(rgb, w);
+    oScene = vec4(expandC(rgb), 1.0);
+    if (uDebug == 1) oScene = vec4(vec3(blend), 1.0);
+    else if (uDebug == 2) oScene = vec4(tint, actor, blend, 1.0);
+}
+)GLSL";
+
+// Light contrast-adaptive sharpen (after AMD FidelityFX CAS) for the resolved TAA image. TAA integrates sub-pixel
+// samples, which is a one-pixel box filter: it removes aliasing but softens fine detail a little. This works in a
+// perceptual (square-root) space on tone-compressed colour so HDR highlights are not over-sharpened, backs off where
+// the local contrast is already high, and fades out in the darks: dark areas get no extra edge emphasis.
+static const char* kTaaSharpenShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform ivec2 uSize;
+uniform float uSharpen;
+const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
+vec3 percept(ivec2 q) {
+    vec3 c = max(texelFetch(uScene, clamp(q, ivec2(0), uSize - 1), 0).rgb, vec3(0.0));
+    return sqrt(c / (1.0 + dot(c, kLuma)));
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 E = percept(p), B = percept(p + ivec2(0, -1)), D = percept(p + ivec2(-1, 0)), F = percept(p + ivec2(1, 0)),
+         H = percept(p + ivec2(0, 1));
+    vec3 mn = min(min(min(B, D), min(F, H)), E);
+    vec3 mx = max(max(max(B, D), max(F, H)), E);
+    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+    vec3 w = amp * (-1.0 / mix(8.0, 5.0, uSharpen));
+    vec3 S = clamp(((B + D + F + H) * w + E) / (1.0 + 4.0 * w), 0.0, 1.0);
+    S = mix(E, S, smoothstep(0.12, 0.35, dot(E, kLuma))); // nothing in the darks
+    vec3 c = S * S;
+    oColor = vec4(c / max(1.0 - dot(c, kLuma), 1e-3), 1.0);
 }
 )GLSL";
 
@@ -2865,8 +3046,20 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFogVolume", PostFxGL::kFogUnit },
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
-                          { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
-                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 }, { "uCausticTex", PostFxGL::kCausticUnit }, { "uUwShafts", 10 } }) {
+                          { "uFlareClouds", PostFxGL::kFlareCloudUnit },
+                          { "uScene", 8 },
+                          { "uDepth", 9 },
+                          { "uGiRaw", 10 },
+                          { "uGiShadow", 10 },
+                          { "uGiHistory", 11 },
+                          { "uTaaHistory", 10 },
+                          { "uTaaMask", 11 },
+                          { "uRayMask", 8 },
+                          { "uRays", 11 },
+                          { "uRaySky", 10 },
+                          { "uShadowCmp", 11 },
+                          { "uCausticTex", PostFxGL::kCausticUnit },
+                          { "uUwShafts", 10 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -3075,6 +3268,7 @@ void PostFxGL::Init() {
     glSamplerParameteri(mCmpSampler, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
     glSamplerParameteri(mCmpSampler, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
     glGenQueries(kQueryStages * kQueryRing, &mQueries[0][0]);
+    glGenQueries(kQueryRing * 2, &mWorldQuery[0][0]);
     mUsable = true;
     SPDLOG_INFO("NewDawnPostFx: enabled (OpenGL {}.{}, {})", major, minor,
                 reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
@@ -3130,6 +3324,20 @@ uniform sampler2D uScene;
 void main() { fragColor = texture(uScene, vUv); }
 )GLSL" };
     mHdrCopy.id = BuildProgram("HDR presentation copy", copy, 2, mHdrCopy.uniforms);
+    // Optional: a failure only leaves TAA unavailable. All four samplers sit on the dedicated postfx lanes 8..11
+    // (see the unit table in BuildProgramWithVertex) and every lane holds a complete dummy until a pass binds real
+    // data.
+    const char* taaFill[] = { kVersion, R"GLSL(
+out vec4 oColor;
+void main() { oColor = vec4(1.0); }
+)GLSL" };
+    const char* taa[] = { kVersion, kTaaShader };
+    for (int unit = 0; unit < 4; ++unit)
+        Bind(unit, mFogNeutral);
+    mTaa.id = BuildProgram("temporal anti-aliasing", taa, 2, mTaa.uniforms);
+    mTaaMaskFill.id = BuildProgram("TAA actor mask", taaFill, 2, mTaaMaskFill.uniforms);
+    const char* taaSharpen[] = { kVersion, kTaaSharpenShader };
+    mTaaSharpen.id = BuildProgram("TAA sharpen", taaSharpen, 2, mTaaSharpen.uniforms);
     const char* comp[] = { kVersion, kCompositeShader };
     const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
     const char* compNoDither[] = { kVersion, "#define NO_DITHER\n", kCompositeShader };
@@ -3336,26 +3544,27 @@ void PostFxGL::BeginTimer(int stage) {
         mQueryPending[stage][slot] = false;
         mQueryTotalMs[stage] += ns / 1e6;
         if (++mQueryCount[stage] == 300) {
-            const char* label = (stage == 0)   ? "opaque end / AO"
-                                : (stage == 1) ? "scene end / bloom+grade"
-                                : (stage == 2) ? "shadows"
-                                : (stage == 3) ? "sun shafts"
-                                : (stage == 4) ? "water"
-                                : (stage == 5) ? "water opaque copy"
-                                : (stage == 6) ? "physical sky"
-                                : (stage == 7) ? "volumetric clouds"
-                                : (stage == 9) ? "volumetric fog"
-                                : (stage == 10) ? "textured sun flare"
-                                : (stage == 11) ? "ambient particles"
-                                : (stage == 12) ? "wet surfaces and rain shelter"
-                                : (stage == 13) ? "rain and snow"
-                                : (stage == 14) ? "screen-space GI"
-                                : (stage == 15) ? "VFX sprites"
-                                : (stage == 16) ? "local lights"
-                                : (stage == 17) ? "water caustics"
-                                : (stage == 18) ? "underwater"
-                                : (stage == 19) ? "grass"
-                                               : "sky ambient cube";
+            const char* label = (stage == 0)                ? "opaque end / AO"
+                                : (stage == 1)              ? "scene end / bloom+grade"
+                                : (stage == 2)              ? "shadows"
+                                : (stage == 3)              ? "sun shafts"
+                                : (stage == 4)              ? "water"
+                                : (stage == 5)              ? "water opaque copy"
+                                : (stage == 6)              ? "physical sky"
+                                : (stage == 7)              ? "volumetric clouds"
+                                : (stage == 9)              ? "volumetric fog"
+                                : (stage == 10)             ? "textured sun flare"
+                                : (stage == 11)             ? "ambient particles"
+                                : (stage == 12)             ? "wet surfaces and rain shelter"
+                                : (stage == 13)             ? "rain and snow"
+                                : (stage == 14)             ? "screen-space GI"
+                                : (stage == 15)             ? "VFX sprites"
+                                : (stage == 16)             ? "local lights"
+                                : (stage == 17)             ? "water caustics"
+                                : (stage == 18)             ? "underwater"
+                                : (stage == 19)             ? "grass"
+                                : (stage == kTaaTimerStage) ? "temporal anti-aliasing"
+                                                            : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
             mQueryTotalMs[stage] = 0.0;
@@ -3391,6 +3600,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     mFlareCloudOpacity = 0.0f;
     mRaySkyReady = false;
     mLocalMarking = false;
+    mTaaCam.valid = false; // the interpreter sets it again, after this call, when TAA is on for the frame
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -3450,6 +3660,24 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
         mLocalMarking = true;
     }
     mHdrActive = true;
+    mStats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
+    if (mStats) {
+        const int slot = mWorldNext;
+        if (mWorldPending[slot]) {
+            GLuint64 t0 = 0, t1 = 0;
+            glGetQueryObjectui64v(mWorldQuery[slot][0], GL_QUERY_RESULT, &t0);
+            glGetQueryObjectui64v(mWorldQuery[slot][1], GL_QUERY_RESULT, &t1);
+            mWorldPending[slot] = false;
+            mWorldTotalMs += (t1 - t0) / 1e6;
+            if (++mWorldCount == 300) {
+                SPDLOG_INFO("NewDawnPostFx: world total (HDR open to presentation) averages {:.3f} ms GPU over {} runs",
+                            mWorldTotalMs / 300.0, 300);
+                mWorldTotalMs = 0.0;
+                mWorldCount = 0;
+            }
+        }
+        glQueryCounter(mWorldQuery[slot][0], GL_TIMESTAMP);
+    }
     return true;
 }
 
@@ -3875,7 +4103,7 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
     CheckError("sky ambient cube");
 }
 
-GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
+GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb, bool final) {
     GlStateGuard guard;
     guard.Neutralise();
     glBindVertexArray(mVao);
@@ -3884,14 +4112,14 @@ GLuint PostFxGL::HdrSnapshot(const FramebufferOGL& fb) {
     if (!s.postFxOn)
         s.bloomOn = s.gradeOn = false;
     BeginTimer(1);
-    RunSceneEnd(fb, s); // resolves RGBA16F before bloom, then tonemaps once into display colour
+    RunSceneEnd(fb, s, final); // resolves RGBA16F before bloom, then tonemaps once into display colour
     EndTimer(1);
     CheckError("HDR display transform");
     return mHdrDisplay.fbo;
 }
 
 void PostFxGL::EndHdr(const FramebufferOGL& fb) {
-    HdrSnapshot(fb);
+    HdrSnapshot(fb, true);
     GlStateGuard guard;
     guard.Neutralise();
     glBindVertexArray(mVao);
@@ -3902,6 +4130,37 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
     glUniform1i(Loc("uScene"), kFirstUnit);
     Draw(fb.fbo, fb.width, fb.height);
     CheckError("HDR presentation copy");
+    if (mStats) {
+        // Whole 3D world on the GPU: HDR world open to the presentation copy (timestamps, so the per-pass timers nest).
+        glQueryCounter(mWorldQuery[mWorldNext][1], GL_TIMESTAMP);
+        mWorldPending[mWorldNext] = true;
+        mWorldNext = (mWorldNext + 1) % kQueryRing;
+    }
+    // Debug-only measurement fixture: while the file DumpDir/go exists, dump up to DumpFrames consecutive final world
+    // frames as raw RGB8, bottom row first, to DumpDir/fNNNN_WxH.rgb. Nothing happens unless the cvar is set.
+    if (const int dumpCount = CvInt("gNewDawn.TAA.DumpFrames", 0); dumpCount > 0) {
+        const char* dir = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.TAA.DumpDir", "");
+        std::error_code ec;
+        if (dir != nullptr && *dir != '\0' && mDumpDone < dumpCount && mHdrDisplay.tex != 0 &&
+            std::filesystem::exists(std::string(dir) + "/go", ec)) {
+            std::vector<uint8_t> pixels((size_t)mHdrDisplay.w * mHdrDisplay.h * 3);
+            GLint packAlign = 4;
+            glGetIntegerv(GL_PACK_ALIGNMENT, &packAlign);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            Bind(0, mHdrDisplay.tex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+            glPixelStorei(GL_PACK_ALIGNMENT, packAlign);
+            char name[512];
+            snprintf(name, sizeof(name), "%s/f%04d_%dx%d.rgb", dir, mDumpDone, mHdrDisplay.w, mHdrDisplay.h);
+            if (FILE* f = fopen(name, "wb")) {
+                fwrite(pixels.data(), 1, pixels.size(), f);
+                fclose(f);
+            }
+            mDumpDone++;
+        }
+    } else {
+        mDumpDone = 0;
+    }
     mHdrActive = false;
 }
 
@@ -5464,7 +5723,231 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     CheckError("AO apply pass");
 }
 
-void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
+// ---------------------------------------------------------------------------------------------------------------------
+// Temporal anti-aliasing
+
+static bool TaaInvert4x4(const float m[16], float out[16]) {
+    // General 4x4 inverse (cofactors, double precision): row-major in, row-major out.
+    double a[16], inv[16];
+    for (int i = 0; i < 16; i++)
+        a[i] = m[i];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] +
+             a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] -
+             a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] +
+             a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] -
+              a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] -
+             a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] +
+             a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] -
+             a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] +
+              a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] +
+             a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] -
+             a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] +
+              a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] -
+              a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] -
+             a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] +
+             a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] -
+              a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] -
+              a[8] * a[2] * a[5];
+    const double det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (std::fabs(det) < 1e-30)
+        return false;
+    for (int i = 0; i < 16; i++)
+        out[i] = (float)(inv[i] / det);
+    return true;
+}
+
+// Camera position and view axis out of a row-vector view-projection (clip = v * M): clip x, y and w all vanish at the
+// eye, and w is the distance along the view axis. Used only to notice camera cuts.
+static bool TaaCameraOf(const float m[16], float eye[3], float fwd[3]) {
+    const int cols[3] = { 0, 1, 3 };
+    double a[3][4];
+    for (int i = 0; i < 3; i++) {
+        for (int r = 0; r < 3; r++)
+            a[i][r] = m[r * 4 + cols[i]];
+        a[i][3] = -m[12 + cols[i]];
+    }
+    for (int c = 0; c < 3; c++) {
+        int piv = c;
+        for (int r = c + 1; r < 3; r++)
+            if (std::fabs(a[r][c]) > std::fabs(a[piv][c]))
+                piv = r;
+        if (std::fabs(a[piv][c]) < 1e-12)
+            return false;
+        std::swap_ranges(a[c], a[c] + 4, a[piv]);
+        for (int r = 0; r < 3; r++) {
+            if (r == c)
+                continue;
+            const double f = a[r][c] / a[c][c];
+            for (int k = c; k < 4; k++)
+                a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        eye[i] = (float)(a[i][3] / a[i][i]);
+    const float len = std::sqrt(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
+    if (len < 1e-12f)
+        return false;
+    fwd[0] = m[3] / len, fwd[1] = m[7] / len, fwd[2] = m[11] / len;
+    return true;
+}
+
+void PostFxGL::SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar,
+                            float jitterPxX, float jitterPxY, uint32_t frameIndex) {
+    mTaaCam.jitter[0] = jitterPxX;
+    mTaaCam.jitter[1] = jitterPxY;
+    std::copy(viewProj, viewProj + 16, mTaaCam.vp);
+    mTaaCam.ndcXScale = ndcXScale;
+    mTaaCam.flipY = flipY;
+    mTaaCam.zNear = zNear > 0.0f ? zNear : 10.0f;
+    mTaaCam.zFar = zFar > mTaaCam.zNear ? zFar : 12800.0f;
+    mTaaCam.frame = frameIndex;
+    mTaaCam.valid = true;
+}
+
+const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Settings& s) {
+    mTaaDidReset = false;
+    if (!mTaaCam.valid || !mTaa.id || !mTaaMaskFill.id || s.debugView != 0) {
+        mTaaValid = false;
+        return nullptr;
+    }
+    const int w = fb.width, h = fb.height;
+    // The actor mask only exists while the local-light pass marks stencil for this frame's character draws.
+    const bool useMask = mLocalMarking;
+    EnsureTarget(mTaaHist[0], w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mTaaHist[1], w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mTaaOut, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mTaaDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
+    if (useMask)
+        EnsureTarget(mTaaMask, w, h, GL_R8, GL_RED, GL_UNSIGNED_BYTE, false, false);
+    if (!mUsable) {
+        return nullptr;
+    }
+
+    float eye[3] = {}, fwd[3] = { 0, 0, 1 };
+    const bool haveCamera = TaaCameraOf(mTaaCam.vp, eye, fwd);
+    bool cut = false;
+    if (mTaaValid && haveCamera) {
+        const float dx = eye[0] - mTaaPrevEye[0], dy = eye[1] - mTaaPrevEye[1], dz = eye[2] - mTaaPrevEye[2];
+        const float dot = fwd[0] * mTaaPrevFwd[0] + fwd[1] * mTaaPrevFwd[1] + fwd[2] * mTaaPrevFwd[2];
+        // Hard cut: a jump no continuous camera makes in one rendered frame (400 units, or about 25 degrees)
+        cut = dx * dx + dy * dy + dz * dz > 400.0f * 400.0f || dot < 0.9f;
+        if (cut && mStats) {
+            SPDLOG_INFO("NewDawnPostFx: TAA camera moved {:.0f} units, view axis dot {:.3f}",
+                        std::sqrt(dx * dx + dy * dy + dz * dz), dot);
+        }
+    }
+    const bool reset =
+        !mTaaValid || !haveCamera || mTaaCam.frame != mTaaLastFrame + 1 || mTaaPrevW != w || mTaaPrevH != h || cut;
+    mTaaDidReset = reset;
+    if (reset && mStats) {
+        SPDLOG_INFO("NewDawnPostFx: TAA history reset ({}), frame {}",
+                    !mTaaValid                           ? "no history"
+                    : !haveCamera                        ? "no camera"
+                    : mTaaCam.frame != mTaaLastFrame + 1 ? "frame gap"
+                    : (mTaaPrevW != w || mTaaPrevH != h) ? "resize"
+                                                         : "camera cut",
+                    mTaaCam.frame);
+    }
+
+    // Depth (and the actor stencil) of the finished world, single sample
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mTaaDepth.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT | (useMask ? GL_STENCIL_BUFFER_BIT : 0), GL_NEAREST);
+    CheckError("TAA depth blit");
+    if (useMask) {
+        glBindFramebuffer(GL_FRAMEBUFFER, mTaaMask.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, mTaaDepth.tex, 0);
+        glViewport(0, 0, w, h);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
+        Use(mTaaMaskFill);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glStencilFunc(GL_ALWAYS, 0, 0xFF);
+        CheckError("TAA actor mask");
+    }
+
+    float invVP[16];
+    if (!TaaInvert4x4(mTaaCam.vp, invVP)) {
+        mTaaValid = false;
+        return nullptr;
+    }
+    const int write = 1 - mTaaRead;
+    glBindFramebuffer(GL_FRAMEBUFFER, mTaaHist[write].fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mTaaOut.tex, 0);
+    const GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers(2, buffers);
+    Bind(0, mScene.tex);
+    Bind(1, mTaaDepth.tex);
+    Bind(2, mTaaHist[mTaaRead].tex);
+    Bind(3, useMask ? mTaaMask.tex : mFogNeutral);
+    Use(mTaa);
+    glUniform1i(Loc("uScene"), kFirstUnit + 0);
+    glUniform1i(Loc("uDepth"), kFirstUnit + 1);
+    glUniform1i(Loc("uTaaHistory"), kFirstUnit + 2);
+    glUniform1i(Loc("uTaaMask"), kFirstUnit + 3);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, invVP);
+    glUniformMatrix4fv(Loc("uPrevViewProj"), 1, GL_FALSE, reset ? mTaaCam.vp : mTaaPrevVP);
+    glUniform2f(Loc("uNdc"), mTaaCam.ndcXScale, mTaaCam.flipY);
+    glUniform2f(Loc("uJitter"), mTaaCam.jitter[0], mTaaCam.jitter[1]);
+    glUniform1f(Loc("uNear"), mTaaCam.zNear);
+    glUniform1f(Loc("uFar"), mTaaCam.zFar);
+    glUniform1f(Loc("uFeedback"), std::clamp(CvFloat("gNewDawn.TAA.Feedback", 0.9f), 0.0f, 0.98f));
+    glUniform1i(Loc("uReset"), reset ? 1 : 0);
+    glUniform1i(Loc("uUseMask"), useMask ? 1 : 0);
+    glUniform1i(Loc("uDebug"), CvInt("gNewDawn.TAA.Debug", 0));
+    Draw(mTaaHist[write]);
+    CheckError("TAA resolve");
+
+    mTaaRead = write;
+    mTaaValid = true;
+    mTaaLastFrame = mTaaCam.frame;
+    mTaaPrevW = w;
+    mTaaPrevH = h;
+    std::copy(mTaaCam.vp, mTaaCam.vp + 16, mTaaPrevVP);
+    std::copy(eye, eye + 3, mTaaPrevEye);
+    std::copy(fwd, fwd + 3, mTaaPrevFwd);
+    // The history keeps the unsharpened image; only what goes on to bloom and the display transform is sharpened.
+    const float sharpen = std::clamp(CvFloat("gNewDawn.TAA.Sharpen", 0.7f), 0.0f, 1.0f);
+    if (sharpen > 0.0f && mTaaSharpen.id) {
+        EnsureTarget(mTaaSharp, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+        if (!mUsable) {
+            return &mTaaOut;
+        }
+        Bind(0, mTaaOut.tex);
+        Use(mTaaSharpen);
+        glUniform1i(Loc("uScene"), kFirstUnit + 0);
+        glUniform2i(Loc("uSize"), w, h);
+        glUniform1f(Loc("uSharpen"), sharpen);
+        Draw(mTaaSharp);
+        CheckError("TAA sharpen");
+        return &mTaaSharp;
+    }
+    return &mTaaOut;
+}
+
+void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa) {
     const int w = fb.width, h = fb.height;
     // Linear: the first bloom downsample is a 13-tap kernel that relies on bilinear taps
     EnsureTarget(mScene, w, h, mHdrActive ? GL_RGBA16F : GL_RGB8, GL_RGBA, mHdrActive ? GL_FLOAT : GL_UNSIGNED_BYTE,
@@ -5491,16 +5974,32 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
     glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     CheckError("colour blit");
 
+    // Temporal anti-aliasing resolves the jittered world here: before bloom and the display transform, so the
+    // temporal supersampling happens in scene-referred light, and before the HUD, which is drawn after the world.
+    const Target* sceneSrc = &mScene;
+    if (taa && mHdrActive && mTaaCam.valid && mTaa.id) {
+        // Stage 1's timer is open around this function; GL_TIME_ELAPSED queries cannot nest, so TAA gets its own and
+        // stage 1 (bloom, display transform) resumes after it.
+        if (mStats)
+            glEndQuery(GL_TIME_ELAPSED);
+        BeginTimer(kTaaTimerStage);
+        if (const Target* resolved = RunTaa(fb, s))
+            sceneSrc = resolved;
+        EndTimer(kTaaTimerStage);
+        if (mStats)
+            glBeginQuery(GL_TIME_ELAPSED, mQueries[1][mQueryNext[1]]);
+    }
+
     const bool useBloom = s.bloomOn && levels > 0;
     if (useBloom) {
-        Bind(0, mScene.tex);
+        Bind(0, sceneSrc->tex);
         Use(mHdrActive ? mDownHdr : mDown);
         glUniform1i(Loc("uSrc"), kFirstUnit + 0);
         glUniform1f(Loc("uThreshold"),
                     mHdrActive ? std::max(s.bloomThreshold, 1.0f) : std::min(s.bloomThreshold, 0.99f));
         glUniform1i(Loc("uHdr"), mHdrActive);
         for (int l = 0; l < levels; l++) {
-            const Target& src = (l == 0) ? mScene : mBloom[l - 1];
+            const Target& src = (l == 0) ? *sceneSrc : mBloom[l - 1];
             Bind(0, src.tex);
             glUniform1i(Loc("uPrefilter"), l == 0 ? 1 : 0);
             glUniform2f(Loc("uTexel"), 1.0f / src.w, 1.0f / src.h);
@@ -5523,8 +6022,8 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s) {
         CheckError("bloom upsample");
     }
 
-    Bind(0, mScene.tex);
-    Bind(1, useBloom ? mBloom[0].tex : mScene.tex);
+    Bind(0, sceneSrc->tex);
+    Bind(1, useBloom ? mBloom[0].tex : sceneSrc->tex);
     Use(mHdrActive ? mCompositeHdr : (CvInt("gNewDawn.PostFx.Dither.Enabled", 1) ? mComposite : mCompositeNoDither));
     glUniform1i(Loc("uScene"), kFirstUnit + 0);
     glUniform1i(Loc("uBloom"), kFirstUnit + 1);

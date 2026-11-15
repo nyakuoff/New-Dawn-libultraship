@@ -106,11 +106,15 @@ class PostFxGL {
         return mLocalMarking;
     }
     bool mLocalMarking = false;
+    // New Dawn TAA: the un-jittered camera of the frame that just opened (the interpreter jitters P itself).
+    void SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar, float jitterPxX,
+                      float jitterPxY, uint32_t frameIndex);
     bool BeginHdr(const FramebufferOGL& fb);
     void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void RunSunFlare(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void EndHdr(const FramebufferOGL& fb);
-    GLuint HdrSnapshot(const FramebufferOGL& fb);
+    // final: the last read of the finished world (EndHdr); TAA only resolves then, never on mid-frame snapshots.
+    GLuint HdrSnapshot(const FramebufferOGL& fb, bool final = false);
     GLuint HdrDisplayTexture() const {
         return mHdrDisplay.tex;
     }
@@ -225,7 +229,10 @@ class PostFxGL {
     void RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
                               bool sunShadow);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
-    void RunSceneEnd(const FramebufferOGL& fb, const Settings& s);
+    void RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa = false);
+    // Resolves this frame's jittered world against the reprojected history; returns the resolved linear target, or
+    // nullptr when TAA is not active (the caller then keeps using mScene).
+    const Target* RunTaa(const FramebufferOGL& fb, const Settings& s);
     void Draw(const Target& t);
     void Draw(GLuint fbo, int w, int h);
     void Bind(int unit, GLuint tex);
@@ -343,10 +350,25 @@ class PostFxGL {
     bool EnsureFlareAssets();
     static constexpr int kMaxBloomLevels = 6;
     Target mBloom[kMaxBloomLevels];
+    // Temporal anti-aliasing (gNewDawn.TAA.*). History holds tone-compressed colour with the view depth in alpha.
+    struct TaaCamera {
+        bool valid = false;
+        float vp[16] = {}, ndcXScale = 1.0f, flipY = 1.0f, zNear = 10.0f, zFar = 12800.0f, jitter[2] = {};
+        uint32_t frame = 0;
+    } mTaaCam;
+    Program mTaa, mTaaMaskFill, mTaaSharpen;
+    Target mTaaHist[2], mTaaOut, mTaaSharp, mTaaDepth, mTaaMask;
+    int mTaaRead = 0;
+    bool mTaaValid = false;
+    uint32_t mTaaLastFrame = UINT32_MAX;
+    float mTaaPrevVP[16] = {}, mTaaPrevEye[3] = {}, mTaaPrevFwd[3] = {};
+    int mTaaPrevW = 0, mTaaPrevH = 0;
+    bool mTaaDidReset = false; // diagnostics: the last resolve started from scratch
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 20;
+    static constexpr int kQueryStages = 21;
+    static constexpr int kTaaTimerStage = 20;
     static constexpr int kLocalTimerStage = 16;
     static constexpr int kCausticsTimerStage = 17;
     static constexpr int kUnderwaterTimerStage = 18;
@@ -367,6 +389,12 @@ class PostFxGL {
     int mQueryNext[kQueryStages] = {};
     double mQueryTotalMs[kQueryStages] = {};
     int mQueryCount[kQueryStages] = {};
+    GLuint mWorldQuery[kQueryRing][2] = {};
+    bool mWorldPending[kQueryRing] = {};
+    int mWorldNext = 0;
+    double mWorldTotalMs = 0.0;
+    int mWorldCount = 0;
+    int mDumpDone = 0; // gNewDawn.TAA.DumpFrames bookkeeping
 };
 
 } // namespace Fast
