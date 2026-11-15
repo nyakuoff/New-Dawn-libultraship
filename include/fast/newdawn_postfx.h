@@ -50,6 +50,15 @@ typedef struct NewDawnPostFxParams {
        4 poisoned swamp. skyMood is the final day's 0..1 intensity derived from the game clock. */
     int32_t skyVariant;
     float skyMood;
+    /* Night sky (all read-only): clock as a 0..1 fraction of the day, star/Milky Way visibility from the variant (1
+       normal; dimmed under the final-day storm; 0 in cursed Ikana and the poisoned swamp) and the Moon glow scale
+       (grows through the final day as the Moon falls). */
+    float skyClock;
+    float skyStarVis;
+    float skyMoonGlow;
+    float skyMoonDir[3];  /* unit direction from the eye to the visible giant Moon (En_Fall) */
+    float skyMoonRadius;  /* its angular radius, radians */
+    int32_t shadowIsMoon; /* shadowSunDir/shadowDirColor describe the Moon, not the sun */
 
     float flareSunPos[3]; /* native sun position, world space, read-only */
     float screenShaftStrength; /* HDR radial rays; independent of shadows and volumetric fog */
