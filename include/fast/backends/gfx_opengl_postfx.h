@@ -243,6 +243,7 @@ class PostFxGL {
     void CheckError(const char* where);
 
     bool mUsable = false;
+    bool mTimers = false; // stage timers run for the stats log or the performance overlay
     bool mStats = false; // copy of mSettings.stats for the helpers
     uint32_t mSettingsFrame = UINT32_MAX;
     // Art-directed grade of the current frame, copied from the scene-end marker's params.
