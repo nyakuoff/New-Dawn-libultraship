@@ -5482,7 +5482,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doFog = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && (doShadow || params.fogVolumetric == 2) &&
                        mHdrActive && params.fogVolumetric && mFogMarch.id && mFogApply.id &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
-    const bool doVfx = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrActive && params.vfxEnabled && mVfxCount > 0 &&
+    const bool doVfx = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && mHdrActive && params.vfxEnabled && (mVfxCount > 0 || params.vfxFlash[3] > 0.0f) &&
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;

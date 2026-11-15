@@ -777,6 +777,8 @@ class Interpreter {
     uint32_t mVfxTriSerial = 0, mVfxLastTri = 0;
     uint8_t mVfxLastClass = 0, mVfxLastCount = 0;
     float mVfxDim = 1.0f; // brightness/opacity scale of the native triangle being drawn (water splashes, ripples)
+    uint32_t mVfxFxMask = 0xF; // gNewDawn.Vfx.Sparkles/Frost/BubblePop bits 0, 2, 3
+    uint32_t mVfxIceCount = 0; // ice triangles seen this frame (every Nth gets a frost sparkle)
     const LoadedVertex* mVfxLastVerts[3] = {};
     std::vector<float> mVfxInst;
     std::vector<float> mVfxArrowPts; // NDC points of the magic-arrow model being accumulated (one instance per model)
