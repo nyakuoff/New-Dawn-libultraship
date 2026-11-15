@@ -91,7 +91,8 @@ enum class ShaderOpts {
     MATERIAL_MAPS,
     MATERIAL_MAPS_TILE1,
     MATERIAL_MAPS_BLEND,
-    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 22
+    SMOOTH,       // New Dawn smooth characters: curved patches through tessellation stages
+    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 23
     MAX
 };
 
@@ -135,6 +136,7 @@ struct CCFeatures {
     bool opt_material_maps;
     bool opt_material_tile1;
     bool opt_material_blend;
+    bool opt_smooth;
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -157,7 +159,7 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 22;
+constexpr size_t SHADER_ID_SHIFT = 23;
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -525,6 +527,98 @@ class Interpreter {
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
     void UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]);
+
+    // New Dawn smooth characters (docs/SMOOTH_CHARACTERS.md). Actor triangles become curved PN patches in the
+    // tessellation stages. What a patch needs from its neighbours (welded normals, creases) does not depend on the
+    // pose, so it is worked out once per triangle command and kept; nothing here changes what the game draws when
+    // gNewDawn.Characters.Smooth is off.
+    struct SmoothMtx { // one model-to-world matrix of this frame: its 3x3 and that matrix's cofactor (for normals)
+        float src[4][4];
+        float m[3][3];
+        float cof[3][3];
+        bool identity;
+    };
+    struct SmoothSlot { // per loaded vertex
+        const void* src = nullptr; // the F3DVtx it was loaded from
+        uint32_t mtx = 0;          // index into mSmoothMtx
+        int8_t n[3] = {};          // its normal as loaded
+        bool lit = false;          // loaded with G_LIGHTING (the colour bytes are a normal)
+        // Memo of the last geometry normal asked for this vertex: world space, and the batch's model space.
+        bool worldValid = false;
+        int16_t gKey[3] = {};
+        uint32_t batchMtx = ~0u;
+        float world[3] = {};
+        float batch[3] = {};
+    };
+    enum : uint8_t { SMOOTH_END_NORMAL = 0, SMOOTH_END_CREASE = 1, SMOOTH_END_STRAIGHT = 2 };
+    enum : uint8_t { SMOOTH_TRI_CHARACTER = 1, SMOOTH_TRI_SKIP = 2 };
+    struct SmoothTri {     // cached per triangle command
+        uint64_t key = 0;  // command address * 2 + index within the command; 0 = free
+        const void* v[3];  // the source vertices it was analysed with
+        int8_t own[3][3];  // their normals then: a change means a CPU-skinned mesh
+        int16_t g[3][3];   // welded geometry/shading normal per corner, in that vertex's model space (unit * 32767)
+        int16_t t[6][3];   // crease tangent per edge end (model space), when kind is CREASE
+        uint8_t kind[6];   // per edge end (corner i towards i+1: 2i, towards i+2: 2i+1)
+        uint16_t thin[3];  // per edge (corner i to i+1): narrowest triangle on it, height over edge length * 8192
+        uint8_t mixed;     // bit i: corner i's normal is an average of different normals
+        uint8_t state;     // SMOOTH_TRI_*
+        uint8_t stale;     // times the command was seen with other vertices (dynamic geometry gives up at 4)
+        uint8_t info;      // debug: bit 0 decal, bit 1 lies on another face, bits 2.. triangles on edge 0/1/2 (2 bits each)
+    };
+    struct SmoothPending { // a triangle of a frame that is being logged for analysis
+        uint64_t key;
+        const void* v[3];
+        int8_t n[3][3];
+        uint32_t mtx[3];
+        float pos[3][3];
+        int16_t ob[3][3]; // model-space positions
+        bool decal;
+        bool fresh;     // not in the cache yet
+        bool character; // its actor turned out to be a skeleton (set when the actor is complete)
+        uint32_t actor; // which actor draw of the frame it belongs to
+    };
+    void SmoothBeginFrame();
+    uint32_t SmoothSyncMatrix();
+    SmoothTri* SmoothFind(uint64_t key, const void* v0);
+    SmoothTri* SmoothInsert(uint64_t key, const void* v0);
+    const SmoothTri* SmoothLookup(uint64_t key, const uint8_t idx[3]);
+    void SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], const LoadedVertex* const v[3], float normals[3][3],
+                       float offsets[3][2][3]);
+    void SmoothFinishActor();
+    void SmoothAnalyze();
+    void SmoothSyncCamera();
+    bool mSmooth = false, mSmoothProps = false;
+    bool mSmoothDebug = false, mSmoothChecking = false; // SmoothDebug 1: timing and the crack check, 2: timing only
+    float mSmoothStrength = 1.0f, mSmoothCrease = 0.82f, mSmoothTip = 0.8f, mSmoothThin = 1.0f, mSmoothTolerance = 0.35f;
+    float mSmoothFlat = 0.105f; // sine of the angle under which an edge counts as lying in a flat panel
+    int mSmoothMaxLevel = 8;
+    uint64_t mSmoothKey = 0;      // the triangle command being run (set by the triangle handlers)
+    size_t mSmoothBaseDepth = 0;  // display list depth of the actor's own commands (where its lights were bound)
+    std::vector<SmoothMtx> mSmoothMtx;
+    SmoothSlot mSmoothSlots[MAX_VERTICES + 4];
+    std::vector<SmoothTri> mSmoothTable; // open addressing, power-of-two size
+    size_t mSmoothCount = 0;
+    std::vector<SmoothPending> mSmoothPending;
+    size_t mSmoothActorStart = 0; // first entry of mSmoothPending that belongs to the actor being drawn
+    uint32_t mSmoothActor = 0;    // running number of the actor being drawn (debug)
+    // A triangle that is not in the cache makes the next frame a logged one: every character triangle drawn is then
+    // written down and the actors with something new are analysed as a whole at the end of it.
+    bool mSmoothSawNew = false, mSmoothLogging = false;
+    int mSmoothBusy = 0, mSmoothCooldown = 0; // keeps geometry that is new every frame from being analysed every frame
+    float mSmoothP[4][4] = {};
+    float mSmoothCameraKey[4] = {};
+    bool mSmoothCameraSet = false;
+    struct { uint32_t tris, patches, pending, analysed, mismatched; uint64_t ns; } mSmoothStats = {};
+    // Debug check (gNewDawn.Characters.SmoothDebug): every edge end drawn this frame, to compare what the triangles
+    // sharing it were given.
+    struct SmoothCheck {
+        uint32_t a[3], b[3]; // bits of the end's own point and of the edge's other point (world)
+        float o[3];
+        uint64_t key;
+        uint32_t actor;
+        uint8_t kind, mixed, info, edge;
+    };
+    std::vector<SmoothCheck> mSmoothChecks;
     bool SolveCameraPosition(float out[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
@@ -634,7 +728,7 @@ class Interpreter {
 
     unsigned int mMsaaLevel = 1;
     bool mDroppedFrame{};
-    float* mBufVbo; // 3 vertices in a triangle and 32 floats per vtx
+    float* mBufVbo; // 3 vertices in a triangle and 48 floats per vtx
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
     GfxWindowBackend* mWapi = nullptr;

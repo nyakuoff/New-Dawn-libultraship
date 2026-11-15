@@ -207,6 +207,14 @@ class GfxRenderingAPI {
     }
     virtual void SetPerPixelLighting(const GfxPerPixelLightingState& state) {
     }
+    // New Dawn smooth characters: programs built with the SMOOTH option take two extra vec3 per vertex (the offsets of
+    // the two cubic edge control points next to it, world space) and draw patches. viewProj maps a world-space offset
+    // to clip space (column-major); params: pixels per world unit at w = 1, strength, max level, tolerance in pixels.
+    virtual bool SupportsSmoothCharacters() const {
+        return false;
+    }
+    virtual void SetSmoothCharacters(const float* viewProj, const float* params) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;
