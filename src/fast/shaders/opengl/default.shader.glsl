@@ -13,6 +13,14 @@
         @{update_floats(3)}
         @{update_floats(3)}
     @end
+    @if(o_smooth)
+        @{attr} vec3 aSmooth0;
+        @{attr} vec3 aSmooth1;
+        @{out} vec3 vSmooth0;
+        @{out} vec3 vSmooth1;
+        @{update_floats(3)}
+        @{update_floats(3)}
+    @end
 
     @for(i in 0..2)
         @if(o_textures[i])
@@ -85,6 +93,10 @@
         @if(o_per_pixel_lighting)
             vNormal = aNormal;
             vViewPos = aViewPos;
+        @end
+        @if(o_smooth)
+            vSmooth0 = aSmooth0;
+            vSmooth1 = aSmooth1;
         @end
         gl_Position = aVtxPos;
         @if(opengles)

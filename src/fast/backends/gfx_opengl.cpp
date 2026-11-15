@@ -141,8 +141,21 @@ void GfxRenderingAPIOGL::SetFoliageDraw(bool on, const float* origin, const floa
     }
 }
 
+bool GfxRenderingAPIOGL::SupportsSmoothCharacters() const {
+    return mSmoothAvailable;
+}
+
+void GfxRenderingAPIOGL::SetSmoothCharacters(const float* viewProj, const float* params) {
+    memcpy(mSmoothViewProj, viewProj, sizeof(mSmoothViewProj));
+    memcpy(mSmoothParams, params, sizeof(mSmoothParams));
+}
+
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
+    if (mCurrentShaderProgram->smooth) {
+        glUniformMatrix4fv(mCurrentShaderProgram->smooth_vp_location, 1, GL_FALSE, mSmoothViewProj);
+        glUniform4fv(mCurrentShaderProgram->smooth_params_location, 1, mSmoothParams);
+    }
     if (mCurrentShaderProgram->fol_draw_location >= 0) {
         glUniform4fv(mCurrentShaderProgram->fol_frame_location, 3, mFolFrame);
         glUniform4fv(mCurrentShaderProgram->fol_draw_location, 1, mFolDraw);
@@ -597,6 +610,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
         { "o_fog", cc_features.opt_fog },
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
+        { "o_smooth", cc_features.opt_smooth },
         { "o_material_maps", cc_features.opt_material_maps },
         { "material_tile", cc_features.opt_material_tile1 ? 1 : 0 },
         { "material_blend", cc_features.opt_material_blend && cc_features.c[0][0][2] >= SHADER_INPUT_1 &&
@@ -655,6 +669,115 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     return result;
 }
 
+#ifndef USE_OPENGLES
+// New Dawn smooth characters. The vertex and fragment shaders of a SMOOTH program are the ordinary ones; these two
+// stages sit between them. Every varying the fragment shader reads is passed through (v* in, t* between the two
+// stages, v* out again), so the list below must follow the template's vertex outputs.
+//
+// A patch is one actor triangle. Each corner carries the offsets of the two cubic edge control points next to it
+// (vSmooth0: on the edge towards the next corner, vSmooth1: towards the previous one), measured from where the control
+// point of the flat triangle would be. The interpreter builds them so that both triangles sharing an edge hold the same
+// numbers; the stages then only have to evaluate them the same way from either side, which is what `precise` and the
+// (own * own) * other weights are for.
+static void BuildSmoothStages(const CCFeatures& cc, std::string& tcs, std::string& tes) {
+    std::vector<std::pair<std::string, std::string>> vars; // type, name without the leading v
+    vars.emplace_back("vec3", "Normal");
+    vars.emplace_back("vec3", "ViewPos");
+    for (int i = 0; i < 2; i++) {
+        if (!cc.usedTextures[i]) {
+            continue;
+        }
+        vars.emplace_back("vec2", "TexCoord" + std::to_string(i));
+        if (cc.clamp[i][0]) {
+            vars.emplace_back("float", "TexClampS" + std::to_string(i));
+        }
+        if (cc.clamp[i][1]) {
+            vars.emplace_back("float", "TexClampT" + std::to_string(i));
+        }
+    }
+    if (cc.opt_fog) {
+        vars.emplace_back("vec4", "Fog");
+    }
+    if (cc.opt_grayscale) {
+        vars.emplace_back("vec4", "GrayscaleColor");
+    }
+    for (int i = 0; i < cc.numInputs; i++) {
+        vars.emplace_back(cc.opt_alpha ? "vec4" : "vec3", "Input" + std::to_string(i + 1));
+    }
+
+    tcs = "#version 400 compatibility\nlayout(vertices = 3) out;\n"
+          "uniform vec4 uSmooth;\n" // pixels per world unit at w = 1, strength, max level, tolerance (pixels)
+          "in vec3 vSmooth0[];\nin vec3 vSmooth1[];\nout vec3 tSmooth0[];\nout vec3 tSmooth1[];\n";
+    tes = "#version 400 compatibility\nlayout(triangles, fractional_odd_spacing, ccw) in;\n"
+          "uniform vec4 uSmooth;\nuniform mat4 uSmoothVP;\n"
+          "in vec3 tSmooth0[];\nin vec3 tSmooth1[];\n";
+    for (const auto& [type, name] : vars) {
+        tcs += "in " + type + " v" + name + "[];\nout " + type + " t" + name + "[];\n";
+        tes += "in " + type + " t" + name + "[];\nout " + type + " v" + name + ";\n";
+    }
+    // The level of an edge comes from that edge alone (its two control offsets and the depth of its ends), so the two
+    // patches sharing it always split it the same way. It follows the curve's deviation from the chord in pixels:
+    // a straight edge is never split, and distant characters fall back to their own triangles.
+    tcs += "float edgeLevel(vec3 a, vec3 b, float wa, float wb) {\n"
+           "    precise float sag = 0.375 * (length(a) + length(b)) * uSmooth.y;\n"
+           "    precise float w = max(0.5 * (wa + wb), 1.0);\n"
+           "    precise float level = clamp(sqrt(sag * uSmooth.x / (w * uSmooth.w)), 1.0, uSmooth.z);\n"
+           "    return level;\n"
+           "}\n"
+           "void main() {\n"
+           "    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+           "    tSmooth0[gl_InvocationID] = vSmooth0[gl_InvocationID];\n"
+           "    tSmooth1[gl_InvocationID] = vSmooth1[gl_InvocationID];\n";
+    for (const auto& [type, name] : vars) {
+        tcs += "    t" + name + "[gl_InvocationID] = v" + name + "[gl_InvocationID];\n";
+    }
+    tcs += "    if (gl_InvocationID == 0) {\n"
+           "        float w0 = gl_in[0].gl_Position.w, w1 = gl_in[1].gl_Position.w, w2 = gl_in[2].gl_Position.w;\n"
+           // Outer level i belongs to the edge opposite corner i.
+           "        float l0 = edgeLevel(vSmooth0[1], vSmooth1[2], w1, w2);\n"
+           "        float l1 = edgeLevel(vSmooth0[2], vSmooth1[0], w2, w0);\n"
+           "        float l2 = edgeLevel(vSmooth0[0], vSmooth1[1], w0, w1);\n"
+           "        gl_TessLevelOuter[0] = l0;\n        gl_TessLevelOuter[1] = l1;\n        gl_TessLevelOuter[2] = l2;\n"
+           "        gl_TessLevelInner[0] = max(l0, max(l1, l2));\n"
+           "    }\n}\n";
+    tes += "void main() {\n"
+           "    float u = gl_TessCoord.x, v = gl_TessCoord.y, w = gl_TessCoord.z;\n";
+    for (const auto& [type, name] : vars) {
+        tes += "    v" + name + " = u * t" + name + "[0] + v * t" + name + "[1] + w * t" + name + "[2];\n";
+    }
+    // Cubic Bezier triangle minus the flat triangle. On an edge only that edge's two terms are non-zero, and each is
+    // (own * own) * other, so both patches get the same bits there.
+    tes += "    precise vec3 d = 3.0 * (((u * u) * v) * tSmooth0[0] + ((v * v) * u) * tSmooth1[1]\n"
+           "                         + ((v * v) * w) * tSmooth0[1] + ((w * w) * v) * tSmooth1[2]\n"
+           "                         + ((w * w) * u) * tSmooth0[2] + ((u * u) * w) * tSmooth1[0]);\n"
+           "    d += 1.5 * ((u * v) * w) * (tSmooth0[0] + tSmooth1[0] + tSmooth0[1] + tSmooth1[1] + tSmooth0[2] + tSmooth1[2]);\n"
+           "    d *= uSmooth.y;\n"
+           "    vViewPos += d;\n"
+           "    precise vec4 flatPos = u * gl_in[0].gl_Position + v * gl_in[1].gl_Position + w * gl_in[2].gl_Position;\n"
+           "    precise vec4 p = flatPos + (uSmoothVP[0] * d.x + uSmoothVP[1] * d.y + uSmoothVP[2] * d.z);\n"
+           "    gl_Position = p;\n"
+           "}\n";
+}
+
+static GLuint CompileSmoothStage(GLenum type, const std::string& source) {
+    GLuint shader = glCreateShader(type);
+    const GLchar* text = source.data();
+    const GLint length = (GLint)source.size();
+    glShaderSource(shader, 1, &text, &length);
+    glCompileShader(shader);
+    GLint success = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char log[2048] = {};
+        glGetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
+        SPDLOG_ERROR("Smooth character {} stage failed to compile: {}\n{}",
+                     type == GL_TESS_CONTROL_SHADER ? "control" : "evaluation", log, source);
+        abort();
+    }
+    return shader;
+}
+#endif
+
 void GfxRenderingAPIOGL::ClearShaderCache() {
     mShaderProgramPool.clear();
 }
@@ -699,7 +822,24 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     GLuint shader_program = glCreateProgram();
     glAttachShader(shader_program, vertex_shader);
     glAttachShader(shader_program, fragment_shader);
+#ifndef USE_OPENGLES
+    if (cc_features.opt_smooth) {
+        std::string tcs, tes;
+        BuildSmoothStages(cc_features, tcs, tes);
+        glAttachShader(shader_program, CompileSmoothStage(GL_TESS_CONTROL_SHADER, tcs));
+        glAttachShader(shader_program, CompileSmoothStage(GL_TESS_EVALUATION_SHADER, tes));
+    }
+#endif
     glLinkProgram(shader_program);
+    if (cc_features.opt_smooth) {
+        glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+        if (!success) {
+            char log[2048] = {};
+            glGetProgramInfoLog(shader_program, sizeof(log) - 1, nullptr, log);
+            SPDLOG_ERROR("Smooth character program failed to link: {}", log);
+            abort();
+        }
+    }
 
     size_t cnt = 0;
 
@@ -714,6 +854,16 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         ++cnt;
 
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+    }
+
+    if (cc_features.opt_smooth) {
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aSmooth0");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aSmooth1");
         prg->attribSizes[cnt] = 3;
         ++cnt;
     }
@@ -801,6 +951,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->material_eye_location = glGetUniformLocation(shader_program, "uMaterialEye");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
     prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
+    prg->smooth = cc_features.opt_smooth;
+    prg->smooth_vp_location = glGetUniformLocation(shader_program, "uSmoothVP");
+    prg->smooth_params_location = glGetUniformLocation(shader_program, "uSmooth");
     prg->fol_frame_location = glGetUniformLocation(shader_program, "uFolFrame");
     prg->fol_draw_location = glGetUniformLocation(shader_program, "uFolDraw");
     prg->fol_inv_location = glGetUniformLocation(shader_program, "uFolInv");
@@ -1146,7 +1299,11 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     else if (mDrawStats)
         ++mDrawTimerDropped;
 #endif
+#ifndef USE_OPENGLES
+    glDrawArrays(mCurrentShaderProgram->smooth ? GL_PATCHES : GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+#else
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+#endif
 #ifndef USE_OPENGLES
     if (timeDraw) {
         glEndQuery(GL_TIME_ELAPSED);
@@ -1193,6 +1350,16 @@ void GfxRenderingAPIOGL::Init() {
     mPixelDepthRbSize = 1;
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+
+#ifndef USE_OPENGLES
+    // New Dawn smooth characters need the tessellation stages (OpenGL 4.0).
+    GLint glMajor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &glMajor);
+    mSmoothAvailable = glMajor >= 4;
+    if (mSmoothAvailable) {
+        glPatchParameteri(GL_PATCH_VERTICES, 3);
+    }
+#endif
 
     // Extension query; an unsupported enum leaves the value untouched (and raises GL_INVALID_ENUM once).
     mMaxAnisotropy = 1.0f;
