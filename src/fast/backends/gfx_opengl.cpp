@@ -1911,6 +1911,11 @@ void GfxRenderingAPIOGL::SetGiTriangles(const float* data, uint32_t count) {
     mGiTriangleCount = count;
 }
 
+void GfxRenderingAPIOGL::SetFlowTriangles(const float* data, uint32_t count) {
+    mFlowTriangles = data;
+    mFlowTriangleCount = count;
+}
+
 bool GfxRenderingAPIOGL::GiWantsGeometry() const {
 #ifndef USE_OPENGLES
     return mPostFx != nullptr && mPostFx->WorldGiWantsGeometry(mFrameCount);
@@ -2038,6 +2043,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         mPostFx->SetVfxSprites(mVfxSprites, mVfxSpriteCount);
         mPostFx->SetGrassTriangles(mGrassTriangles, mGrassTriangleCount);
         mPostFx->SetGiTriangles(mGiTriangles, mGiTriangleCount);
+        mPostFx->SetFlowTriangles(mFlowTriangles, mFlowTriangleCount);
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
         if (mStencilMarkOn) {

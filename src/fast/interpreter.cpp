@@ -1429,6 +1429,229 @@ void Interpreter::RecordInteriorTriangle(const LoadedVertex* const v[3], uint8_t
     mInteriorTris.push_back((mRsp->geometry_mode & cull_back) != 0 ? 1.0f : 0.0f);
 }
 
+// ---- New Dawn rivers and waterfalls (docs/WATER_SIM.md). The native water draws are scrolled by the game through the tile
+// size (uls/ult change every tick). That scroll is the true direction and speed of the flow, so it is read back here: per
+// (texture, tile) the offset delta between ticks, turned into a world velocity with the triangle's own UV gradient.
+// River surfaces are triangles lying in a WaterBox plane; waterfalls are near-vertical faces whose texture is listed in
+// newdawn_fall_textures.inc (or the gNewDawn.Water.FallTextures substring list, for finding new ones). Nothing is written back.
+namespace {
+const char* const kFallTextures[] = {
+#include "fast/newdawn_fall_textures.inc"
+    nullptr
+};
+// Scrolling river textures on meshes with no WaterBox under them (streams the game only paints; a WaterBox river needs no entry).
+const char* const kRiverTextures[] = {
+#include "fast/newdawn_river_textures.inc"
+    nullptr
+};
+} // namespace
+
+void Interpreter::BeginFlowRecording(bool rivers, bool falls, const NewDawnPostFxParams& params) {
+    mFlowRivers = rivers;
+    mFlowFalls = falls;
+    mFlow = rivers || falls;
+    mFlowTris.clear();
+    mFlowBoxCount = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    memcpy(mFlowBoxes, params.waterBoxes, sizeof(mFlowBoxes));
+    mFlowDebug = mFlow && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Water.FlowDebug", 0) != 0;
+    if (mFlowDebug && ++mFlowDebugFrames % 240 == 0) {
+        for (const auto& [tag, box] : mFlowDebugBoxes) {
+            SPDLOG_INFO("FLOWBOX {} x {:.0f}..{:.0f} y {:.0f}..{:.0f} z {:.0f}..{:.0f}", tag, box[0], box[3], box[1], box[4], box[2], box[5]);
+        }
+    }
+}
+
+void Interpreter::RecordFlowTriangle(const LoadedVertex* const v[3]) {
+    constexpr size_t kMaxTriangles = 6000;
+    if (mFlowTris.size() >= kMaxTriangles * NEWDAWN_FLOW_TRI_FLOATS) {
+        return;
+    }
+    const uint32_t t0 = mRdp->first_tile_index;
+    const auto& lt0 = mRdp->loaded_texture[mRdp->texture_tile[t0].tmem_index];
+    if (lt0.raw_tex_metadata.resource == nullptr) {
+        return;
+    }
+    const float* a = v[0]->view_pos;
+    const float* b = v[1]->view_pos;
+    const float* c = v[2]->view_pos;
+    const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+    const float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len < 1e-3f) {
+        return;
+    }
+    const float ny = std::fabs(n[1]) / len;
+    // Waterfall faces are classified by texture (cached per resource); river surfaces by lying in a water plane.
+    bool fall = false;
+    if (mFlowFalls && ny < 0.55f) {
+        const void* key = lt0.raw_tex_metadata.resource.get();
+        auto found = mFlowFallClass.find(key);
+        if (found == mFlowFallClass.end()) {
+            const std::string& path = lt0.raw_tex_metadata.resource->GetInitData()->Path;
+            const size_t slash = path.rfind('/');
+            const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+            uint8_t cls = 0;
+            for (int i = 0; kFallTextures[i] != nullptr; i++) {
+                cls |= base == kFallTextures[i] ? 1 : 0;
+            }
+            const std::string extra =
+                Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Water.FallTextures", "");
+            for (size_t s = 0; !extra.empty() && s < extra.size();) {
+                size_t e = extra.find(',', s);
+                e = e == std::string::npos ? extra.size() : e;
+                cls |= (e > s && base.find(extra.substr(s, e - s)) != std::string::npos) ? 1 : 0;
+                s = e + 1;
+            }
+            found = mFlowFallClass.emplace(key, cls).first;
+        }
+        fall = found->second != 0;
+    }
+    bool river = false, paintedRiver = false;
+    if (mFlowRivers && ny > 0.9f) {
+        const float cx = (a[0] + b[0] + c[0]) / 3.0f, cz = (a[2] + b[2] + c[2]) / 3.0f;
+        const float lo = std::min({ a[1], b[1], c[1] }), hi = std::max({ a[1], b[1], c[1] });
+        for (int i = 0; i < mFlowBoxCount && !river; i++) {
+            const float* box = mFlowBoxes[i];
+            river = cx >= box[0] - 8.0f && cx <= box[2] + 8.0f && cz >= box[1] - 8.0f && cz <= box[3] + 8.0f &&
+                    lo >= box[4] - 3.0f && hi <= box[4] + 3.0f;
+        }
+    }
+    if (mFlowRivers && ny > 0.9f && !river) {
+        const void* key = lt0.raw_tex_metadata.resource.get();
+        auto found = mFlowRiverClass.find(key);
+        if (found == mFlowRiverClass.end()) {
+            const std::string& path = lt0.raw_tex_metadata.resource->GetInitData()->Path;
+            const size_t slash = path.rfind('/');
+            const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+            uint8_t cls = 0;
+            for (int i = 0; kRiverTextures[i] != nullptr; i++) {
+                cls |= base == kRiverTextures[i] ? 1 : 0;
+            }
+            found = mFlowRiverClass.emplace(key, cls).first;
+        }
+        paintedRiver = found->second != 0;
+    }
+    if (!river && !fall && !paintedRiver && !mFlowDebug) {
+        return;
+    }
+    // Scroll velocity of each of the two render tiles, as the world velocity of the pattern.
+    float flow[3] = { 0.0f, 0.0f, 0.0f };
+    int scrolling = 0;
+    for (uint32_t ti = 0; ti < 2 && t0 + ti < 8; ti++) {
+        const uint32_t tile = t0 + ti;
+        const auto& lt = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+        if (lt.raw_tex_metadata.resource == nullptr) {
+            continue;
+        }
+        const int32_t uls = mRdp->texture_tile[tile].uls, ult = mRdp->texture_tile[tile].ult;
+        FlowScroll& st = mFlowScroll[(uint64_t)(uintptr_t)lt.raw_tex_metadata.resource.get() * 8 + ti];
+        if (!st.seen) {
+            st.seen = true;
+            st.uls = uls;
+            st.ult = ult;
+        } else if (uls != st.uls || ult != st.ult) {
+            const int pu = std::max<int>(lt.raw_tex_metadata.width, 1) * 4, pv = std::max<int>(lt.raw_tex_metadata.height, 1) * 4;
+            const auto wrap = [](int d, int period) { return ((d + period / 2) % period + period) % period - period / 2; };
+            // The game's scroll advances once per 20 Hz tick, so the delta between two changes is one tick's step.
+            // Only a step that repeats counts as a scroll: textures whose tile size changes between draws (actors, atlases)
+            // never produce two equal steps in a row.
+            const int ndu = wrap(uls - st.uls, pu), ndv = wrap(ult - st.ult, pv);
+            if (ndu == st.du && ndv == st.dv) {
+                st.su = ndu * 0.25f * 20.0f;
+                st.sv = ndv * 0.25f * 20.0f;
+            }
+            st.du = ndu;
+            st.dv = ndv;
+            st.uls = uls;
+            st.ult = ult;
+        }
+        if (st.su == 0.0f && st.sv == 0.0f) {
+            continue;
+        }
+        float u[3], w[3];
+        for (int i = 0; i < 3; i++) {
+            u[i] = v[i]->u / 32.0f;
+            w[i] = v[i]->v / 32.0f;
+            const int shifts = mRdp->texture_tile[tile].shifts, shiftt = mRdp->texture_tile[tile].shiftt;
+            if (shifts != 0) {
+                u[i] = shifts <= 10 ? u[i] / (1 << shifts) : u[i] * (1 << (16 - shifts));
+            }
+            if (shiftt != 0) {
+                w[i] = shiftt <= 10 ? w[i] / (1 << shiftt) : w[i] * (1 << (16 - shiftt));
+            }
+        }
+        const float du1 = u[1] - u[0], dv1 = w[1] - w[0], du2 = u[2] - u[0], dv2 = w[2] - w[0];
+        const float det = du1 * dv2 - du2 * dv1;
+        if (std::fabs(det) < 1e-4f) {
+            continue;
+        }
+        for (int k = 0; k < 3; k++) {
+            const float dPdu = (e1[k] * dv2 - e2[k] * dv1) / det;
+            const float dPdv = (e2[k] * du1 - e1[k] * du2) / det;
+            // u_effective = u_vertex - uls / 4: a texture feature sits where u_vertex = c + uls / 4, so it moves along +u as the offset grows.
+            flow[k] += dPdu * st.su + dPdv * st.sv;
+        }
+        scrolling++;
+    }
+    if (scrolling > 0) {
+        for (float& f : flow) {
+            f /= (float)scrolling;
+        }
+    }
+    if (mFlowDebug && scrolling > 0) {
+        static std::unordered_set<std::string> seen;
+        const std::string& path = lt0.raw_tex_metadata.resource->GetInitData()->Path;
+        const std::string tag = path + (river ? "|R" : (fall ? "|F" : (paintedRiver ? "|P" : (ny < 0.55f ? "|V" : "|H"))));
+        if ((path.find("scenes/") != std::string::npos || path.find("gameplay_keep") != std::string::npos) && seen.insert(tag).second) {
+            SPDLOG_INFO("FLOWDBG {} {} flow {:.1f},{:.1f},{:.1f} n.y {:.2f} at {:.0f},{:.0f},{:.0f} omL {:x}", path,
+                        river ? "river" : (fall ? "fall" : (paintedRiver ? "painted" : (ny < 0.55f ? "vertical" : "horizontal"))), flow[0], flow[1], flow[2],
+                        n[1] / len, (a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3, (a[2] + b[2] + c[2]) / 3,
+                        mRdp->other_mode_l);
+        }
+    }
+    if (mFlowDebug && scrolling > 0) {
+        const std::string& path = lt0.raw_tex_metadata.resource->GetInitData()->Path;
+        if (path.find("scenes/") != std::string::npos && path.find("alt/") != 0) {
+            auto& box = mFlowDebugBoxes.try_emplace(path + (river ? "|R" : (fall ? "|F" : (paintedRiver ? "|P" : (ny < 0.55f ? "|V" : "|H")))),
+                                                    std::array<float, 6>{ 1e9f, 1e9f, 1e9f, -1e9f, -1e9f, -1e9f }).first->second;
+            for (int i = 0; i < 3; i++) {
+                for (int k = 0; k < 3; k++) {
+                    box[k] = std::min(box[k], v[i]->view_pos[k]);
+                    box[3 + k] = std::max(box[3 + k], v[i]->view_pos[k]);
+                }
+            }
+        }
+    }
+    if (!river && !fall && !paintedRiver) {
+        return;
+    }
+    float kind = 0.0f;
+    if (fall) {
+        // Falling water: the scroll only says how fast. Down is down.
+        const float speed = std::max(std::sqrt(flow[0] * flow[0] + flow[1] * flow[1] + flow[2] * flow[2]), 120.0f);
+        flow[0] = flow[2] = 0.0f;
+        flow[1] = -std::min(speed, 400.0f);
+        kind = 1.0f;
+    } else {
+        flow[1] = 0.0f;
+        kind = river ? 0.0f : 2.0f; // 0: river in a WaterBox (the surface pass), 2: painted stream (an overlay)
+        const float speed = std::sqrt(flow[0] * flow[0] + flow[2] * flow[2]);
+        if (speed < 2.0f) {
+            return; // standing water
+        }
+        if (speed > 140.0f) {
+            flow[0] *= 140.0f / speed;
+            flow[2] *= 140.0f / speed;
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        mFlowTris.insert(mFlowTris.end(), v[i]->view_pos, v[i]->view_pos + 3);
+    }
+    mFlowTris.insert(mFlowTris.end(), flow, flow + 3);
+    mFlowTris.push_back(kind);
+    mFlowTris.push_back(0.0f);
+}
+
 void Interpreter::SubmitInterior(NewDawnPostFxParams& params) {
     // The game side already put the render-only windows (kind 2) of the scene in front; recorded openings follow.
     params.emissiveLightCount = 0;
@@ -4174,7 +4397,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
-            mGrass || mInterior || mGiRecord || mSmooth) {
+            mGrass || mInterior || mGiRecord || mFlow || mSmooth) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -4319,7 +4542,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord || mVfx ||
+        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord || mVfx || mFlow ||
             mSmooth) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
@@ -4589,6 +4812,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
+    if (mFlow && !is_rect && (mFlowDebug || !(v1->clip_rej & v2->clip_rej & v3->clip_rej))) {
+        RecordFlowTriangle(v_arr); // debug scans every drawn triangle, off-screen ones included
+    }
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
         if (!foliageCaster) {
@@ -7365,6 +7591,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         }
         gfx->BeginInteriorRecording(gfx->mPostFxActive && (params.interiorEnabled != 0 || params.emissiveEnabled != 0),
                                     params.interiorDebug != 0);
+        gfx->BeginFlowRecording(gfx->mPostFxActive && params.waterEnabled != 0 && params.waterRivers > 0.0f,
+                                gfx->mPostFxActive && params.waterEnabled != 0 && params.waterFalls > 0.0f, params);
         gfx->BeginShadowRecording(gfx->mPostFxActive &&
                                       (params.shadowEnabled != 0 || params.atmosWeather || params.localShadows != 0),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
@@ -7413,7 +7641,16 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
                 effective.waterEnabled = 0;
             }
         }
+        if (stage == NEWDAWN_POSTFX_STAGE_WATER_XLU) {
+            gfx->mRapi->SetFlowTriangles(gfx->mFlowTris.empty() ? nullptr : gfx->mFlowTris.data(),
+                                         (uint32_t)(gfx->mFlowTris.size() / NEWDAWN_FLOW_TRI_FLOATS));
+        }
         gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
+        if (stage == NEWDAWN_POSTFX_STAGE_WATER_XLU) {
+            gfx->mRapi->SetFlowTriangles(nullptr, 0);
+            gfx->mFlowTris.clear();
+            gfx->mFlow = false;
+        }
         if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
             gfx->mGiTris.clear();
         }

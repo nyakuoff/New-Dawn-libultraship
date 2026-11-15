@@ -107,6 +107,12 @@ class PostFxGL {
     }
     bool WorldGiWantsGeometry(uint32_t frameIndex) const;
 
+    // New Dawn rivers and waterfalls: recorded flowing-water triangles for the next Run (NEWDAWN_FLOW_TRI_FLOATS each).
+    void SetFlowTriangles(const float* data, uint32_t count) {
+        mFlowData = data;
+        mFlowCount = count;
+    }
+
     bool VfxUsable() const {
         return mUsable && (!mVfxAttempted || mVfx.id != 0);
     }
@@ -151,6 +157,10 @@ class PostFxGL {
     // Point-light shadow cubes (dedicated lanes, a complete dummy cube bound at program creation).
     static constexpr int kPointShadowUnit0 = 34;
     static constexpr int kPointShadowUnit1 = 35;
+    // Rivers and waterfalls: flow buffer (river velocity per pixel), tileable flow noise, spray/mist sprite.
+    static constexpr int kFlowBufUnit = 36;
+    static constexpr int kFlowNoiseUnit = 37;
+    static constexpr int kRiverSpriteUnit = 38;
     static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
     static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
@@ -239,6 +249,12 @@ class PostFxGL {
                     uint32_t vertexCount, int debug);
     void RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    // Rivers and waterfalls (docs/WATER_SIM.md): the flow buffer feeds the surface pass; the falls pass overlays the
+    // waterfall faces and draws mist, spray and foam at their feet.
+    bool BuildRiverPrograms();
+    bool EnsureRiverAssets();
+    void RunRiverFlow(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunWaterfalls(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterWaves(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void StepWaterRipples(const NewDawnPostFxParams& params);
     void RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
@@ -407,6 +423,15 @@ class PostFxGL {
     Program mWaterDepthMap, mWaterWaves, mWaterRipple;
     Target mWaveDepth, mWaveBuf, mRipple[2];
     GLuint mWaveDummy = 0;
+    Program mRiverFlow, mFallDraw, mMistDraw;
+    Target mFlowBuf;
+    GLuint mFlowNoise = 0, mRiverSprite = 0, mFlowVao = 0, mFlowVbo = 0;
+    bool mRiverAttempted = false, mRiverAssetsOk = false;
+    std::string mRiverAssetPath;
+    uint32_t mFlowBufFrame = UINT32_MAX; // settings frame whose flow buffer is valid
+    const float* mFlowData = nullptr;
+    uint32_t mFlowCount = 0;
+    std::vector<float> mFlowScratch;
     int mRippleRead = 0, mRippleScene = -1;
     bool mRippleValid = false;
     float mRippleMin[2] = {}, mRippleAccum = 0.0f, mRippleLastTime = 0.0f;
