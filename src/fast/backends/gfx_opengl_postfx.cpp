@@ -4507,7 +4507,7 @@ static const char* const kStageNames[NEWDAWN_PERF_STAGES] = {
     "physical sky", "volumetric clouds", "sky ambient cube", "volumetric fog", "textured sun flare",
     "ambient particles", "wet surfaces and rain shelter", "rain and snow", "screen-space GI", "VFX sprites",
     "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "point-light shadows",
-    "interior window light", "emissive surfaces" };
+    "interior window light", "emissive surfaces", "world GI" };
 static float sStageMs[NEWDAWN_PERF_STAGES] = {};
 float gNewDawnGpuFrameMs = 0.0f; // written by GfxRenderingAPIOGL
 
@@ -5434,6 +5434,9 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doEmissive = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.emissiveEnabled && (params.flags & 1u) &&
                             mLocalMarking && mEmissive.id && params.shadowUseExactProj && s.debugView == 0 &&
                             s.shadowDebug == 0;
+    const bool doWorldGi = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && s.postFxOn && params.giWorld &&
+                           params.giWorldStrength > 0.0f && params.shadowUseExactProj && s.debugView == 0 &&
+                           s.shadowDebug == 0;
     if (stage == NEWDAWN_POSTFX_STAGE_GROUND_END) {
         // Ground-only colour for the grass: room geometry is in, actors (Link, NPCs, props) are not, so tufts rooted behind
         // an actor never take its colours.
@@ -5461,7 +5464,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi &&
-        !doVfx && !doLocal && !doGrass && !doCaustics && !doUnderwater) {
+        !doVfx && !doLocal && !doGrass && !doCaustics && !doUnderwater && !doWorldGi) {
         return;
     }
 
@@ -5492,7 +5495,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(kGrassTimerStage);
     }
     if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal || doCaustics ||
-        doUnderwater || doInterior || doProbe) {
+        doUnderwater || doInterior || doProbe || doWorldGi) {
         PrepareDepth(fb);
     }
     if (doProbe) {
@@ -5563,6 +5566,24 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(kEmissiveTimerStage);
         RunEmissive(params, fb);
         EndTimer(kEmissiveTimerStage);
+    }
+    if (doWorldGi) {
+        // After the local lights: their darkening must not swallow the bounce they cause. The albedo proxy for
+        // actors only needs the pixel's hue, so the screen-space GI's copy of this frame is reused when it exists.
+        BeginTimer(kWorldGiTimerStage);
+        const Target* copy = doGi ? &mGiSource : nullptr;
+        if (copy == nullptr) {
+            EnsureTarget(mGiSource, fb.width, fb.height, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+            glDisable(GL_BLEND);
+            glDisable(GL_SCISSOR_TEST);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mGiSource.fbo);
+            glBlitFramebuffer(0, 0, fb.width, fb.height, 0, 0, fb.width, fb.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            copy = &mGiSource;
+        }
+        RunWorldGi(params, fb, frameIndex, copy);
+        EndTimer(kWorldGiTimerStage);
     }
     if (doCaustics) {
         BeginTimer(kCausticsTimerStage);
@@ -6874,7 +6895,8 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     Bind(3, mGiHistory[write].tex);
     Use(mGiApply);
     geometry();
-    glUniform1f(Loc("uStrength"), params.giStrength);
+    // With world-space GI on, the screen-space term stays as near-field detail (contact colour, actors) at half weight.
+    glUniform1f(Loc("uStrength"), params.giStrength * (params.giWorld ? 0.5f : 1.0f));
     const float debug = static_cast<float>(CvInt("gNewDawn.GI.Debug", 0)); // 0 off, N: show only bounce * N
     glUniform1f(Loc("uDebug"), debug > 0.0f ? debug : 1.0f);
     glEnable(GL_BLEND);
@@ -7004,8 +7026,11 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
                 lightRgb[i] = lightRgb[i] * 0.35f + warmFire[i] * (lum / 0.662f) * 0.65f; // 0.662: the luminance of warmFire
             gain = 6.0f * flameGain;
         }
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 3; ++i) {
             rgb[count][i] = lightRgb[i] * k * f * boost * gain * params.localStrength * params.localGain * 4.0f;
+            mWgi.lightRgb[count][i] = rgb[count][i] / f; // world GI injects the light without the designed flicker
+        }
+        std::copy_n(pos[count], 4, mWgi.lightPos[count]);
         ++count;
     };
     for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i) {
@@ -7082,6 +7107,8 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
     }
     for (auto it = smoothed.begin(); it != smoothed.end();)
         it = (now - it->second[4] > 2.0) ? smoothed.erase(it) : std::next(it);
+    mWgi.lightCount = count;
+    mWgi.lightFrame = frameIndex;
 }
 
 void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {

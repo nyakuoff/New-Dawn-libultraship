@@ -157,6 +157,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
         mStencilMarkClass = mark;
     }
     bool VfxReplacing() const override;
+    void SetGiTriangles(const float* data, uint32_t count) override;
+    bool GiWantsGeometry() const override;
     bool SupportsAlphaToCoverage() const override {
         return true;
     }
@@ -233,6 +235,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     const float* mVfxSprites = nullptr;
     const float* mGrassTriangles = nullptr;
     uint32_t mGrassTriangleCount = 0;
+    const float* mGiTriangles = nullptr;
+    uint32_t mGiTriangleCount = 0;
     uint32_t mVfxSpriteCount = 0;
 
 #ifndef USE_OPENGLES

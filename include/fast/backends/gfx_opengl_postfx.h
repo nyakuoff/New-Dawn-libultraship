@@ -100,6 +100,13 @@ class PostFxGL {
         mGrassCount = count;
     }
 
+    // New Dawn world GI: recorded room triangles for the next Run (NEWDAWN_GI_TRI_FLOATS floats each).
+    void SetGiTriangles(const float* data, uint32_t count) {
+        mWgiTris = data;
+        mWgiTriCount = count;
+    }
+    bool WorldGiWantsGeometry(uint32_t frameIndex) const;
+
     bool VfxUsable() const {
         return mUsable && (!mVfxAttempted || mVfx.id != 0);
     }
@@ -246,6 +253,30 @@ class PostFxGL {
     void RunGlobalIllumination(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
                               bool sunShadow);
     void RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s);
+    // World-space GI (gfx_opengl_worldgi.cpp, docs/WORLD_GI.md): a persistent voxel copy of the room geometry, a
+    // radiance volume lit from it, an irradiance + distance probe grid traced through it, and the per-pixel apply.
+    bool BuildWorldGi();
+    void ResetWorldGi(const NewDawnPostFxParams& params, int tier);
+    void RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
+                    const Target* sceneCopy);
+    const float* mWgiTris = nullptr;
+    uint32_t mWgiTriCount = 0;
+    struct WorldGi {
+        bool attempted = false, ready = false;
+        Program voxelize, inject, trace, blend, apply;
+        GLuint voxAlbedo = 0, voxNormal = 0, voxCoarse = 0, voxRadiance = 0; // 3D
+        GLuint probeIrr = 0, probeDist = 0, rays = 0;                         // 2D
+        GLuint voxFbo = 0, radFbo = 0, rayFbo = 0, probeFbo = 0, vao = 0, vbo = 0;
+        int tier = 0, scene = -1;
+        int dim[3] = {}, origin[3] = {}, perProbe = 8, rayCount = 0, rayRows = 0; // window corner in world voxel cells
+        float boundsMin[3] = {}, boundsMax[3] = {}, lo[3] = {}, hi[3] = {}, voxSize = 1.0f, probeStep = 1.0f;
+        int sliceCursor = 0, rowCursor = 0;
+        uint32_t frames = 0, updates = 0, sweeps = 0, lastFrame = UINT32_MAX, want = 0, tris = 0;
+        // This frame's smoothed local lights without the designed flicker (filled by RunLocalLights).
+        float lightPos[24][4] = {}, lightRgb[24][3] = {};
+        int lightCount = 0;
+        uint32_t lightFrame = UINT32_MAX;
+    } mWgi;
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa = false);
     // Resolves this frame's jittered world against the reprojected history; returns the resolved linear target, or
     // nullptr when TAA is not active (the caller then keeps using mScene).
@@ -430,10 +461,11 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 25;
+    static constexpr int kQueryStages = 26;
     static constexpr int kPointTimerStage = 22;
     static constexpr int kInteriorTimerStage = 23;
     static constexpr int kEmissiveTimerStage = 24;
+    static constexpr int kWorldGiTimerStage = 25;
     static constexpr int kNightTimerStage = 20;
     static constexpr int kTaaTimerStage = 21;
     static constexpr int kLocalTimerStage = 16;
