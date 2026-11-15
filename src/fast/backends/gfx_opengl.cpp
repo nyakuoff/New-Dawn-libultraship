@@ -1739,6 +1739,19 @@ void GfxRenderingAPIOGL::SetGrassTriangles(const float* data, uint32_t count) {
     mGrassTriangleCount = count;
 }
 
+void GfxRenderingAPIOGL::SetGiTriangles(const float* data, uint32_t count) {
+    mGiTriangles = data;
+    mGiTriangleCount = count;
+}
+
+bool GfxRenderingAPIOGL::GiWantsGeometry() const {
+#ifndef USE_OPENGLES
+    return mPostFx != nullptr && mPostFx->WorldGiWantsGeometry(mFrameCount);
+#else
+    return false;
+#endif
+}
+
 bool GfxRenderingAPIOGL::HdrWorldActive() const {
 #ifndef USE_OPENGLES
     return mPostFx && mPostFx->HdrActive() && mCurrentFrameBuffer == mHdrGameFb;
@@ -1857,6 +1870,7 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
         mPostFx->SetFoliageCasters(mShadowFoliageVerts, mShadowFoliageBatches, mShadowFoliageBatchCount);
         mPostFx->SetVfxSprites(mVfxSprites, mVfxSpriteCount);
         mPostFx->SetGrassTriangles(mGrassTriangles, mGrassTriangleCount);
+        mPostFx->SetGiTriangles(mGiTriangles, mGiTriangleCount);
         mPostFx->Run(stage, params, mFrameBuffers[gameFbId], mFrameCount, mShadowCasterPositions,
                      mShadowCasterVertexCount);
         if (mStencilMarkOn) {
@@ -1875,6 +1889,8 @@ void GfxRenderingAPIOGL::RunPostFx(int stage, const NewDawnPostFxParams& params,
     mVfxSpriteCount = 0;
     mGrassTriangles = nullptr;
     mGrassTriangleCount = 0;
+    mGiTriangles = nullptr;
+    mGiTriangleCount = 0;
 #endif
 }
 } // namespace Fast

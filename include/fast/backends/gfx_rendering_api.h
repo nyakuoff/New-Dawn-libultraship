@@ -179,6 +179,13 @@ class GfxRenderingAPI {
     virtual void SetStencilMark(uint8_t mark) {
     }
     // True while the renderer will redraw recorded VFX sprites itself (so the native draw may be skipped).
+    // New Dawn world GI: NEWDAWN_GI_TRI_FLOATS floats per recorded room triangle; valid until RunPostFx returns.
+    virtual void SetGiTriangles(const float* data, uint32_t count) {
+    }
+    // True on the frames the renderer wants the room geometry recorded (always after a scene change, then periodically).
+    virtual bool GiWantsGeometry() const {
+        return false;
+    }
     virtual bool VfxReplacing() const {
         return false;
     }
