@@ -587,7 +587,8 @@ class Interpreter {
     void SmoothFinishActor();
     void SmoothAnalyze();
     void SmoothSyncCamera();
-    bool mSmooth = false, mSmoothProps = false, mSmoothDebug = false;
+    bool mSmooth = false, mSmoothProps = false;
+    bool mSmoothDebug = false, mSmoothChecking = false; // SmoothDebug 1: timing and the crack check, 2: timing only
     float mSmoothStrength = 1.0f, mSmoothCrease = 0.82f, mSmoothTip = 0.8f, mSmoothThin = 1.0f, mSmoothTolerance = 0.35f;
     float mSmoothFlat = 0.105f; // sine of the angle under which an edge counts as lying in a flat panel
     int mSmoothMaxLevel = 8;
@@ -616,9 +617,6 @@ class Interpreter {
         uint64_t key;
         uint32_t actor;
         uint8_t kind, mixed, info, edge;
-        uint32_t mtxHash, mtxIdx;
-        int16_t g[3];
-        int8_t own[3];
     };
     std::vector<SmoothCheck> mSmoothChecks;
     bool SolveCameraPosition(float out[3]);

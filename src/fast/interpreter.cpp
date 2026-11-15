@@ -3218,7 +3218,7 @@ void Interpreter::SmoothBeginFrame() {
                     apart++;
                 }
                 static int logged = 0;
-                if (logged < 60) {
+                if (logged < 20) {
                     logged++;
                     const SmoothCheck& f = *it->second;
                     SPDLOG_INFO("SMOOTHDBG mismatch rel {:.5f} at {:.2f},{:.2f},{:.2f} edge {:.2f}: actor {} cmd {:x} kind {} "
@@ -3227,9 +3227,6 @@ void Interpreter::SmoothBeginFrame() {
                                 rel, a[0], a[1], a[2], std::sqrt(SmoothDot(e, e)), f.actor, f.key, f.kind, f.mixed,
                                 f.info & 1, f.info >> 1 & 1, f.info >> (2 + f.edge * 2) & 3, c.actor, c.key, c.kind,
                                 c.mixed, c.info & 1, c.info >> 1 & 1, c.info >> (2 + c.edge * 2) & 3);
-                    SPDLOG_INFO("SMOOTHDBG   mtx {}#{:08x} own {},{},{} g {},{},{} o {:.6f},{:.6f},{:.6f} | mtx {}#{:08x} own {},{},{} g {},{},{} o {:.6f},{:.6f},{:.6f}",
-                                f.mtxIdx, f.mtxHash, f.own[0], f.own[1], f.own[2], f.g[0], f.g[1], f.g[2], f.o[0], f.o[1], f.o[2],
-                                c.mtxIdx, c.mtxHash, c.own[0], c.own[1], c.own[2], c.g[0], c.g[1], c.g[2], c.o[0], c.o[1], c.o[2]);
                 }
             }
             mSmoothChecks.clear();
@@ -4144,7 +4141,7 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
     }
     mSmoothStats.patches++;
     if (mSmoothDebug) {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 3 && mSmoothChecking; i++) {
             for (int e = 0; e < 2; e++) {
                 SmoothCheck& c = mSmoothChecks.emplace_back();
                 memcpy(c.a, v[i]->view_pos, sizeof(c.a));
@@ -4156,15 +4153,6 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
                 c.mixed = tri->mixed >> i & 1;
                 c.info = tri->info;
                 c.edge = (uint8_t)(e == 0 ? i : (i + 2) % 3);
-                c.mtxIdx = mSmoothSlots[idx[i]].mtx;
-                c.mtxHash = 0;
-                for (int q = 0; q < 16; q++) {
-                    uint32_t bits;
-                    memcpy(&bits, &mSmoothMtx[c.mtxIdx].src[q / 4][q % 4], 4);
-                    c.mtxHash = (c.mtxHash ^ bits) * 0x9E3779B1u;
-                }
-                memcpy(c.g, tri->g[i], sizeof(c.g));
-                memcpy(c.own, mSmoothSlots[idx[i]].n, sizeof(c.own));
             }
         }
         mSmoothStats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
@@ -8710,6 +8698,7 @@ void Interpreter::StartFrame() {
         mSmoothTolerance = std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothTolerance", 0.35f), 0.05f, 8.0f);
         mSmoothMaxLevel = std::clamp(cvars->GetInteger("gNewDawn.Characters.SmoothMaxLevel", 8), 1, 16);
         mSmoothDebug = cvars->GetInteger("gNewDawn.Characters.SmoothDebug", 0) != 0;
+        mSmoothChecking = cvars->GetInteger("gNewDawn.Characters.SmoothDebug", 0) == 1;
     }
     int cacheBudgetMb = cvars->GetInteger("gNewDawn.Textures.CacheBudgetMB", 2048);
     mTextureCacheBudgetBytes = cacheBudgetMb > 0 ? (uint64_t)cacheBudgetMb * 1024 * 1024 : 0;
