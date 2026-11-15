@@ -67,6 +67,9 @@ float csmLit(vec3 pos, vec3 N, float vz, float nBias, float bias) {
 // colour grade and dithering of the finished world. It works on private copies of the game framebuffer's depth and
 // colour, writes its result back into the game framebuffer and leaves all GL state exactly as it found it, so the
 // backend's cached state (and whatever is drawn afterwards) is unaffected. GI retains rejected temporal history.
+void PackInteriorWindows(const NewDawnPostFxParams& params, float (*win0)[4], float (*win1)[4], float (*win2)[4],
+                         float (*beam)[4]);
+
 class PostFxGL {
   public:
     // Checks the GL version and builds the shaders. On failure the feature stays unusable.
@@ -327,6 +330,9 @@ class PostFxGL {
     // HDR local lighting (gfx_opengl_postfx.cpp RunLocalLights)
     void PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t frameIndex);
     void RunLocalLights(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
+    void ProbeInterior(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunInteriorLight(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunEmissive(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     static constexpr int kMaxLocal = 24;
     float mLocalPos[kMaxLocal][4] = {}; // this frame's lights: world position, range
     float mLocalRgb[kMaxLocal][3] = {};
@@ -352,6 +358,7 @@ class PostFxGL {
     uint32_t mCasterVertexCount = 0;
     int mPointLastRendered = 0, mPointLastTriangles = 0; // diagnostics
     Program mLocalLight;
+    Program mInteriorLight, mEmissive, mInteriorGlass;
     Target mLocalSource;
     std::vector<float> mFlameLights; // previous frame's VFX flames: world xyz + warm rgb
     uint32_t mFlameFrame = 0;
@@ -423,8 +430,10 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 23;
+    static constexpr int kQueryStages = 25;
     static constexpr int kPointTimerStage = 22;
+    static constexpr int kInteriorTimerStage = 23;
+    static constexpr int kEmissiveTimerStage = 24;
     static constexpr int kNightTimerStage = 20;
     static constexpr int kTaaTimerStage = 21;
     static constexpr int kLocalTimerStage = 16;
