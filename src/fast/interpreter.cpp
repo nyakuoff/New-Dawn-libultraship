@@ -147,6 +147,7 @@ void Interpreter::Flush() {
             mPerPixelLightUploadedSerial = mPerPixelLightState.serial;
         }
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        mRapi->SetStencilMark(mBufMark);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -918,6 +919,8 @@ static bool Invert4x4(const float m[4][4], float out[16]) {
 
 void Interpreter::BeginShadowRecording(bool enabled, bool captureCamera) {
     mShadowRecording = enabled;
+    mShadowOnlyTris = 0;
+    mShadowOnlyNs = 0;
     mShadowVertices.clear();
     mShadowOverflowLogged = false;
     mShadowSerial++; // expires last frame's texture pins
@@ -957,6 +960,30 @@ void Interpreter::EndShadowRecording() {
 }
 
 void Interpreter::SubmitShadowCasters() {
+    if (const int dbg = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Shadows.CoverageDebug", 0)) {
+        // 1: a line every 30 frames; 2: every frame, with the camera yaw (the measurement fixture of docs/CASCADED_SHADOWS.md)
+        static uint32_t sFrame = 0;
+        if (dbg >= 2 || sFrame++ % 30 == 0) {
+            float a[4] = { 0, 0, -1, 1 }, b[4] = { 0, 0, 1, 1 }, wa[4] = {}, wb[4] = {};
+            for (int j = 0; j < 4; j++) {
+                for (int i = 0; i < 4; i++) {
+                    wa[j] += a[i] * mShadowInvViewProj[i * 4 + j];
+                    wb[j] += b[i] * mShadowInvViewProj[i * 4 + j];
+                }
+            }
+            const float fx = wb[0] / wb[3] - wa[0] / wa[3], fz = wb[2] / wb[3] - wa[2] / wa[3];
+            SPDLOG_INFO("NewDawn shadow casters: {} triangles ({} from the coverage pass) yaw {:.2f}",
+                        mShadowVertices.size() / 9, mShadowOnlyTris, std::atan2(fx, fz) * 57.29578f);
+            static double sNs = 0.0;
+            static int sN = 0;
+            sNs += mShadowOnlyNs;
+            if (++sN == 120) {
+                SPDLOG_INFO("NewDawn coverage pass CPU: {:.4f} ms/frame (120 frames)", sNs / sN / 1.0e6);
+                sNs = 0.0;
+                sN = 0;
+            }
+        }
+    }
     mRapi->SetShadowCasterGeometry(mShadowVertices.empty() ? nullptr : mShadowVertices.data(),
                                    (uint32_t)(mShadowVertices.size() / 3));
     mShadowFoliageVerts.clear();
@@ -1342,6 +1369,266 @@ void Interpreter::RecordGrassTriangle(const LoadedVertex* const v[3]) {
     }
     for (int i = 0; i < 3; i++) {
         mGrassTris.insert(mGrassTris.end(), v[i]->view_pos, v[i]->view_pos + 3);
+    }
+}
+
+// ---- New Dawn interior polish: window and emissive textures (tools/newdawn: newdawn_interior_textures.inc, listed by
+// resource basename) are recorded in world space, merged into openings and emissive lights, and handed to the renderer in
+// the post-fx params at the opaque-end marker. Emissive draws also write a stencil class (see Flush). Read-only.
+namespace {
+enum { INTERIOR_NONE = 0, INTERIOR_WINDOW = 1, INTERIOR_GLASS = 2, INTERIOR_LAMP = 3 };
+struct InteriorTexture {
+    const char* name;
+    uint8_t kind;
+    float a, b, c, d; // window: inset u, inset v, panes u, panes v. glass/lamp: tint rgb, light intensity (0 = no light)
+};
+const InteriorTexture kInteriorTextures[] = {
+#include "fast/newdawn_interior_textures.inc"
+};
+
+struct InteriorCluster {
+    uint8_t idx;
+    float n[3];
+    float mn[3], mx[3];
+    bool cullBack;
+    std::vector<float> verts;
+};
+} // namespace
+
+void Interpreter::BeginInteriorRecording(bool enabled, bool debug) {
+    mInterior = enabled;
+    mInteriorDebug = enabled && debug;
+    mInteriorTris.clear();
+    mInteriorBBox[0] = mInteriorBBox[1] = mInteriorBBox[2] = 1e9f;
+    mInteriorBBox[3] = mInteriorBBox[4] = mInteriorBBox[5] = -1e9f;
+}
+
+uint8_t Interpreter::InteriorClassify(std::string_view path) {
+    static const std::unordered_map<std::string_view, uint8_t> table = [] {
+        std::unordered_map<std::string_view, uint8_t> t;
+        for (size_t i = 0; i < sizeof(kInteriorTextures) / sizeof(kInteriorTextures[0]); i++) {
+            t.emplace(kInteriorTextures[i].name, (uint8_t)(i + 1));
+        }
+        return t;
+    }();
+    const size_t slash = path.rfind('/');
+    const auto found = table.find(slash == std::string_view::npos ? path : path.substr(slash + 1));
+    return found == table.end() ? 0 : found->second;
+}
+
+void Interpreter::RecordInteriorTriangle(const LoadedVertex* const v[3], uint8_t idx) {
+    constexpr size_t kMaxTriangles = 4096;
+    if (mInteriorTris.size() >= kMaxTriangles * 11) {
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        mInteriorTris.insert(mInteriorTris.end(), v[i]->view_pos, v[i]->view_pos + 3);
+    }
+    mInteriorTris.push_back((float)idx);
+    const uint32_t cull_back = get_attr(CULL_BACK);
+    mInteriorTris.push_back((mRsp->geometry_mode & cull_back) != 0 ? 1.0f : 0.0f);
+}
+
+void Interpreter::SubmitInterior(NewDawnPostFxParams& params) {
+    // The game side already put the render-only windows (kind 2) of the scene in front; recorded openings follow.
+    params.emissiveLightCount = 0;
+    // Developer test opening, "dx,dy,dz,nx,ny,nz,halfWidth,halfHeight" relative to the camera (gNewDawn.Interior.TestWindow).
+    {
+        std::string test = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Interior.TestWindow", "");
+        const bool absolute = !test.empty() && test[0] == 'a'; // "a:" prefix: world coordinates instead of eye-relative
+        if (absolute) {
+            test.erase(0, 2);
+        }
+        float t[8];
+        if (!test.empty() && sscanf(test.c_str(), "%f,%f,%f,%f,%f,%f,%f,%f", &t[0], &t[1], &t[2], &t[3], &t[4], &t[5], &t[6], &t[7]) == 8 &&
+            params.interiorEnabled && params.interiorWindowCount < NEWDAWN_INTERIOR_WINDOWS) {
+            float* o = params.interiorWindows[params.interiorWindowCount++];
+            const float nl = std::max(std::sqrt(t[3] * t[3] + t[4] * t[4] + t[5] * t[5]), 1e-3f);
+            for (int a = 0; a < 3; a++) {
+                o[a] = (absolute ? 0.0f : params.giCameraEye[a]) + t[a];
+                o[3 + a] = t[3 + a] / nl;
+            }
+            o[6] = o[5], o[7] = 0.0f, o[8] = -o[3];
+            const float ul = std::max(std::sqrt(o[6] * o[6] + o[8] * o[8]), 1e-3f);
+            o[6] /= ul, o[8] /= ul;
+            o[9] = t[6], o[10] = t[7], o[11] = 2, o[12] = 2, o[13] = 2;
+        }
+    }
+    if (mInteriorDebug) {
+        static uint32_t sBox = 0;
+        if (sBox++ % 120 == 0) {
+            SPDLOG_INFO("INTDBG room bbox {:.0f},{:.0f},{:.0f} .. {:.0f},{:.0f},{:.0f} eye {:.0f},{:.0f},{:.0f}", mInteriorBBox[0], mInteriorBBox[1], mInteriorBBox[2], mInteriorBBox[3], mInteriorBBox[4], mInteriorBBox[5], params.giCameraEye[0], params.giCameraEye[1], params.giCameraEye[2]);
+        }
+    }
+    if (mInteriorTris.empty()) {
+        return;
+    }
+    // Merge the triangles of one texture that lie in one plane and touch (a window is usually two triangles, sometimes
+    // a frame of several).
+    std::vector<InteriorCluster> windows, lamps;
+    const size_t triCount = mInteriorTris.size() / 11;
+    for (size_t t = 0; t < triCount; t++) {
+        const float* f = &mInteriorTris[t * 11];
+        const uint8_t idx = (uint8_t)f[9];
+        const InteriorTexture& tex = kInteriorTextures[idx - 1];
+        const float e1[3] = { f[3] - f[0], f[4] - f[1], f[5] - f[2] }, e2[3] = { f[6] - f[0], f[7] - f[1], f[8] - f[2] };
+        float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len < 1.0f) {
+            continue;
+        }
+        for (float& c : n) {
+            c /= len;
+        }
+        float mn[3], mx[3];
+        for (int a = 0; a < 3; a++) {
+            mn[a] = std::min({ f[a], f[3 + a], f[6 + a] });
+            mx[a] = std::max({ f[a], f[3 + a], f[6 + a] });
+        }
+        auto& list = tex.kind == INTERIOR_WINDOW ? windows : lamps;
+        InteriorCluster* hit = nullptr;
+        for (auto& c : list) {
+            if (c.idx != idx) {
+                continue;
+            }
+            const bool planar = tex.kind != INTERIOR_WINDOW || std::fabs(n[0] * c.n[0] + n[1] * c.n[1] + n[2] * c.n[2]) > 0.9f;
+            bool touches = true;
+            for (int a = 0; a < 3; a++) {
+                touches &= mn[a] <= c.mx[a] + 8.0f && mx[a] >= c.mn[a] - 8.0f;
+            }
+            if (planar && touches) {
+                hit = &c;
+                break;
+            }
+        }
+        if (!hit) {
+            list.push_back({ idx, { n[0], n[1], n[2] }, { mn[0], mn[1], mn[2] }, { mx[0], mx[1], mx[2] },
+                             f[10] != 0.0f, {} });
+            hit = &list.back();
+        }
+        for (int a = 0; a < 3; a++) {
+            hit->mn[a] = std::min(hit->mn[a], mn[a]);
+            hit->mx[a] = std::max(hit->mx[a], mx[a]);
+        }
+        if (hit->verts.size() < 96) {
+            hit->verts.insert(hit->verts.end(), f, f + 9);
+        }
+    }
+
+    if (mInteriorDebug) {
+        static uint32_t sLog = 0;
+        if (sLog++ % 120 == 0) {
+            SPDLOG_INFO("INTDBG submit: {} triangles, {} window clusters, {} lamp clusters", triCount, windows.size(), lamps.size());
+        }
+    }
+    struct Opening {
+        float data[NEWDAWN_INTERIOR_WINDOW_FLOATS];
+        float area;
+    };
+    std::vector<Opening> openings;
+    for (const auto& c : windows) {
+        const InteriorTexture& tex = kInteriorTextures[c.idx - 1];
+        float n[3] = { c.n[0], c.n[1], c.n[2] };
+        const float centre[3] = { (c.mn[0] + c.mx[0]) * 0.5f, (c.mn[1] + c.mx[1]) * 0.5f, (c.mn[2] + c.mx[2]) * 0.5f };
+        // Front face looks into the room. Double-sided quads face the camera's side instead.
+        if (!c.cullBack) {
+            const float* eye = params.giCameraEye;
+            if ((eye[0] - centre[0]) * n[0] + (eye[1] - centre[1]) * n[1] + (eye[2] - centre[2]) * n[2] < 0.0f) {
+                for (float& x : n) {
+                    x = -x;
+                }
+            }
+        }
+        // Horizontal axis along the wall; skylights and other near-horizontal openings use the world X axis.
+        float u[3] = { n[2], 0.0f, -n[0] };
+        float ul = std::sqrt(u[0] * u[0] + u[2] * u[2]);
+        if (std::fabs(n[1]) > 0.7f || ul < 1e-3f) {
+            const float d = n[0];
+            u[0] = 1.0f - n[0] * d, u[1] = -n[1] * d, u[2] = -n[2] * d;
+            ul = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        }
+        for (float& x : u) {
+            x /= ul;
+        }
+        const float vv[3] = { n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0] };
+        float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+        for (size_t i = 0; i + 2 < c.verts.size(); i += 3) {
+            const float d[3] = { c.verts[i] - centre[0], c.verts[i + 1] - centre[1], c.verts[i + 2] - centre[2] };
+            const float pu = d[0] * u[0] + d[1] * u[1] + d[2] * u[2], pv = d[0] * vv[0] + d[1] * vv[1] + d[2] * vv[2];
+            u0 = std::min(u0, pu), u1 = std::max(u1, pu), v0 = std::min(v0, pv), v1 = std::max(v1, pv);
+        }
+        const float hu = (u1 - u0) * 0.5f * (1.0f - 2.0f * tex.a), hv = (v1 - v0) * 0.5f * (1.0f - 2.0f * tex.b);
+        if (mInteriorDebug) {
+            SPDLOG_INFO("INTDBG cluster {} bbox {:.0f},{:.0f},{:.0f}..{:.0f},{:.0f},{:.0f} half {:.0f}x{:.0f}", tex.name, c.mn[0], c.mn[1], c.mn[2], c.mx[0], c.mx[1], c.mx[2], hu, hv);
+        }
+        if (hu < 7.0f || hv < 7.0f) {
+            continue;
+        }
+        Opening o = {};
+        const float cu = (u0 + u1) * 0.5f, cv = (v0 + v1) * 0.5f;
+        for (int a = 0; a < 3; a++) {
+            o.data[a] = centre[a] + u[a] * cu + vv[a] * cv;
+            o.data[3 + a] = n[a];
+            o.data[6 + a] = u[a];
+        }
+        o.data[9] = hu, o.data[10] = hv, o.data[11] = tex.c, o.data[12] = tex.d, o.data[13] = (float)tex.kind;
+        o.area = hu * hv;
+        o.data[14] = o.area;
+        if (mInteriorDebug) {
+            SPDLOG_INFO("INTDBG opening tex {} centre {:.0f},{:.0f},{:.0f} n {:.2f},{:.2f},{:.2f} half {:.0f}x{:.0f} cullBack {}",
+                        kInteriorTextures[c.idx - 1].name, o.data[0], o.data[1], o.data[2], n[0], n[1], n[2], hu, hv,
+                        c.cullBack);
+        }
+        openings.push_back(o);
+    }
+    std::sort(openings.begin(), openings.end(), [](const Opening& a, const Opening& b) {
+        return a.area != b.area ? a.area > b.area : a.data[0] < b.data[0];
+    });
+    for (size_t i = 0; i < openings.size() && params.interiorWindowCount < NEWDAWN_INTERIOR_WINDOWS; i++) {
+        memcpy(params.interiorWindows[params.interiorWindowCount], openings[i].data, sizeof(openings[i].data));
+        params.interiorWindowCount++;
+    }
+
+    // Emissive lights: nearest-first, one per cluster, only for textures that ask for a light.
+    struct Lamp {
+        float data[8];
+        float dist;
+    };
+    std::vector<Lamp> lights;
+    // Bit 0 of params.flags: an emissive texture was drawn this frame (the renderer skips the emission pass otherwise).
+    if (!lamps.empty()) {
+        params.flags |= 1u;
+    }
+    for (const auto& c : lamps) {
+        const InteriorTexture& tex = kInteriorTextures[c.idx - 1];
+        if (tex.d <= 0.0f) {
+            continue;
+        }
+        Lamp l = {};
+        const float ext = std::max({ c.mx[0] - c.mn[0], c.mx[1] - c.mn[1], c.mx[2] - c.mn[2] });
+        for (int a = 0; a < 3; a++) {
+            l.data[a] = (c.mn[a] + c.mx[a]) * 0.5f + c.n[a] * 8.0f;
+        }
+        l.data[3] = std::clamp(ext * 3.0f, 70.0f, 260.0f);
+        l.data[4] = tex.a, l.data[5] = tex.b, l.data[6] = tex.c;
+        l.data[7] = tex.kind == INTERIOR_GLASS ? -tex.d : tex.d; // negative: lit only at night
+        const float dx = l.data[0] - params.giCameraEye[0], dy = l.data[1] - params.giCameraEye[1],
+                    dz = l.data[2] - params.giCameraEye[2];
+        l.dist = dx * dx + dy * dy + dz * dz;
+        // One light per fixture: skip clusters close to a nearer one already taken.
+        bool dup = false;
+        for (const auto& o : lights) {
+            const float ex = o.data[0] - l.data[0], ey = o.data[1] - l.data[1], ez = o.data[2] - l.data[2];
+            dup |= ex * ex + ey * ey + ez * ez < 50.0f * 50.0f;
+        }
+        if (!dup) {
+            lights.push_back(l);
+        }
+    }
+    std::sort(lights.begin(), lights.end(), [](const Lamp& a, const Lamp& b) { return a.dist < b.dist; });
+    for (size_t i = 0; i < lights.size() && i < NEWDAWN_EMISSIVE_LIGHTS; i++) {
+        memcpy(params.emissiveLights[i], lights[i].data, sizeof(lights[i].data));
+        params.emissiveLightCount++;
     }
 }
 
@@ -2815,11 +3102,22 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
-            mGrass || mGiRecord) {
+            mGrass || mInterior || mGiRecord) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+        }
+
+        if (mShadowOnly) {
+            // Coverage pass: only the world position (casters) and z/w (a branch-by-depth command may read them).
+            d->view_pos[0] = world_pos[0];
+            d->view_pos[1] = world_pos[1];
+            d->view_pos[2] = world_pos[2];
+            d->z = z;
+            d->w = w;
+            d->clip_rej = 0;
+            continue;
         }
 
         x = AdjXForAspectRatio(x);
@@ -2944,7 +3242,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mGiRecord) {
+        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -3022,6 +3320,34 @@ void Interpreter::SyncViewportScissor() {
 
 }
 
+// The opaque, depth-writing draws that cast shadows (render state only).
+static inline bool OpaqueCasterMode(uint32_t om) {
+    return (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC && (om & CVG_X_ALPHA) != CVG_X_ALPHA &&
+           (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD && (om & G_ZS_PRIM) == 0 &&
+           !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+}
+
+void Interpreter::BeginShadowOnly() {
+    mShadowOnlyRsp = *mRsp;
+    mShadowOnlyRdp = *mRdp;
+    memcpy(mShadowOnlySegments, mSegmentPointers, sizeof(mSegmentPointers));
+    mShadowOnlyMatrixLoads = mMatrixLoadsSinceLights;
+    mShadowOnly = true;
+    mShadowOnlyStart = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Interpreter::EndShadowOnly() {
+    if (!mShadowOnly) {
+        return;
+    }
+    *mRsp = mShadowOnlyRsp;
+    *mRdp = mShadowOnlyRdp;
+    memcpy(mSegmentPointers, mShadowOnlySegments, sizeof(mSegmentPointers));
+    mMatrixLoadsSinceLights = mShadowOnlyMatrixLoads;
+    mShadowOnly = false;
+    mShadowOnlyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - mShadowOnlyStart;
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
     // New Dawn world GI: solid, depth-writing room triangles, taken before any rejection (and before the MM3D swap:
     // the N64 room stays the right shape for bounce light). Render state only; nothing is drawn differently.
@@ -3054,6 +3380,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     }
+    if (mShadowOnly) {
+        // Culled room entry (coverage pass): record it as a caster, never draw it.
+        if (!is_rect && mShadowRecording && OpaqueCasterMode(mRdp->other_mode_l)) {
+            RecordShadowTriangle(&mRsp->loaded_vertices[vtx1_idx], &mRsp->loaded_vertices[vtx2_idx],
+                                 &mRsp->loaded_vertices[vtx3_idx]);
+            mShadowOnlyTris++;
+        }
+        return;
+    }
     if (mMM3DSuppress && !is_rect) {
         return; // Preserve state/vertices/rectangles, suppress only room triangles and their old casters.
     }
@@ -3068,12 +3403,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // frustum rejection and culling: a caster outside the view, or facing away from the camera, still shadows the
     // visible ground. All of these conditions are render-state only.
     if (mShadowRecording && !is_rect) {
-        const uint32_t om = mRdp->other_mode_l;
-        const bool caster = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC &&
-                            (om & CVG_X_ALPHA) != CVG_X_ALPHA && (om & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_THRESHOLD &&
-                            (om & G_ZS_PRIM) == 0 &&
-                            !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
-        if (caster) {
+        if (OpaqueCasterMode(mRdp->other_mode_l)) {
             RecordShadowTriangle(v1, v2, v3);
         }
     }
@@ -3115,6 +3445,51 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             RecordGrassTriangle(v_arr);
         }
         skipGrass:;
+    }
+
+    // New Dawn interior polish: windows and emissive textures. Kept even when off-screen (their light reaches into view).
+    mBufMarkNext = 0;
+    if (mInterior && !is_rect) {
+        const auto& lt = mRdp->loaded_texture[mRdp->texture_tile[mRdp->first_tile_index].tmem_index];
+        if (mInteriorDebug && lt.raw_tex_metadata.resource != nullptr) {
+            static std::unordered_set<std::string> seenInterior;
+            const std::string name = lt.raw_tex_metadata.resource->GetInitData()->Path;
+            if (seenInterior.insert(name + "|" + std::to_string(mRdp->other_mode_l)).second) {
+                const float* a = v1->view_pos;
+                const float* b = v2->view_pos;
+                const float* c = v3->view_pos;
+                const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+                float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+                const float nl = std::max(std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]), 1e-3f);
+                SPDLOG_INFO("INTDBG draw {} omL {:x} cc {:x} prim {},{},{},{} env {},{},{},{} at {:.0f},{:.0f},{:.0f} n {:.2f},{:.2f},{:.2f} cullBack {}",
+                            name, mRdp->other_mode_l, mRdp->combine_mode, mRdp->prim_color.r, mRdp->prim_color.g,
+                            mRdp->prim_color.b, mRdp->prim_color.a, mRdp->env_color.r, mRdp->env_color.g,
+                            mRdp->env_color.b, mRdp->env_color.a, (a[0] + b[0] + c[0]) / 3, (a[1] + b[1] + c[1]) / 3,
+                            (a[2] + b[2] + c[2]) / 3, n[0] / nl, n[1] / nl, n[2] / nl,
+                            (mRsp->geometry_mode & get_attr(CULL_BACK)) != 0);
+            }
+        }
+        if (mInteriorDebug && lt.raw_tex_metadata.resource != nullptr) {
+            // Room extents (tools for placing the per-scene window table): every vertex of scene-bank draws.
+            const std::string& path = lt.raw_tex_metadata.resource->GetInitData()->Path;
+            if (path.find("scenes/") != std::string::npos) {
+                for (int i = 0; i < 3; i++) {
+                    for (int a = 0; a < 3; a++) {
+                        mInteriorBBox[a] = std::min(mInteriorBBox[a], v_arr[i]->view_pos[a]);
+                        mInteriorBBox[3 + a] = std::max(mInteriorBBox[3 + a], v_arr[i]->view_pos[a]);
+                    }
+                }
+            }
+        }
+        if (lt.interiorIdx != 0) {
+            const uint8_t kind = kInteriorTextures[lt.interiorIdx - 1].kind;
+            RecordInteriorTriangle(v_arr, lt.interiorIdx);
+            if (kind == INTERIOR_GLASS) {
+                mBufMarkNext = 4;
+            } else if (kind == INTERIOR_LAMP) {
+                mBufMarkNext = 8;
+            }
+        }
     }
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
@@ -3614,6 +3989,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool usedTextures[2];
 
     mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
+
+    if (mBufMarkNext != mBufMark) {
+        Flush();
+        mBufMark = mBufMarkNext;
+    }
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
@@ -4179,6 +4559,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].interiorIdx = mInterior ? InteriorClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].swayPlant = mWindSway && mWindRoom && SwayClassify(texPath);
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
@@ -4257,6 +4638,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].vfxClass = mVfx ? VfxClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].grassId = mGrass ? GrassClassify(texPath) : 0;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].interiorIdx = mInterior ? InteriorClassify(texPath) : 0;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].swayPlant = mWindSway && mWindRoom && SwayClassify(texPath);
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
@@ -5776,6 +6158,21 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         gfx->mWindRoom = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_ROOM_SHIFT) & 1);
         return false;
     }
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN) {
+        // w1 is a display list of room entries the game culled. It only runs while casters are being recorded (never on
+        // another backend or with the effect off, where it would draw the entries), and the end marker restores state.
+        // World GI records room geometry from the same list, so its grid also gets the meshes behind the camera.
+        gfx->Flush();
+        if (gfx->mPostFxActive && (gfx->mShadowRecording || gfx->mGiRecord) && !gfx->mShadowOnly) {
+            gfx->BeginShadowOnly();
+            g_exec_stack.call(cmd, reinterpret_cast<F3DGfx*>(cmd->words.w1));
+        }
+        return false;
+    }
+    if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_END) {
+        gfx->EndShadowOnly();
+        return false;
+    }
     gfx->Flush();
     const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
 
@@ -5783,7 +6180,10 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginVfxRecording(gfx->mPostFxActive && params.vfxEnabled != 0);
         gfx->BeginGrassRecording(gfx->mPostFxActive && params.grassEnabled != 0);
-        gfx->BeginShadowRecording(gfx->mPostFxActive && (params.shadowEnabled != 0 || params.atmosWeather),
+        gfx->BeginInteriorRecording(gfx->mPostFxActive && (params.interiorEnabled != 0 || params.emissiveEnabled != 0),
+                                    params.interiorDebug != 0);
+        gfx->BeginShadowRecording(gfx->mPostFxActive &&
+                                      (params.shadowEnabled != 0 || params.atmosWeather || params.localShadows != 0),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
                                                          params.fogVolumetric != 0 || params.giEnabled != 0 ||
                                                          params.giWorld != 0 ||
@@ -5815,6 +6215,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             gfx->mGrass = false;
             gfx->mRapi->SetGiTriangles(gfx->mGiTris.empty() ? nullptr : gfx->mGiTris.data(),
                                        (uint32_t)(gfx->mGiTris.size() / NEWDAWN_GI_TRI_FLOATS));
+            gfx->SubmitInterior(effective);
+            gfx->mInterior = false;
         } else if ((stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) ||
                    (stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && effective.waterEnabled != 0)) {
             if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
@@ -6852,6 +7254,7 @@ GfxExecStack g_exec_stack = {};
 void Interpreter::RunGuiOnly() {
     SpReset();
 
+    mShadowOnly = false;
     mWindSway = false;
 
     mGetPixelDepthPending.clear();

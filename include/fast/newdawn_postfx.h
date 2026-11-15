@@ -6,8 +6,10 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
-#define NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN 15 /* world GI: static room geometry scope (render-side capture only) */
-#define NEWDAWN_POSTFX_STAGE_GI_ROOM_END 16
+#define NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN 17 /* world GI: static room geometry scope (render-side capture only) */
+#define NEWDAWN_POSTFX_STAGE_GI_ROOM_END 18
+#define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_END 16   /* end of a shadow-only display list (restores every piece of state it touched) */
+#define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN 15 /* w1 = a display list of room entries the game culled this frame: run only while casters are recorded, it records casters and draws nothing */
 #define NEWDAWN_POSTFX_STAGE_WATER_XLU 14 /* actors drawn, soft-sprite effects (splashes, ripples) not yet: the water surface pass runs here so those draw above it */
 #define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
@@ -197,6 +199,8 @@ typedef struct NewDawnPostFxParams {
     float localBoost[NEWDAWN_LOCAL_LIGHTS];          /* per-light intensity multiplier (1; below 1 for fairies) */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
     float localGain;         /* light intensity multiplier (interiors are lit harder) */
+    int32_t localShadows;    /* gNewDawn.Shadows.PointLights: 0..2 lights that get a shadow cube map (needs the casters recorded) */
+    float localFocus[3];     /* the player's position: the shadow-casting lights are the ones that matter around it */
     /* New Dawn grass: render-only instanced tufts on grass-textured ground, drawn at the opaque-end marker. Needs HDR. */
     int32_t grassEnabled;
     float grassDensity;      /* 0..2 multiplier on the tuft count */
@@ -205,4 +209,25 @@ typedef struct NewDawnPostFxParams {
     float grassFocus[3];     /* the player's position: blades close to it are laid low (read-only snapshot) */
     float grassSunDir[3];    /* unit vector towards the sun; all zero when there is none */
     float grassSunColor[3];  /* sRGB 0..1 */
+    /* New Dawn interior polish (render only). Window and doorway openings are recorded by the interpreter from the draw
+       stream (textures named in newdawn_interior_textures.inc) and submitted at the opaque-end marker; the game side fills
+       the light (time of day, weather). Light through the openings: shafts in the air and pools on the surfaces. */
+#define NEWDAWN_INTERIOR_WINDOWS 12
+#define NEWDAWN_INTERIOR_WINDOW_FLOATS 16
+#define NEWDAWN_EMISSIVE_LIGHTS 8
+    int32_t interiorEnabled;       /* window light on (interiors only) */
+    float interiorStrength;        /* user multiplier */
+    float interiorSinElevation;    /* sin of the elevation of the beams (0 horizon .. 1 overhead) */
+    float interiorColor[3];        /* linear light colour including intensity (sun, dusk, moon), 0 = no light */
+    float interiorMotes;           /* dust in the beams, 0..1 */
+    int32_t interiorDebug;         /* 1: log recorded openings and texture draws */
+    int32_t interiorWindowCount;   /* filled by the interpreter */
+    /* Per opening: centre xyz, inward normal xyz, horizontal axis xyz, half width, half height, panes x, panes y, kind. */
+    float interiorWindows[NEWDAWN_INTERIOR_WINDOWS][NEWDAWN_INTERIOR_WINDOW_FLOATS];
+    /* Emissive surfaces: draws of the classified textures write stencil bits; the renderer adds HDR emission there. */
+    int32_t emissiveEnabled;
+    float emissiveStrength;        /* user multiplier */
+    float emissiveNight;           /* 0 day .. 1 night: how far the night-only glass glows */
+    int32_t emissiveLightCount;    /* filled by the interpreter: lamp/sign/window lights for the local-light pass */
+    float emissiveLights[NEWDAWN_EMISSIVE_LIGHTS][8]; /* world xyz, radius, linear rgb, intensity */
 } NewDawnPostFxParams;
