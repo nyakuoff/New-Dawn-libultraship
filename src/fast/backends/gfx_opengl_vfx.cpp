@@ -39,7 +39,7 @@ uniform float uEmbers, uGlowRadius;
 uniform int uFlameGlow; // gNewDawn.Lighting.FlameLight: the analytic flame bloom instead of the flat disc sprite
 uniform int uMode; // 0 flame layers, 1 embers
 out vec2 vUv;
-out float vViewZ, vAlpha, vLayerKind, vSeed, vSize;
+out float vViewZ, vAlpha, vLayerKind, vSeed, vSize, vTw;
 flat out int vLayer;
 out vec4 vPrim, vEnv;
 float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
@@ -67,6 +67,59 @@ void main() {
         vViewZ = w;
         vSize = H;
         vAlpha = aPrim.a * (l == 1 ? 0.55 : 1.0);
+        return;
+    }
+    if (uMode == 6) { // mask-transformation flash: a full-screen quad
+        vUv = vec2(u01.x, u01.y);
+        vViewZ = 1.0; vAlpha = 1.0; vLayerKind = 0.0; vSeed = 0.0; vSize = 1.0; vTw = 0.0; vLayer = 0;
+        gl_Position = vec4(q.x, q.y, 0.0, 1.0);
+        return;
+    }
+    if (uMode == 5) { // overlay effects: sparkles, lightning, frost, popped bubble (12 quads per recorded effect)
+        int cls = int(aA.x + 0.5);
+        int l = gl_InstanceID % 12;
+        vec2 hp = vec2(aB.y * uSize.x, aB.z * uSize.y) * 0.5; // half size in pixels
+        float hm = max(hp.x, hp.y);
+        vec2 pxc = vec2(aA.y, aA.z) * uSize * 0.5;
+        vec2 sz = vec2(0.0); // half extents of this quad, pixels
+        vec2 off = vec2(0.0);
+        float rot = 0.0;
+        int layer = 10;
+        float tm = uTime * (6.0 + 8.0 * hash(seed)) + seed * 40.0;
+        float p = aWorld.w * 7.0 / 4.0; // pop progress 0..1 over frames 1..5
+        if (cls == 6) {          // fairy sparkle / rupee glint: core, chromatic star halo, soft tail
+            if (l == 0) { sz = vec2(hm * 0.4); }
+            else if (l == 1) { sz = vec2(hm * 1.3); layer = 8; rot = 0.0; }
+            else if (l == 2) { sz = vec2(hm * 0.12, hm * 0.75); off = vec2(0.0, -hm * 0.65); }
+        } else if (cls == 17) {  // frost sparkle on an ice fragment
+            float hs = clamp(hm * 0.9, 4.0, 16.0);
+            if (l == 0) { sz = vec2(hs * 0.55); }
+            else if (l == 1) { sz = vec2(hs * 1.5); layer = 8; }
+            else if (l == 2) { sz = vec2(hs * 0.95); layer = 8; rot = 0.7854; }
+        } else if (cls == 18) {  // popped bubble: droplets, ring, flash
+            float R = hm * 1.1;
+            if (l < 10) {
+                float a = (float(l) + hash(seed + float(l))) / 10.0 * 6.2832;
+                float sp = 0.55 + 0.7 * hash(seed * 1.7 + float(l) * 3.1);
+                vec2 d = vec2(cos(a), sin(a) * 0.8);
+                off = d * R * sp * (0.25 + 1.1 * p) + vec2(0.0, -R * 0.55 * p * p);
+                sz = vec2(R * (0.075 + 0.05 * hash(seed + float(l) * 5.3)) * (1.0 - 0.45 * p));
+            } else if (l == 10) { sz = vec2(R * (0.5 + 0.8 * p)); }
+            else { sz = vec2(R * 0.9); }
+        }
+        float c = cos(rot), sn = sin(rot);
+        vec2 local = vec2(c * q.x - sn * q.y, sn * q.x + c * q.y) * sz;
+        vec2 ndc = (pxc + off + local) / (uSize * 0.5);
+        vUv = vec2(u01.x, 1.0 - u01.y);
+        vLayer = layer;
+        vLayerKind = float(cls * 100 + l);
+        vSeed = p;
+        vViewZ = w;
+        vSize = max(H, 4.0);
+        vAlpha = aPrim.a;
+        gl_Position = vec4(ndc.x * w, ndc.y * uFlipY * w, 0.0, w);
+        vPrim = aPrim; vEnv = aEnv;
+        vTw = tm;
         return;
     }
     if (uMode == 4) { // magic arrow: a chain of sprites along the model's screen-space axis (24 per arrow)
@@ -176,7 +229,7 @@ void main() {
 
 const char* kFragment = R"GLSL(#version 330 core
 in vec2 vUv;
-in float vViewZ, vAlpha, vLayerKind, vSeed, vSize;
+in float vViewZ, vAlpha, vLayerKind, vSeed, vSize, vTw;
 flat in int vLayer;
 in vec4 vPrim, vEnv;
 out vec4 oColor;
@@ -185,15 +238,33 @@ uniform sampler2D uDepth;
 uniform vec2 uSize, uNearFar;
 uniform float uStrength;
 uniform vec3 uLit;
+uniform vec4 uFlash;
 uniform int uMode, uDebug, uFlameGlow;
 float linearDepth(float d) {
     return 2.0*uNearFar.x*uNearFar.y / max(uNearFar.y+uNearFar.x-(2.0*d-1.0)*(uNearFar.y-uNearFar.x),0.001);
 }
 void main() {
     if (vViewZ <= 0.0 || vAlpha < 0.002) discard;
+    if (uMode == 6) {
+        // The game fills the screen with a flat colour whose alpha ramps up (hiding the model swap), holds, and ramps down.
+        // Same alpha timeline, but the light leads from the centre with a radial burst, so the ramp is a bloom of rays
+        // rather than a grey veil; at full alpha it is the same solid fill, so the swap stays hidden.
+        float a = uFlash.a;
+        vec2 d = (vUv - vec2(0.5, 0.52)) * vec2(uSize.x / uSize.y, 1.0) * 2.0;
+        float r = length(d);
+        float ang = atan(d.y, d.x);
+        float rays = 0.6 * pow(abs(cos(ang * 7.0 + 0.8)), 22.0) + 0.4 * pow(abs(cos(ang * 13.0 + 2.3)), 40.0);
+        float fall = exp(-r * 1.5);
+        float core = exp(-r * r * 4.5);
+        float lead = clamp(a * (1.0 + 0.9 * fall * (0.7 + rays)), 0.0, 1.0);
+        float burst = a * (1.0 - a) * 4.0; // peaks mid-ramp, zero when the screen is solid
+        vec3 rgb = uFlash.rgb * (1.0 + burst * (3.2 * core + 2.4 * rays * fall));
+        oColor = vec4(rgb * lead, lead);
+        return;
+    }
     float scene = linearDepth(texture(uDepth, gl_FragCoord.xy / uSize).r);
     // Geometry nearer than the flame hides it; the sprite is allowed to sit slightly inside its own holder.
-    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + ((uMode == 3 || uMode == 4) ? 0.35 : 0.6), 0.0, 1.0);
+    float soft = clamp((scene - vViewZ) / max(vSize, 4.0) + ((uMode >= 3) ? 0.35 : 0.6), 0.0, 1.0);
     vec4 t;
     if (uMode == 0) {
         float f0 = floor(vSeed);
@@ -204,6 +275,49 @@ void main() {
     float v = t.r * t.a;
     vec3 rgb;
     float a;
+    if (uMode == 5) { // overlay effects (the native draw is still underneath)
+        int k = int(vLayerKind + 0.5);
+        int cls = k / 100, l = k - cls * 100;
+        vec2 d = vUv * 2.0 - 1.0;
+        float r2 = dot(d, d);
+        float tw = 0.7 + 0.3 * sin(vTw);
+        vec3 base = mix(vEnv.rgb, vPrim.rgb, 0.5);
+        vec3 c = vec3(0.0);
+        float al = 0.0;
+        if (cls == 6) {
+            // Subtle chromatic twinkle: the halo's hue drifts around the game's colour as the sparkle shimmers.
+            vec3 hue = 0.5 + 0.5 * cos(6.2832 * (vTw * 0.12 + vec3(0.0, 0.33, 0.67)));
+            if (l == 0) { c = mix(vec3(1.0), base, 0.3) * 3.2 * tw; al = exp(-r2 * 8.0) * vAlpha; }
+            else if (l == 1) { c = mix(base, hue, 0.45) * 2.0 * tw; al = t.a * t.r * vAlpha * 0.4; }
+            else { // tail: a soft falloff trailing below the glint
+                c = mix(base, hue, 0.3) * 1.4; al = pow(max(1.0 - abs(d.x), 0.0), 3.0) * (1.0 - vUv.y) * smoothstep(0.0, 0.25, vUv.y) * vAlpha * 0.16 * tw;
+            }
+        } else if (cls == 17) {
+            vec3 frost = vec3(0.62, 0.86, 1.0);
+            float flick = 0.35 + 0.65 * smoothstep(0.3, 1.0, 0.5 + 0.5 * sin(vTw * 1.3));
+            if (l == 0) { c = mix(frost, vec3(1.0), 0.6) * 4.0; al = exp(-r2 * 10.0) * vAlpha * flick; }
+            else { c = mix(frost, vec3(1.0), l == 1 ? 0.5 : 0.7) * 2.8; al = t.a * t.r * vAlpha * flick * (l == 1 ? 0.8 : 0.5); }
+        } else if (cls == 18) {
+            float p = vSeed;
+            if (l < 10) {
+                // droplet: bright rim with a specular highlight, thin-film tint
+                vec3 film = 0.5 + 0.5 * cos(6.2832 * (float(l) * 0.11 + p * 0.5 + vec3(0.0, 0.33, 0.67)));
+                float edge = smoothstep(0.35, 1.0, sqrt(r2));
+                float spec = exp(-dot(d - vec2(-0.3, 0.32), d - vec2(-0.3, 0.32)) * 18.0);
+                c = mix(vec3(0.85, 0.95, 1.0), film, 0.45) * (0.7 + 1.6 * edge) + vec3(3.0) * spec;
+                al = (1.0 - smoothstep(0.85, 1.0, sqrt(r2))) * (1.0 - p) * vAlpha * 0.9 * step(p, 0.99);
+            } else if (l == 10) {
+                float rr = sqrt(r2);
+                float ring = exp(-pow((rr - 0.82) * 9.0, 2.0));
+                vec3 film = 0.5 + 0.5 * cos(6.2832 * (rr * 1.5 + p + vec3(0.0, 0.33, 0.67)));
+                c = mix(vec3(1.0), film, 0.55) * 2.2; al = ring * (1.0 - p) * vAlpha * 0.7 * step(p, 0.99);
+            } else {
+                c = vec3(0.8, 0.95, 1.0) * 3.0; al = exp(-r2 * 7.0) * (1.0 - p) * (1.0 - p) * vAlpha * 0.6 * step(p, 0.99);
+            }
+        }
+        oColor = vec4(c * al * soft * uStrength, 0.0);
+        return;
+    }
     if (uMode == 4) { // magic arrows: HDR in the arrow's own prim/env colours
         int cls = int(vLayerKind / 10.0 + 0.01);
         int role = int(vLayerKind + 0.5) - cls * 10;
@@ -446,7 +560,8 @@ bool PostFxGL::BuildVfxProgram() {
 }
 
 void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
-    if (!mVfxData || mVfxCount == 0 || !BuildVfxProgram())
+    const bool flashOn = p.vfxFlash[3] > 0.0f;
+    if (((!mVfxData || mVfxCount == 0) && !flashOn) || !BuildVfxProgram())
         return;
     Use(mVfx);
     glActiveTexture(GL_TEXTURE0 + kSpriteUnit);
@@ -475,9 +590,9 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
     glUniform1f(Loc("uTime"), static_cast<float>(std::fmod(seconds, 3600.0)));
 
-    std::vector<float> flames, glows, puffs, arrows;
+    std::vector<float> flames, glows, puffs, arrows, overlays;
     mFlameLights.clear();
-    for (uint32_t i = 0; i < mVfxCount; ++i) {
+    for (uint32_t i = 0; mVfxData && i < mVfxCount; ++i) {
         const float* f = mVfxData + (size_t)i * NEWDAWN_VFX_FLOATS;
         if (f[0] == 1.0f) {
             flames.insert(flames.end(), f, f + NEWDAWN_VFX_FLOATS);
@@ -485,12 +600,14 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
         }
         else if (f[0] == 2.0f)
             glows.insert(glows.end(), f, f + NEWDAWN_VFX_FLOATS);
+        else if (f[0] >= 17.0f || f[0] == 6.0f)
+            overlays.insert(overlays.end(), f, f + NEWDAWN_VFX_FLOATS);
         else if (f[0] >= 9.0f)
             arrows.insert(arrows.end(), f, f + NEWDAWN_VFX_FLOATS);
         else if (f[0] >= 3.0f)
             puffs.insert(puffs.end(), f, f + NEWDAWN_VFX_FLOATS);
     }
-    if (flames.empty() && glows.empty() && puffs.empty() && arrows.empty())
+    if (flames.empty() && glows.empty() && puffs.empty() && arrows.empty() && overlays.empty() && !flashOn)
         return;
     if (p.shadowEnabled) {
         float lit[3];
@@ -516,6 +633,15 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glBindVertexArray(mVfxVao);
     glBindBuffer(GL_ARRAY_BUFFER, mVfxVbo);
+    if (flashOn) {
+        static const float zero[NEWDAWN_VFX_FLOATS] = {};
+        glBufferData(GL_ARRAY_BUFFER, sizeof(zero), zero, GL_STREAM_DRAW);
+        glUniform1i(Loc("uMode"), 6);
+        glUniform4f(Loc("uFlash"), p.vfxFlash[0], p.vfxFlash[1], p.vfxFlash[2], std::clamp(p.vfxFlash[3], 0.0f, 1.0f));
+        for (int i = 0; i < 5; ++i)
+            glVertexAttribDivisor(i, 1);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, 1);
+    }
     if (ng > 0) {
         glBufferData(GL_ARRAY_BUFFER, glows.size() * sizeof(float), glows.data(), GL_STREAM_DRAW);
         glUniform1i(Loc("uMode"), 2);
@@ -529,6 +655,13 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
         for (int i = 0; i < 5; ++i)
             glVertexAttribDivisor(i, 2);
         glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)(puffs.size() / NEWDAWN_VFX_FLOATS) * 2);
+    }
+    if (!overlays.empty()) {
+        glBufferData(GL_ARRAY_BUFFER, overlays.size() * sizeof(float), overlays.data(), GL_STREAM_DRAW);
+        glUniform1i(Loc("uMode"), 5);
+        for (int i = 0; i < 5; ++i)
+            glVertexAttribDivisor(i, 12);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)(overlays.size() / NEWDAWN_VFX_FLOATS) * 12);
     }
     if (!arrows.empty()) {
         if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.Debug", 0))
