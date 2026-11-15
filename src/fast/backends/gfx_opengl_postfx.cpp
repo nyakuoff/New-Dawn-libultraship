@@ -7020,11 +7020,11 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
             // Reach follows the flame's size (a candle a few steps, a brazier a few body lengths); the colour is the
             // game's own pulled toward a warm fire colour; intensity is raised for fires only.
             pos[count][3] = std::clamp(std::clamp(flameH * 10.0f, 130.0f, 300.0f) * flameReach, 90.0f, 700.0f); // the flame's own size, not the game's (large, soft) light radius
-            const float warmFire[3] = { 1.0f, 0.60f, 0.28f };
+            const float warmFire[3] = { 1.0f, 0.52f, 0.20f };
             const float lum = 0.2126f * lightRgb[0] + 0.7152f * lightRgb[1] + 0.0722f * lightRgb[2];
             for (int i = 0; i < 3; ++i)
-                lightRgb[i] = lightRgb[i] * 0.35f + warmFire[i] * (lum / 0.662f) * 0.65f; // 0.662: the luminance of warmFire
-            gain = 6.0f * flameGain;
+                lightRgb[i] = lightRgb[i] * 0.2f + warmFire[i] * (lum / 0.60f) * 0.8f; // 0.60: the luminance of warmFire
+            gain = 8.0f * flameGain;
         }
         for (int i = 0; i < 3; ++i) {
             rgb[count][i] = lightRgb[i] * k * f * boost * gain * params.localStrength * params.localGain * 4.0f;
@@ -7163,7 +7163,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         for (int i = 0; i < kMax; ++i)
             flame[i] = mLocalFlame[i] ? 1.0f : 0.0f;
         glUniform1fv(Loc("uLightFlame"), kMax, flame);
-        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.26f), 0.0f, 0.6f));
+        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.32f), 0.0f, 0.6f));
     }
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
