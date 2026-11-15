@@ -1184,8 +1184,42 @@ void GfxRenderingAPIOGL::Init() {
 void GfxRenderingAPIOGL::OnResize() {
 }
 
+extern float gNewDawnGpuFrameMs; // gfx_opengl_postfx.cpp, read via NewDawnPerfGet
+static GLuint stamps[4][2] = {};
+static bool stampPending[4] = {}; // set once the end timestamp is issued
+static int stampSlot = 0;
+
 void GfxRenderingAPIOGL::StartFrame() {
 #ifndef USE_OPENGLES
+    // Whole-frame GPU time for the performance overlay: timestamp pair per frame, read back once available.
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Perf.Overlay", 0) != 0) {
+        if (!stamps[0][0]) {
+            glGenQueries(8, &stamps[0][0]);
+        }
+        for (int i = 0; i < 4; i++) {
+            GLint ready = 0;
+            if (stampPending[i]) {
+                glGetQueryObjectiv(stamps[i][1], GL_QUERY_RESULT_AVAILABLE, &ready);
+            }
+            if (ready) {
+                GLuint64 a = 0, b = 0;
+                glGetQueryObjectui64v(stamps[i][0], GL_QUERY_RESULT, &a);
+                glGetQueryObjectui64v(stamps[i][1], GL_QUERY_RESULT, &b);
+                gNewDawnGpuFrameMs += (static_cast<float>((b - a) / 1e6) - gNewDawnGpuFrameMs) * 0.1f;
+                stampPending[i] = false;
+            }
+        }
+        if (!stampPending[stampSlot]) {
+            glQueryCounter(stamps[stampSlot][0], GL_TIMESTAMP);
+            mFrameStamp = stampSlot;
+            stampSlot = (stampSlot + 1) % 4;
+        } else {
+            mFrameStamp = -1;
+        }
+        mFrameStampQueries = &stamps[0][0];
+    } else {
+        mFrameStamp = -1;
+    }
     mDrawStats =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Debug.Stats", 0) != 0;
     if (mDrawStats) {
@@ -1221,6 +1255,12 @@ void GfxRenderingAPIOGL::StartFrame() {
 }
 
 void GfxRenderingAPIOGL::EndFrame() {
+#ifndef USE_OPENGLES
+    if (mFrameStamp >= 0) {
+        glQueryCounter(mFrameStampQueries[mFrameStamp * 2 + 1], GL_TIMESTAMP);
+        stampPending[mFrameStamp] = true;
+    }
+#endif
     glFlush();
 }
 
