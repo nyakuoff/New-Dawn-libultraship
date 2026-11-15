@@ -142,6 +142,11 @@ class GfxRenderingAPI {
     }
     virtual void FinishWorld() {
     }
+    // New Dawn TAA: this frame's un-jittered camera (row-major view-projection in the projection's own pre-aspect
+    // clip space, plus the NDC mapping the post passes use). Called right after the HDR world opens.
+    virtual void SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar,
+                              float jitterPxX, float jitterPxY) {
+    }
 
     virtual bool PostFxAvailable() {
         return false;

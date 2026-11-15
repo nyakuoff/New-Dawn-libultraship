@@ -1,6 +1,6 @@
 #pragma once
 // Read-only GPU timings for the New Dawn performance overlay. Call NewDawnPerfGet from the render (GL) thread.
-#define NEWDAWN_PERF_STAGES 21
+#define NEWDAWN_PERF_STAGES 22
 
 struct NewDawnPerfInfo {
     float gpuFrameMs;                    // whole-frame GPU time (timestamps), 0 until the first result

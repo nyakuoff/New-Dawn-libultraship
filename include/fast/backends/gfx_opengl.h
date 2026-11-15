@@ -121,6 +121,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DrawMM3DRoom(const NewDawnMM3DRoomParams&, const float*, float, float, const NewDawnMM3DScroll*) override;
     bool HdrWorldActive() const override;
     void FinishWorld() override;
+    void SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar, float jitterPxX,
+                      float jitterPxY) override;
     void StartFrame() override;
     void EndFrame() override;
     void FinishRender() override;

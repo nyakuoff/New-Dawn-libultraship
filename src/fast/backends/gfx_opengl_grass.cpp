@@ -443,6 +443,14 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
     glDepthMask(GL_TRUE);
     if (a2c)
         glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+    // Tuft fragments write stencil 2 (characters write 1) so TAA can treat swaying blades as their own class. Only
+    // when this frame's stencil was cleared at the start of the world (the game never uses it otherwise).
+    if (mLocalMarking) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glStencilFunc(GL_ALWAYS, 2, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    }
 
     glBindVertexArray(mGrassVao);
     glBindBuffer(GL_ARRAY_BUFFER, mGrassVbo);
@@ -474,6 +482,11 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
     glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
+    if (mLocalMarking) {
+        glDisable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 0, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
     CheckError("grass");
 }
 } // namespace Fast

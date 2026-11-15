@@ -2466,6 +2466,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     if (parameters & mtx_projection) {
         if (parameters & mtx_load) {
             memcpy(mRsp->P_matrix, matrix, sizeof(matrix));
+            if (mTaaJitter) {
+                JitterProjection();
+            }
         } else {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
@@ -2491,6 +2494,86 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         mMatrixLoadsSinceLights++;
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
+}
+
+// New Dawn TAA. The game loads its projection (G_MTX_LOAD) and then multiplies the view into it, so a clip-space shift
+// applied right after the load ends up as the rightmost factor of the final view-projection. Only perspective
+// projections are shifted: orthographic ones (screen fills, HUD-style 3D) stay on the pixel grid.
+void Interpreter::JitterProjection() {
+    float (*P)[4] = mRsp->P_matrix;
+    if (mFbActive || (P[0][3] == 0.0f && P[1][3] == 0.0f && P[2][3] == 0.0f)) {
+        return;
+    }
+    for (int r = 0; r < 4; r++) {
+        P[r][0] += mTaaOffset[0] * P[r][3];
+        P[r][1] += mTaaOffset[1] * P[r][3];
+    }
+}
+
+static float Halton(uint32_t index, uint32_t base) {
+    float f = 1.0f, r = 0.0f;
+    while (index > 0) {
+        f /= (float)base;
+        r += f * (float)(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+// Called right after the renderer opened the HDR world (WORLD_BEGIN). The camera loaded before the marker is still the
+// current P here: hand its un-jittered form to the renderer for reprojection, then shift it for everything that
+// follows.
+void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
+    mTaaJitter = false;
+    if (!mRapi->HdrWorldActive()) {
+        return;
+    }
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const bool taa = cvars->GetInteger("gNewDawn.TAA.Enabled", 0) != 0;
+    // Debug only (measurement fixture): a deterministic constant-speed sideways camera pan in pixels per rendered frame
+    // (gNewDawn.TAA.DebugPan). It is a real part of the camera as far as TAA is concerned, and works with TAA off too.
+    const float pan = cvars->GetFloat("gNewDawn.TAA.DebugPan", 0.0f);
+    if (!taa && pan == 0.0f) {
+        return;
+    }
+    const float (*P)[4] = mRsp->P_matrix;
+    if (P[0][3] == 0.0f && P[1][3] == 0.0f && P[2][3] == 0.0f) {
+        return; // not a perspective camera (nothing sensible to reproject)
+    }
+    const float xScale = AdjXForAspectRatio(1.0f);
+    const float ndcXScale = xScale > 1e-6f ? 1.0f / xScale : 1.0f;
+    const float flipY = mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
+    const float w = (float)std::max<int>(mCurDimensions.width, 1), h = (float)std::max<int>(mCurDimensions.height, 1);
+    const uint32_t frame = mTaaIndex++;
+    // Pixel offsets become clip-space shifts in the projection's own x/y (the mapping the post passes use to
+    // unproject).
+    const float panPx = pan * (float)frame;
+    const float panX = panPx * 2.0f / w * ndcXScale;
+    float jitterX = 0.0f, jitterY = 0.0f, jitterPxX = 0.0f, jitterPxY = 0.0f;
+    if (taa) {
+        // 16-sample Halton(2,3), centred on the pixel: offsets within (-0.5, 0.5) pixels.
+        const uint32_t i = (frame % 16) + 1;
+        jitterPxX = Halton(i, 2) - 0.5f;
+        jitterPxY = Halton(i, 3) - 0.5f;
+        jitterX = jitterPxX * 2.0f / w * ndcXScale;
+        jitterY = jitterPxY * 2.0f / h * flipY;
+        // The camera the renderer reprojects with: loaded before this marker, so still the current P; the pan is part
+        // of it, the jitter is not.
+        float vp[16];
+        for (int r = 0; r < 4; r++) {
+            vp[r * 4 + 0] = P[r][0] + panX * P[r][3];
+            vp[r * 4 + 1] = P[r][1];
+            vp[r * 4 + 2] = P[r][2];
+            vp[r * 4 + 3] = P[r][3];
+        }
+        mRapi->SetTaaCamera(vp, ndcXScale, flipY, params.zNear, params.zFar, jitterPxX, jitterPxY);
+    }
+    mTaaOffset[0] = panX + jitterX;
+    mTaaOffset[1] = jitterY;
+    mTaaJitter = true;
+    JitterProjection();
+    MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[std::max<int>(mRsp->modelview_matrix_stack_size, 1) - 1],
+              mRsp->P_matrix);
 }
 
 void Interpreter::GfxSpPopMatrix(uint32_t count) {
@@ -5529,9 +5612,13 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             }
         }
         gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
+        if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
+            gfx->BeginTaa(effective);
+        }
     }
     if (stage == NEWDAWN_POSTFX_STAGE_SCENE_END) {
         gfx->mVfx = false; // stop recording until the next frame's begin marker
+        gfx->mTaaJitter = false; // the HUD and everything after the world stays on the pixel grid
     }
     return false;
 }
@@ -6638,6 +6725,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    mTaaJitter = false;
     mRapi->FinishWorld(); // also closes a partial/debugger display-list walk
     if (mWindProfile && ++mWindProfileFrames == 300) {
         SPDLOG_INFO("NewDawn wind CPU: {:.4f} ms/frame, {:.1f} triangles/frame (300 frames, timer overhead included)",

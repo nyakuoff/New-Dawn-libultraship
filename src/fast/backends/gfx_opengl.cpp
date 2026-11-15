@@ -1691,6 +1691,15 @@ bool GfxRenderingAPIOGL::HdrWorldActive() const {
 #endif
 }
 
+void GfxRenderingAPIOGL::SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar,
+                                      float jitterPxX, float jitterPxY) {
+#ifndef USE_OPENGLES
+    if (mPostFx && mPostFx->HdrActive()) {
+        mPostFx->SetTaaCamera(viewProj, ndcXScale, flipY, zNear, zFar, jitterPxX, jitterPxY, mFrameCount);
+    }
+#endif
+}
+
 void GfxRenderingAPIOGL::FinishWorld() {
 #ifndef USE_OPENGLES
     if (mHdrGameFb >= 0 && mPostFx && mPostFx->HdrActive()) {
