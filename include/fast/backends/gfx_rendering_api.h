@@ -182,6 +182,9 @@ class GfxRenderingAPI {
     // New Dawn world GI: NEWDAWN_GI_TRI_FLOATS floats per recorded room triangle; valid until RunPostFx returns.
     virtual void SetGiTriangles(const float* data, uint32_t count) {
     }
+    // New Dawn rivers and waterfalls: NEWDAWN_FLOW_TRI_FLOATS floats per recorded triangle; valid until RunPostFx returns.
+    virtual void SetFlowTriangles(const float* data, uint32_t count) {
+    }
     // True on the frames the renderer wants the room geometry recorded (always after a scene change, then periodically).
     virtual bool GiWantsGeometry() const {
         return false;

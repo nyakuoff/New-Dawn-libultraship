@@ -33,6 +33,10 @@
 /* One recorded grass ground triangle: world xyz of its three vertices. */
 #define NEWDAWN_GRASS_TRI_FLOATS 9
 
+/* One recorded flowing-water triangle: world xyz of its three vertices, the world-space velocity of its texture scroll
+   (units per second), kind (0 river surface, 1 waterfall). Read-only snapshot for the rivers and waterfalls pass. */
+#define NEWDAWN_FLOW_TRI_FLOATS 14
+
 /* One recorded world-GI room triangle: per vertex world xyz, reflectance rgb, face normal xyz, baked (0 lit, 1 unlit). */
 #define NEWDAWN_GI_TRI_FLOATS 30
 
@@ -251,4 +255,8 @@ typedef struct NewDawnPostFxParams {
     float emissiveNight;           /* 0 day .. 1 night: how far the night-only glass glows */
     int32_t emissiveLightCount;    /* filled by the interpreter: lamp/sign/window lights for the local-light pass */
     float emissiveLights[NEWDAWN_EMISSIVE_LIGHTS][8]; /* world xyz, radius, linear rgb, intensity */
+    /* New Dawn rivers and waterfalls (docs/WATER_SIM.md): flow-mapped streaks on river surfaces and livelier falling
+       water with spray. Strengths 0..2, 0 = off; the flow comes from the native texture scroll the interpreter records. */
+    float waterRivers;
+    float waterFalls;
 } NewDawnPostFxParams;

@@ -491,6 +491,10 @@ class Interpreter {
     uint8_t InteriorClassify(std::string_view path);
     void RecordInteriorTriangle(const LoadedVertex* const v[3], uint8_t idx);
     void SubmitInterior(NewDawnPostFxParams& params);
+    // New Dawn rivers and waterfalls: scrolling river surfaces and waterfall faces, with the world-space velocity of the
+    // native texture scroll (NEWDAWN_FLOW_TRI_FLOATS each), handed to the renderer at the water marker. Read-only.
+    void BeginFlowRecording(bool rivers, bool falls, const NewDawnPostFxParams& params);
+    void RecordFlowTriangle(const LoadedVertex* const v[3]);
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
@@ -693,6 +697,21 @@ class Interpreter {
     std::vector<float> mGiTris; // NEWDAWN_GI_TRI_FLOATS floats each
     std::unordered_map<uint64_t, std::array<float, 4>> mGiTexAverage; // texture data (and palette) -> mean colour
     // New Dawn interior polish: world-space triangles of window/emissive textures (11 floats each, see RecordInteriorTriangle).
+    bool mFlow = false, mFlowRivers = false, mFlowFalls = false, mFlowDebug = false;
+    int mFlowBoxCount = 0;
+    float mFlowBoxes[NEWDAWN_MAX_WATER_BOXES][5] = {};
+    std::vector<float> mFlowTris;
+    struct FlowScroll {
+        bool seen = false;
+        int32_t uls = 0, ult = 0;
+        int du = 0, dv = 0;          // the last offset step
+        float su = 0.0f, sv = 0.0f; // texels per second, set once two consecutive steps agree
+    };
+    uint32_t mFlowDebugFrames = 0;
+    std::map<std::string, std::array<float, 6>> mFlowDebugBoxes; // FlowDebug: extents of the scrolling textures
+    std::unordered_map<uint64_t, FlowScroll> mFlowScroll;     // (texture, tile) -> last scroll offset and its velocity
+    std::unordered_map<const void*, uint8_t> mFlowRiverClass; // texture resource -> 1 when it is a painted river texture
+    std::unordered_map<const void*, uint8_t> mFlowFallClass;  // texture resource -> 1 when it is a waterfall texture
     bool mInterior = false, mInteriorDebug = false;
     std::vector<float> mInteriorTris;
     uint8_t mBufMark = 0, mBufMarkNext = 0;
