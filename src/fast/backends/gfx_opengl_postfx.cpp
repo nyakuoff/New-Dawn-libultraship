@@ -1057,8 +1057,8 @@ uniform mat4 uViewProj;
 uniform int uLightCount;
 uniform vec4 uLight[24];    // world position, range
 uniform vec3 uLightRgb[24]; // HDR radiance (strength and flicker already applied)
-uniform float uLightFlame[24]; // 1 for fire lights (torches, braziers, candles): they light dark surfaces better, see uFlameAlbedo
-uniform float uFlameAlbedo;
+uniform float uLightFlame[24]; // 1 for fire lights (torches, braziers, candles): they light dark surfaces better, see uFlameExp
+uniform float uFlameExp, uFlameScale; // fire light: albedo' = max(albedo, albedo^exp * scale)
 uniform float uDebug;
 uniform float uDarken;
 uniform float uFogMul;
@@ -1215,9 +1215,10 @@ void main() {
         oFactor = vec4(0.0);
         return;
     }
-    // Fire light on a dark surface: the dark authored colour would swallow it, so fires see at least this albedo (only
+    // Fire light on a dark surface: the dark authored colour would swallow it, so fires see a gently lifted albedo (only
     // where their light reaches; the unlit scene between the lights keeps its darkness).
-    vec3 albedoF = max(albedo, vec3(uFlameAlbedo));
+    // The lift keeps the surface's own contrast: a gamma lift (exponent < 1) of the texture albedo, never a constant colour.
+    vec3 albedoF = max(albedo, pow(albedo, vec3(uFlameExp)) * uFlameScale);
     oColor = vec4((albedo * E + albedoF * Ef) * need, 0.0);
     oFactor = vec4(clamp(base / max(c, vec3(0.0001)), 0.0, 1.0), 1.0);
 }
@@ -7019,12 +7020,12 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
         if (flameH > 0.0f && boost >= 0.99f) {
             // Reach follows the flame's size (a candle a few steps, a brazier a few body lengths); the colour is the
             // game's own pulled toward a warm fire colour; intensity is raised for fires only.
-            pos[count][3] = std::clamp(std::clamp(flameH * 10.0f, 130.0f, 300.0f) * flameReach, 90.0f, 700.0f); // the flame's own size, not the game's (large, soft) light radius
+            pos[count][3] = std::clamp(std::clamp(flameH * 9.0f, 130.0f, 260.0f) * flameReach, 90.0f, 700.0f); // the flame's own size, not the game's (large, soft) light radius
             const float warmFire[3] = { 1.0f, 0.52f, 0.20f };
             const float lum = 0.2126f * lightRgb[0] + 0.7152f * lightRgb[1] + 0.0722f * lightRgb[2];
             for (int i = 0; i < 3; ++i)
                 lightRgb[i] = lightRgb[i] * 0.2f + warmFire[i] * (lum / 0.60f) * 0.8f; // 0.60: the luminance of warmFire
-            gain = 8.0f * flameGain;
+            gain = 7.5f * flameGain;
         }
         for (int i = 0; i < 3; ++i) {
             rgb[count][i] = lightRgb[i] * k * f * boost * gain * params.localStrength * params.localGain * 4.0f;
@@ -7153,7 +7154,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         const float soft = std::clamp(CvFloat("gNewDawn.Shadows.PointSoftness", 1.0f), 0.0f, 3.0f);
         const int size = mPointShadow[0].size > 0 ? mPointShadow[0].size : 256;
         // light radius, cube texel angle (a 90 degree face), bias scale
-        glUniform3f(Loc("uPsParams"), 7.0f * soft, 2.0f / (float)size, 1.0f);
+        glUniform3f(Loc("uPsParams"), 11.0f * soft, 2.0f / (float)size, 1.0f);
         glUniform1f(Loc("uPsDebug"), (float)CvInt("gNewDawn.Shadows.PointDebug", 0));
     }
     glUniform4fv(Loc("uLight"), kMax, &pos[0][0]);
@@ -7163,7 +7164,9 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         for (int i = 0; i < kMax; ++i)
             flame[i] = mLocalFlame[i] ? 1.0f : 0.0f;
         glUniform1fv(Loc("uLightFlame"), kMax, flame);
-        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.32f), 0.0f, 0.6f));
+        const float lift = std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.5f), 0.0f, 1.0f); // 0: none
+        glUniform1f(Loc("uFlameExp"), 1.0f - 0.4f * lift);
+        glUniform1f(Loc("uFlameScale"), 1.0f + 0.3f * lift);
     }
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
