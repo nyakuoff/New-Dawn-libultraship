@@ -135,6 +135,7 @@ class PostFxGL {
     static constexpr int kWaveDepthUnit = 32; // eighth-resolution blurred water depth (the wave taper)
     static constexpr int kRippleUnit = 33;    // GPU ripple height field around the player
     static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
+    static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
     }
@@ -226,6 +227,9 @@ class PostFxGL {
     void RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunUnderwater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     bool EnsureCausticAssets();
+    bool EnsureNightSkyAssets();
+    void RunNightStars(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void SetNightUniforms(const NewDawnPostFxParams& params);
     void RunVolumetricFog(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunSunShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunScreenShafts(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const float sunUv[2]);
@@ -288,6 +292,14 @@ class PostFxGL {
     Target mUwShaft; // half resolution underwater light shafts
     GLuint mCausticTex = 0, mCausticDummy = 0; // 32-layer caustics flipbook on unit kCausticUnit
     std::string mCausticAssetPath;
+    // Night sky: real star catalogue (point sprites) and the Milky Way panorama (unit kMilkyWayUnit; a dummy is
+    // always bound there so programs that never use it cannot trip sampler-type conflicts).
+    std::string mNightAssetPath;
+    GLuint mMilkyWayTex = 0, mMilkyWayDummy = 0, mStarVao = 0, mStarVbo = 0;
+    int mStarCount = 0;
+    float mMilkyWayScale = 1.0f;
+    Program mStars;
+    uint32_t mCloudsDrawnFrame = UINT32_MAX;
     uint32_t mShadowReadyFrame = UINT32_MAX; // settings frame whose sun shadow map is valid
     Program mShaftMarch, mShaftBlur, mShaftApply, mWater, mWaterReflection, mWaterReflectionApply, mWaterSurface;
     GLuint mCmpSampler = 0; // linear + depth-compare sampler for the shadow map (bound to its own texture unit)
@@ -362,7 +374,8 @@ class PostFxGL {
     float mKernel[16 * 3] = {};
 
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 20;
+    static constexpr int kQueryStages = 21;
+    static constexpr int kNightTimerStage = 20;
     static constexpr int kLocalTimerStage = 16;
     static constexpr int kCausticsTimerStage = 17;
     static constexpr int kUnderwaterTimerStage = 18;
