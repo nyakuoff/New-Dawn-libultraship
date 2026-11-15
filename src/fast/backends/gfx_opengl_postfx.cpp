@@ -1468,6 +1468,7 @@ uniform float uFlipY;  // -1 when the framebuffer is stored vertically flipped
 uniform float uRadius;
 uniform float uMaxPx;
 uniform vec3 uKernel[16];
+uniform int uStep; // 1: one AO texel per pixel; 2: half resolution (every sample position is a full-resolution pixel)
 
 const float kBayer[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
 
@@ -1479,19 +1480,23 @@ vec3 viewPos(ivec2 p, float d) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 q = ivec2(gl_FragCoord.xy);
+    ivec2 p = q * uStep; // full-resolution pixel this texel stands for
     float d0 = fetchDepth(p);
+    // The linear depth of the sample rides in green so the blur can weight by it without fetching the depth buffer.
+    float ld = linDepth(d0);
     if (d0 >= 0.99999) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
     vec3 P = viewPos(p, d0);
 
     // Normal from the neighbours on the side with the smaller depth step, which keeps silhouettes clean.
-    vec3 Pl = viewPos(p + ivec2(-1, 0), fetchDepth(p + ivec2(-1, 0)));
-    vec3 Pr = viewPos(p + ivec2(1, 0), fetchDepth(p + ivec2(1, 0)));
-    vec3 Pd = viewPos(p + ivec2(0, -1), fetchDepth(p + ivec2(0, -1)));
-    vec3 Pu = viewPos(p + ivec2(0, 1), fetchDepth(p + ivec2(0, 1)));
+    ivec2 sx = ivec2(uStep, 0), sy = ivec2(0, uStep);
+    vec3 Pl = viewPos(p - sx, fetchDepth(p - sx));
+    vec3 Pr = viewPos(p + sx, fetchDepth(p + sx));
+    vec3 Pd = viewPos(p - sy, fetchDepth(p - sy));
+    vec3 Pu = viewPos(p + sy, fetchDepth(p + sy));
     bool useR = (p.x == 0) || (p.x < uSize.x - 1 && abs(Pr.z - P.z) < abs(P.z - Pl.z));
     bool useU = (p.y == 0) || (p.y < uSize.y - 1 && abs(Pu.z - P.z) < abs(P.z - Pd.z));
     vec3 dx = useR ? (Pr - P) : (P - Pl);
@@ -1499,7 +1504,7 @@ void main() {
     vec3 n = cross(dx, dy);
     float nl = length(n);
     if (nl < 1e-8) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
     vec3 N = n / nl;
@@ -1516,12 +1521,15 @@ void main() {
     }
     float fade = smoothstep(1.5, 4.0, pxR); // far away the kernel shrinks below a pixel: fade out instead of popping
     if (fade <= 0.0) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
 
-    // Rotate the kernel around the normal by a per-pixel angle from a 4x4 pattern; the blur averages it away.
-    float ang = (kBayer[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0 * 6.2831853;
+    // Rotate the kernel around the normal by a per-texel angle from a 4x4 pattern (2x2 at half resolution, so the
+    // pattern spans the same four full-resolution pixels); the blur averages it away.
+    const float kBayer2[4] = float[4](0.0, 2.0, 3.0, 1.0);
+    float ang = uStep == 1 ? (kBayer[(q.y & 3) * 4 + (q.x & 3)] + 0.5) / 16.0 * 6.2831853
+                           : (kBayer2[(q.y & 1) * 2 + (q.x & 1)] + 0.5) / 4.0 * 6.2831853;
     vec3 rv = vec3(cos(ang), sin(ang), 0.0);
     vec3 T = rv - N * dot(rv, N);
     float tl = length(T);
@@ -1547,16 +1555,17 @@ void main() {
         occ += ((-S.z) - sd > bias) ? range : 0.0;
     }
     float ao = 1.0 - occ / 16.0;
-    oColor = vec4(vec3(mix(1.0, ao, fade)), 1.0);
+    oColor = vec4(mix(1.0, ao, fade), ld, 0.0, 1.0);
 }
 )GLSL";
 
 // Depth-aware blur of the AO buffer. Edge-stopping is relative to the AO radius (and a little to the distance, so
 // slanted floors still blur), which keeps the result from bleeding across silhouettes.
 static const char* kBlurLib = R"GLSL(
-uniform sampler2D uAo;
+uniform sampler2D uAo;  // red: occlusion, green: linear depth of the sample
 uniform ivec2 uDir;
 uniform float uRadius;
+uniform int uAoShift;   // log2 of the full-resolution pixels per AO texel side (1 for the half-resolution raw buffer, else 0)
 
 float blurAo(ivec2 p) {
     float dc = linDepth(fetchDepth(p));
@@ -1565,12 +1574,15 @@ float blurAo(ivec2 p) {
     float wsum = 0.0;
     for (int i = -4; i <= 4; i++) {
         ivec2 q = clamp(p + uDir * i, ivec2(0), uSize - 1);
-        float dz = (linDepth(fetchDepth(q)) - dc) / sigma;
+        vec2 t = texelFetch(uAo, q >> uAoShift, 0).rg;
+        float dz = (t.g - dc) / sigma;
         float w = exp(-dz * dz);
-        sum += texelFetch(uAo, q, 0).r * w;
+        sum += t.r * w;
         wsum += w;
     }
-    return sum / wsum;
+    // A half-resolution texel can belong to another surface than the pixel (a silhouette): when no tap matches the
+    // pixel's depth, take the nearest texel's occlusion instead of dividing zero by zero.
+    return wsum > 1e-4 ? sum / wsum : texelFetch(uAo, p >> uAoShift, 0).r;
 }
 )GLSL";
 
@@ -1579,7 +1591,7 @@ in vec2 vUv;
 out vec4 oColor;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    oColor = vec4(vec3(blurAo(p)), 1.0);
+    oColor = vec4(blurAo(p), linDepth(fetchDepth(p)), 0.0, 1.0);
 }
 )GLSL";
 
@@ -8116,8 +8128,11 @@ void PostFxGL::RunPointShadows(const NewDawnPostFxParams& params) {
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
     const int w = fb.width, h = fb.height;
-    EnsureTarget(mAoRaw, w, h, GL_R16F, GL_RED, GL_FLOAT, false, false);
-    EnsureTarget(mAoBlur, w, h, GL_R16F, GL_RED, GL_FLOAT, false, false);
+    // Raw occlusion at half resolution (gNewDawn.PostFx.AO.HalfRes, default 1): the kernel is wide and the two depth-aware
+    // blurs below average it over far more than a pixel anyway. Red holds the occlusion, green the sample's linear depth.
+    const int aoStep = CvInt("gNewDawn.PostFx.AO.HalfRes", 1) != 0 ? 2 : 1;
+    EnsureTarget(mAoRaw, (w + aoStep - 1) / aoStep, (h + aoStep - 1) / aoStep, GL_RG16F, GL_RG, GL_FLOAT, false, false);
+    EnsureTarget(mAoBlur, w, h, GL_RG16F, GL_RG, GL_FLOAT, false, false);
     if (!mUsable) {
         return;
     }
@@ -8147,6 +8162,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform1f(Loc("uMaxPx"), maxPx);
     glUniform3fv(Loc("uKernel"), 16, mKernel);
+    glUniform1i(Loc("uStep"), aoStep);
     Draw(mAoRaw);
     CheckError("AO pass");
 
@@ -8160,6 +8176,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uFar"), params.zFar);
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform2i(Loc("uDir"), 1, 0);
+    glUniform1i(Loc("uAoShift"), aoStep - 1);
     Draw(mAoBlur);
     CheckError("AO blur pass");
 
@@ -8173,6 +8190,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uFar"), params.zFar);
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform2i(Loc("uDir"), 0, 1);
+    glUniform1i(Loc("uAoShift"), 0);
     glUniform1f(Loc("uStrength"), s.aoStrength);
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
