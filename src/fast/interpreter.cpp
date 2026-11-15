@@ -2940,23 +2940,102 @@ static inline size_t SmoothHash(uint64_t key, const void* v0) {
 
 void Interpreter::SmoothBeginFrame() {
     if (mSmoothDebug && mSmooth) {
+        // Crack check over the frame just drawn: every triangle that drew an edge end (same two points, to the bit)
+        // must have given it the same offset, to the bit. Counted per frame, summed for the log.
+        static uint64_t ends = 0, differing = 0, apart = 0;
+        static float worst = 0.0f;
+        {
+            struct Key {
+                uint32_t k[6];
+                bool operator==(const Key& o) const {
+                    return memcmp(k, o.k, sizeof(k)) == 0;
+                }
+            };
+            struct KeyHash {
+                size_t operator()(const Key& key) const {
+                    uint64_t h = 0;
+                    for (uint32_t v : key.k) {
+                        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+                    }
+                    return (size_t)(h ^ (h >> 31));
+                }
+            };
+            std::unordered_map<Key, const SmoothCheck*, KeyHash> first;
+            first.reserve(mSmoothChecks.size());
+            for (const SmoothCheck& c : mSmoothChecks) {
+                Key key;
+                memcpy(key.k, c.a, sizeof(c.a));
+                memcpy(key.k + 3, c.b, sizeof(c.b));
+                const auto [it, added] = first.try_emplace(key, &c);
+                ends++;
+                if (added || (it->second->o[0] == c.o[0] && it->second->o[1] == c.o[1] && it->second->o[2] == c.o[2])) {
+                    continue; // equal as numbers (+0 and -0 are the same offset)
+                }
+                differing++;
+                float a[3], b[3];
+                memcpy(a, c.a, sizeof(a));
+                memcpy(b, c.b, sizeof(b));
+                const float d[3] = { c.o[0] - it->second->o[0], c.o[1] - it->second->o[1], c.o[2] - it->second->o[2] };
+                const float e[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+                const float rel = std::sqrt(SmoothDot(d, d) / std::max(SmoothDot(e, e), 1e-12f));
+                worst = std::max(worst, rel);
+                if (rel > 1e-3f) {
+                    apart++;
+                }
+                static int logged = 0;
+                if (logged < 60) {
+                    logged++;
+                    const SmoothCheck& f = *it->second;
+                    SPDLOG_INFO("SMOOTHDBG mismatch rel {:.5f} at {:.2f},{:.2f},{:.2f} edge {:.2f}: actor {} cmd {:x} kind {} "
+                                "mixed {} decal {} onface {} edgetris {} | actor {} cmd {:x} kind {} mixed {} decal {} "
+                                "onface {} edgetris {}",
+                                rel, a[0], a[1], a[2], std::sqrt(SmoothDot(e, e)), f.actor, f.key, f.kind, f.mixed,
+                                f.info & 1, f.info >> 1 & 1, f.info >> (2 + f.edge * 2) & 3, c.actor, c.key, c.kind,
+                                c.mixed, c.info & 1, c.info >> 1 & 1, c.info >> (2 + c.edge * 2) & 3);
+                    SPDLOG_INFO("SMOOTHDBG   mtx {}#{:08x} own {},{},{} g {},{},{} o {:.6f},{:.6f},{:.6f} | mtx {}#{:08x} own {},{},{} g {},{},{} o {:.6f},{:.6f},{:.6f}",
+                                f.mtxIdx, f.mtxHash, f.own[0], f.own[1], f.own[2], f.g[0], f.g[1], f.g[2], f.o[0], f.o[1], f.o[2],
+                                c.mtxIdx, c.mtxHash, c.own[0], c.own[1], c.own[2], c.g[0], c.g[1], c.g[2], c.o[0], c.o[1], c.o[2]);
+                }
+            }
+            mSmoothChecks.clear();
+        }
         static uint32_t frames = 0;
         static uint64_t ns = 0, patches = 0;
         ns += mSmoothStats.ns;
         patches += mSmoothStats.patches;
         if (++frames == 300 || mSmoothStats.analysed != 0) {
             SPDLOG_INFO("SMOOTHDBG {} patches/frame, {:.4f} ms CPU/frame over {} frames; cache {} triangles; this "
-                        "frame analysed {} new ({} put aside)",
+                        "frame analysed {} new ({} put aside); edge ends checked {}, not equal {}, apart by more "
+                        "than 0.1% of the edge {} (worst {:.4f})",
                         patches / frames, double(ns) / 1e6 / frames, frames, mSmoothCount, mSmoothStats.analysed,
-                        mSmoothStats.pending);
+                        mSmoothStats.pending, ends, differing, apart, worst);
             frames = 0;
             ns = patches = 0;
+            ends = differing = apart = 0;
+            worst = 0.0f;
         }
+    } else {
+        mSmoothChecks.clear();
     }
     mSmoothStats = {};
     mSmoothMtx.clear();
     mSmoothPending.clear();
-    mSmoothNewThisFrame = 0;
+    mSmoothActorStart = 0;
+    mSmoothActor = 0;
+    // Something new was seen: log this frame. Geometry that is new every frame (commands built per frame) would keep
+    // that going for ever, so a busy stretch is followed by a pause.
+    mSmoothLogging = mSmooth && mSmoothSawNew && mSmoothCooldown == 0;
+    mSmoothSawNew = false;
+    if (mSmoothLogging) {
+        mSmoothBusy += 4;
+        if (mSmoothBusy > 40) {
+            mSmoothBusy = 0;
+            mSmoothCooldown = 120;
+        }
+    } else {
+        mSmoothBusy = std::max(mSmoothBusy - 1, 0);
+        mSmoothCooldown = std::max(mSmoothCooldown - 1, 0);
+    }
     mSmoothCameraSet = false;
     mSmoothBaseDepth = ~size_t(0); // no actor yet
     mSmoothKey = 0;
@@ -3046,7 +3125,7 @@ Interpreter::SmoothTri* Interpreter::SmoothInsert(uint64_t key, const void* v0) 
 }
 
 // The cached data of the triangle being drawn when it is a character's; otherwise null. A lit triangle of an actor's
-// display list that has not been seen before is put aside for SmoothAnalyze and drawn as it is this once.
+// display list that is not in the cache is drawn as it is and makes the next frame a logged one.
 const Interpreter::SmoothTri* Interpreter::SmoothLookup(uint64_t key, const uint8_t idx[3]) {
     // Lit geometry (the colour bytes are a normal) inside a display list an actor called: Actor_Draw binds the lights
     // in the frame's own command buffer, so anything deeper than that is a model, not immediate geometry.
@@ -3066,57 +3145,151 @@ const Interpreter::SmoothTri* Interpreter::SmoothLookup(uint64_t key, const uint
             return nullptr;
         }
     }
+    // An actor may draw one display list several times (the segments of a ring, both arms), and what a triangle's
+    // neighbours are can differ between those draws: each gets its own entry, told apart by how many matrices the
+    // actor had loaded when it was drawn.
+    key ^= (uint64_t)mMatrixLoadsSinceLights << 48;
     SmoothTri* tri = SmoothFind(key, slot[0]->src);
+    const SmoothTri* cached = nullptr;
     if (tri != nullptr) {
         if (tri->v[1] == slot[1]->src && tri->v[2] == slot[2]->src) {
-            return tri->state == SMOOTH_TRI_CHARACTER ? tri : nullptr;
+            if (tri->state != SMOOTH_TRI_CHARACTER) {
+                return nullptr;
+            }
+            cached = tri;
+        } else if (tri->stale >= 4) {
+            return nullptr; // the command draws other vertices every time (built per frame): left alone after a few tries
+        } else if (mSmoothLogging) {
+            tri->stale++;
         }
-        // The command now draws other vertices (commands built per frame). A few tries, then it is left alone.
-        if (tri->stale >= 4) {
-            return nullptr;
+    }
+    if (cached == nullptr) {
+        mSmoothSawNew = true;
+    }
+    if (mSmoothLogging) {
+        if (mSmoothPending.size() >= 100000) {
+            mSmoothSawNew = true; // a bound on one frame's log; the rest follows
+            return cached;
         }
-        tri->stale++;
+        SmoothPending& p = mSmoothPending.emplace_back();
+        p.key = key;
+        p.decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+        p.fresh = cached == nullptr;
+        p.character = false;
+        p.actor = mSmoothActor;
+        for (int i = 0; i < 3; i++) {
+            p.v[i] = slot[i]->src;
+            p.mtx[i] = slot[i]->mtx;
+            memcpy(p.n[i], slot[i]->n, sizeof(p.n[i]));
+            memcpy(p.pos[i], mRsp->loaded_vertices[idx[i]].view_pos, sizeof(p.pos[i]));
+            const F3DVtx* source = (const F3DVtx*)slot[i]->src;
+            p.ob[i][0] = source->v.ob[0];
+            p.ob[i][1] = source->v.ob[1];
+            p.ob[i][2] = source->v.ob[2];
+        }
     }
-    if (mSmoothNewThisFrame >= 60000) {
-        return nullptr; // a bound on one frame's analysis; the rest follows next frame
-    }
-    mSmoothNewThisFrame++;
-    SmoothPending& p = mSmoothPending.emplace_back();
-    p.key = key;
-    p.decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
-    for (int i = 0; i < 3; i++) {
-        p.v[i] = slot[i]->src;
-        p.mtx[i] = slot[i]->mtx;
-        memcpy(p.n[i], slot[i]->n, sizeof(p.n[i]));
-        memcpy(p.pos[i], mRsp->loaded_vertices[idx[i]].view_pos, sizeof(p.pos[i]));
-    }
-    return nullptr;
+    return cached;
 }
 
+// The actor whose lights were bound last is complete: Actor_Draw binds them once, a skeleton then loads a matrix per
+// limb and a prop loads one. That decides what its new triangles are (its first limb could not know yet).
 void Interpreter::SmoothFinishActor() {
-    if (mSmoothPending.empty()) {
+    const bool character = mMatrixLoadsSinceLights >= 2 || mSmoothProps;
+    for (size_t i = mSmoothActorStart; i < mSmoothPending.size(); i++) {
+        mSmoothPending[i].character = character;
+    }
+    mSmoothActorStart = mSmoothPending.size();
+    mSmoothActor++;
+}
+
+// End of a logged frame: welds the actors that drew something new and stores what each of their triangles needs to
+// be drawn as a patch. Whole actors, cached triangles included: a late arrival (the eyes of another blink state, an
+// item taken in hand) shares edges and faces with what is already known, and both sides must agree on them. An
+// actor's opaque and translucent parts are separate draws far apart in the frame, so "the same actor" is decided by
+// place: every actor draw that reaches into the box around a draw with new triangles.
+void Interpreter::SmoothAnalyze() {
+    if (!mSmoothLogging || mSmoothPending.empty()) {
         return;
     }
-    // Actor_Draw binds an actor's lights once and a skeleton then loads a matrix per limb; a prop loads one.
-    SmoothAnalyze(mMatrixLoadsSinceLights >= 2 || mSmoothProps);
-    mSmoothPending.clear();
-}
-
-// Welds one actor's new triangles and stores what each needs to be drawn as a patch.
-void Interpreter::SmoothAnalyze(bool character) {
     const auto start = std::chrono::steady_clock::now();
     const std::vector<SmoothPending>& pending = mSmoothPending;
     mSmoothStats.pending += (uint32_t)pending.size();
+    if (pending.size() < 100000) {
+        mSmoothSawNew = false; // everything new of this frame is dealt with below
+    }
+    struct Box {
+        float lo[3], hi[3];
+    };
+    std::vector<Box> boxes;          // around the new triangles of each actor draw that has some
+    std::vector<uint8_t> selected;   // per actor draw
+    {
+        uint32_t current = ~0u;
+        for (const SmoothPending& p : pending) {
+            if (!p.fresh || !p.character) {
+                continue;
+            }
+            if (p.actor != current) {
+                current = p.actor;
+                boxes.push_back({ { 1e30f, 1e30f, 1e30f }, { -1e30f, -1e30f, -1e30f } });
+            }
+            Box& box = boxes.back();
+            for (int i = 0; i < 3; i++) {
+                for (int k = 0; k < 3; k++) {
+                    box.lo[k] = std::min(box.lo[k], p.pos[i][k]);
+                    box.hi[k] = std::max(box.hi[k], p.pos[i][k]);
+                }
+            }
+        }
+        for (Box& box : boxes) {
+            for (int k = 0; k < 3; k++) {
+                const float margin = 0.1f * (box.hi[k] - box.lo[k]) + 1.0f;
+                box.lo[k] -= margin;
+                box.hi[k] += margin;
+            }
+        }
+        selected.assign(mSmoothActor + 1, 0);
+        for (const SmoothPending& p : pending) {
+            if (!p.character || p.actor >= selected.size() || selected[p.actor]) {
+                continue;
+            }
+            for (const Box& box : boxes) {
+                for (int i = 0; i < 3 && !selected[p.actor]; i++) {
+                    const float* q = p.pos[i];
+                    if (q[0] >= box.lo[0] && q[0] <= box.hi[0] && q[1] >= box.lo[1] && q[1] <= box.hi[1] &&
+                        q[2] >= box.lo[2] && q[2] <= box.hi[2]) {
+                        selected[p.actor] = 1;
+                    }
+                }
+            }
+        }
+    }
 
-    // A display list drawn twice by one actor is one mesh: keep the first sight of each command.
-    std::vector<uint32_t> tris;
+    // Every draw of a character triangle takes part. Several actors of one kind draw the same entries: those are
+    // instances of one entry (a group), and what is stored for it has to suit all of them (step 5).
+    std::vector<uint32_t> tris, props;
+    std::vector<std::vector<uint32_t>> groups; // per entry: its instances, as indices into tris
     tris.reserve(pending.size());
     {
-        std::unordered_set<uint64_t> seen;
+        std::unordered_map<uint64_t, uint32_t> groupIds;
+        std::unordered_set<uint64_t> seenProps;
         for (uint32_t i = 0; i < pending.size(); i++) {
-            if (seen.insert((uint64_t)SmoothHash(pending[i].key, pending[i].v[0])).second) {
-                tris.push_back(i);
+            const SmoothPending& p = pending[i];
+            if (p.character ? (p.actor >= selected.size() || !selected[p.actor]) : !p.fresh) {
+                continue; // a character with nothing new near it, or a prop that is already known as one
             }
+            const uint64_t id = (uint64_t)SmoothHash(p.key, p.v[0]);
+            if (!p.character) {
+                if (seenProps.insert(id).second) {
+                    props.push_back(i);
+                }
+                continue;
+            }
+            const auto [it, added] = groupIds.try_emplace(id, (uint32_t)groups.size());
+            if (added) {
+                groups.emplace_back();
+            }
+            groups[it->second].push_back((uint32_t)tris.size());
+            tris.push_back(i);
         }
     }
     const uint32_t count = (uint32_t)tris.size();
@@ -3134,19 +3307,22 @@ void Interpreter::SmoothAnalyze(bool character) {
         e->state = SMOOTH_TRI_SKIP;
         return e;
     };
-    if (!character) {
-        for (uint32_t t = 0; t < count; t++) {
-            store(pending[tris[t]]); // remembered as "not a character", so it is not put aside again
-        }
-        return;
+    for (uint32_t i : props) {
+        store(pending[i]); // remembered as "not a character", so it is not put aside again
     }
+
+    // What is stored must not depend on the pose the actor happened to be in (another actor of the same kind is
+    // analysed in another pose and has to arrive at the same numbers), so wherever the vertices involved went through
+    // one matrix the arithmetic is done in their model space, on the model's own integers.
+    const auto sameSpace = [this](uint32_t a, uint32_t b) {
+        return a == b || memcmp(mSmoothMtx[a].src, mSmoothMtx[b].src, sizeof(mSmoothMtx[a].src)) == 0;
+    };
 
     // 1. Weld. Corners at the same world position are one point: twins (texture seams, hard edges, the vertices a
     // limb shares with its parent) go through the same matrix, so their positions are equal to the bit.
     struct Corner {
         uint32_t pos, cluster;
         float nw[3]; // world normal
-        float weight;
     };
     struct PosKey {
         uint32_t b[3];
@@ -3180,65 +3356,17 @@ void Interpreter::SmoothAnalyze(bool character) {
                 c.nw[k] = p.n[i][0] * m.cof[0][k] + p.n[i][1] * m.cof[1][k] + p.n[i][2] * m.cof[2][k];
             }
             SmoothNormalize(c.nw);
-            // The corner's angle weighs its normal in an average.
-            const float* a = p.pos[i];
-            const float* b = p.pos[(i + 1) % 3];
-            const float* d = p.pos[(i + 2) % 3];
-            float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { d[0] - a[0], d[1] - a[1], d[2] - a[2] };
-            c.weight = SmoothNormalize(e1) && SmoothNormalize(e2)
-                           ? std::acos(std::clamp(SmoothDot(e1, e2), -1.0f, 1.0f)) + 1e-4f : 1e-4f;
         }
     }
 
-    // 2. Normal clusters per point. Normals within the crease angle of each other are one smooth surface and share
-    // their average; a point with several clusters lies on a hard edge the artist made by splitting the normals.
-    struct Cluster {
-        float rep[3], sum[3], g[3];
-        bool mixed;
-    };
-    std::vector<Cluster> clusters;
-    std::vector<std::vector<uint32_t>> posClusters(posIds.size());
-    for (Corner& c : corners) {
-        if (SmoothDot(c.nw, c.nw) < 0.5f) {
-            continue; // no normal: this corner stays where it is
-        }
-        for (uint32_t k : posClusters[c.pos]) {
-            const float d = SmoothDot(clusters[k].rep, c.nw);
-            if (d >= mSmoothCrease) {
-                c.cluster = k;
-                if (d < 0.99999f) {
-                    clusters[k].mixed = true;
-                }
-                break;
-            }
-        }
-        if (c.cluster == NONE) {
-            c.cluster = (uint32_t)clusters.size();
-            posClusters[c.pos].push_back(c.cluster);
-            Cluster& k = clusters.emplace_back();
-            memcpy(k.rep, c.nw, sizeof(k.rep));
-            k.sum[0] = k.sum[1] = k.sum[2] = 0.0f;
-            k.mixed = false;
-        }
-        for (int k = 0; k < 3; k++) {
-            clusters[c.cluster].sum[k] += c.nw[k] * c.weight;
-        }
-    }
-    for (Cluster& k : clusters) {
-        // Equal normals stay exactly what they were (their average would only add rounding).
-        memcpy(k.g, k.mixed ? k.sum : k.rep, sizeof(k.g));
-        if (!SmoothNormalize(k.g)) {
-            memcpy(k.g, k.rep, sizeof(k.g));
-        }
-    }
-
-    // 3. Faces and edges. A triangle lying exactly on an earlier one (a decal or a second pass over the same face)
+    // 2. Faces and edges. A triangle lying exactly on an earlier one (a decal or a second pass over the same face)
     // takes that one's data, so both stay the same surface; decals are otherwise a layer of their own, and an edge
     // counts the triangles of its layer that use it.
     struct Edge {
         uint32_t tri[2];
         uint32_t count;
         float thin; // the smallest height over this edge of the triangles on it, as a fraction of its length
+        bool flat;  // an edge of a decal or of a face under one
     };
     struct FaceKey {
         uint32_t p[3];
@@ -3277,22 +3405,171 @@ void Interpreter::SmoothAnalyze(bool character) {
         }
         const SmoothPending& p = pending[tris[t]];
         const bool decal = p.decal;
-        const float e1[3] = { p.pos[1][0] - p.pos[0][0], p.pos[1][1] - p.pos[0][1], p.pos[1][2] - p.pos[0][2] };
-        const float e2[3] = { p.pos[2][0] - p.pos[0][0], p.pos[2][1] - p.pos[0][1], p.pos[2][2] - p.pos[0][2] };
+        // The triangle's shape, from the model's integers when it is rigid (one matrix).
+        float shape[3][3];
+        const bool rigid = sameSpace(p.mtx[0], p.mtx[1]) && sameSpace(p.mtx[0], p.mtx[2]);
+        for (int i = 0; i < 3; i++) {
+            for (int k = 0; k < 3; k++) {
+                shape[i][k] = rigid ? (float)p.ob[i][k] : p.pos[i][k];
+            }
+        }
+        const float e1[3] = { shape[1][0] - shape[0][0], shape[1][1] - shape[0][1], shape[1][2] - shape[0][2] };
+        const float e2[3] = { shape[2][0] - shape[0][0], shape[2][1] - shape[0][1], shape[2][2] - shape[0][2] };
         float areaN[3];
         SmoothCross(areaN, e1, e2);
         const float area2 = std::sqrt(SmoothDot(areaN, areaN)); // twice the area
         for (int i = 0; i < 3; i++) {
-            Edge& e = edges.try_emplace(edgeKey(c[i].pos, c[(i + 1) % 3].pos, decal), Edge{ { NONE, NONE }, 0, 1e9f })
+            Edge& e = edges.try_emplace(edgeKey(c[i].pos, c[(i + 1) % 3].pos, decal), Edge{ { NONE, NONE }, 0, 1e9f, false })
                           .first->second;
             if (e.count < 2) {
                 e.tri[e.count] = t;
             }
             e.count++;
-            const float* a = p.pos[i];
-            const float* b = p.pos[(i + 1) % 3];
+            const float* a = shape[i];
+            const float* b = shape[(i + 1) % 3];
             const float d[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
             e.thin = std::min(e.thin, area2 / std::max(SmoothDot(d, d), 1e-12f));
+        }
+    }
+
+    // 3. Normal clusters per point. Normals within the crease angle of each other are one smooth surface and share
+    // one normal; a point with several clusters lies on a hard edge the artist made by splitting the normals. The
+    // shared normal is the mean of the different normals in the cluster, each counted once, so it does not depend on
+    // how many triangles meet there or on which variant of a neighbouring part happens to be drawn. Triangles that lie
+    // on another face take that face's normals and add nothing.
+    struct Cluster {
+        float rep[3], sum[3], g[3];
+        std::vector<std::array<float, 3>> members;
+        bool mixed;
+        // The same in model space, while every member went through one matrix.
+        uint32_t mtx;
+        bool model;
+        std::vector<std::array<int8_t, 3>> modelMembers;
+        float gm[3];
+    };
+    std::vector<Cluster> clusters;
+    std::vector<std::vector<uint32_t>> posClusters(posIds.size());
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t t = 0; t < count; t++) {
+            if (baseOf[t] == NONE || (baseOf[t] == t) != (pass == 0)) {
+                continue; // degenerate; own faces first, then the ones lying on them
+            }
+            for (int i = 0; i < 3; i++) {
+                Corner& c = corners[t * 3 + i];
+                if (SmoothDot(c.nw, c.nw) < 0.5f) {
+                    continue; // no normal: this corner stays where it is
+                }
+                for (uint32_t k : posClusters[c.pos]) {
+                    if (SmoothDot(clusters[k].rep, c.nw) >= mSmoothCrease) {
+                        c.cluster = k;
+                        break;
+                    }
+                }
+                if (pass == 1) {
+                    continue;
+                }
+                if (c.cluster == NONE) {
+                    c.cluster = (uint32_t)clusters.size();
+                    posClusters[c.pos].push_back(c.cluster);
+                    Cluster& k = clusters.emplace_back();
+                    memcpy(k.rep, c.nw, sizeof(k.rep));
+                    k.sum[0] = k.sum[1] = k.sum[2] = 0.0f;
+                    k.mixed = false;
+                    k.mtx = pending[tris[t]].mtx[i];
+                    k.model = true;
+                }
+                Cluster& k = clusters[c.cluster];
+                bool known = false;
+                for (const auto& m : k.members) {
+                    known = known || SmoothDot(m.data(), c.nw) > 0.99999f;
+                }
+                if (!known) {
+                    const SmoothPending& p = pending[tris[t]];
+                    k.model = k.model && sameSpace(k.mtx, p.mtx[i]);
+                    k.modelMembers.push_back({ p.n[i][0], p.n[i][1], p.n[i][2] });
+                    k.members.push_back({ c.nw[0], c.nw[1], c.nw[2] });
+                    k.sum[0] += c.nw[0];
+                    k.sum[1] += c.nw[1];
+                    k.sum[2] += c.nw[2];
+                    k.mixed = k.members.size() > 1;
+                }
+            }
+        }
+    }
+    for (Cluster& k : clusters) {
+        // Equal normals stay exactly what they were (a mean would only add rounding).
+        memcpy(k.g, k.mixed ? k.sum : k.rep, sizeof(k.g));
+        if (!SmoothNormalize(k.g)) {
+            memcpy(k.g, k.rep, sizeof(k.g));
+        }
+        if (k.model) {
+            // In a fixed order, so the sum does not depend on the order the triangles were drawn in.
+            std::sort(k.modelMembers.begin(), k.modelMembers.end());
+            k.gm[0] = k.gm[1] = k.gm[2] = 0.0f;
+            for (const auto& m : k.modelMembers) {
+                float n[3] = { (float)m[0], (float)m[1], (float)m[2] };
+                SmoothNormalize(n);
+                k.gm[0] += n[0];
+                k.gm[1] += n[1];
+                k.gm[2] += n[2];
+            }
+            k.model = SmoothNormalize(k.gm);
+        }
+    }
+
+    // A decal is drawn onto the face under it and only holds there while both are the same plane: decals stay flat,
+    // and so do the faces they lie on (exact copies of a face were handled above and curve with it).
+    {
+        std::vector<uint32_t> decals, solids;
+        for (uint32_t t = 0; t < count; t++) {
+            if (baseOf[t] == t) {
+                (pending[tris[t]].decal ? decals : solids).push_back(t);
+            }
+        }
+        const auto flatten = [&](uint32_t t) {
+            const Corner* c = &corners[t * 3];
+            for (int i = 0; i < 3; i++) {
+                edges.find(edgeKey(c[i].pos, c[(i + 1) % 3].pos, pending[tris[t]].decal))->second.flat = true;
+            }
+        };
+        for (uint32_t dt : decals) {
+            flatten(dt);
+            const SmoothPending& d = pending[tris[dt]];
+            // Its corners, edge midpoints and centre.
+            float probes[7][3];
+            for (int k = 0; k < 3; k++) {
+                for (int i = 0; i < 3; i++) {
+                    probes[i][k] = d.pos[i][k];
+                    probes[3 + i][k] = 0.5f * (d.pos[i][k] + d.pos[(i + 1) % 3][k]);
+                }
+                probes[6][k] = (d.pos[0][k] + d.pos[1][k] + d.pos[2][k]) * (1.0f / 3.0f);
+            }
+            for (uint32_t st : solids) {
+                const SmoothPending& b = pending[tris[st]];
+                const float e1[3] = { b.pos[1][0] - b.pos[0][0], b.pos[1][1] - b.pos[0][1], b.pos[1][2] - b.pos[0][2] };
+                const float e2[3] = { b.pos[2][0] - b.pos[0][0], b.pos[2][1] - b.pos[0][1], b.pos[2][2] - b.pos[0][2] };
+                float n[3];
+                SmoothCross(n, e1, e2);
+                const float area2 = std::sqrt(SmoothDot(n, n));
+                if (!SmoothNormalize(n)) {
+                    continue;
+                }
+                const float reach = 0.03f * std::sqrt(area2) + 1e-4f;
+                const float d11 = SmoothDot(e1, e1), d12 = SmoothDot(e1, e2), d22 = SmoothDot(e2, e2);
+                const float det = d11 * d22 - d12 * d12;
+                for (const auto& q : probes) {
+                    const float r[3] = { q[0] - b.pos[0][0], q[1] - b.pos[0][1], q[2] - b.pos[0][2] };
+                    if (std::fabs(SmoothDot(r, n)) > reach) {
+                        continue;
+                    }
+                    const float r1 = SmoothDot(r, e1), r2 = SmoothDot(r, e2);
+                    const float u = (d22 * r1 - d12 * r2) / det, v = (d11 * r2 - d12 * r1) / det;
+                    if (u >= -0.02f && v >= -0.02f && u + v <= 1.02f) {
+                        flatten(st);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -3302,112 +3579,218 @@ void Interpreter::SmoothAnalyze(bool character) {
     //   CREASE   the two triangles are in different clusters: the edge follows the line both tangent planes share,
     //            so a hard edge curves along itself (a round rim) and stays hard.
     //   STRAIGHT anything else (more than two triangles, opposite normals, no normal): the flat triangle's edge.
-    std::vector<SmoothTri> results(count);
-    for (uint32_t t = 0; t < count; t++) {
-        const SmoothPending& p = pending[tris[t]];
-        SmoothTri& r = results[t];
-        r = {};
-        for (int s = 0; s < 6; s++) {
-            r.kind[s] = SMOOTH_END_STRAIGHT;
-        }
-        if (baseOf[t] != t) {
-            continue;
-        }
+    std::vector<SmoothTri> results(count), finals(count);
+    std::vector<uint32_t> winners(groups.size());
+    // The record of the edge from corner i to i+1 of triangle t (of the face it lies on).
+    const auto edgeOf = [&](uint32_t t, int i) -> Edge& {
         const Corner* c = &corners[t * 3];
-        for (int i = 0; i < 3; i++) {
-            if (c[i].cluster == NONE) {
+        return edges.find(edgeKey(c[i].pos, c[(i + 1) % 3].pos, pending[tris[baseOf[t]]].decal))->second;
+    };
+    for (int round = 0; round < 8; round++) {
+        for (uint32_t t = 0; t < count; t++) {
+            const SmoothPending& p = pending[tris[t]];
+            SmoothTri& r = results[t];
+            r = {};
+            for (int s = 0; s < 6; s++) {
+                r.kind[s] = SMOOTH_END_STRAIGHT;
+            }
+            if (baseOf[t] != t) {
                 continue;
             }
-            const SmoothMtx& m = mSmoothMtx[p.mtx[i]];
-            const Cluster& own = clusters[c[i].cluster];
-            // World normal back into this vertex's model space: n = m * N (the inverse of the cofactor transform up
-            // to scale).
-            float gm[3];
-            for (int a = 0; a < 3; a++) {
-                gm[a] = m.m[a][0] * own.g[0] + m.m[a][1] * own.g[1] + m.m[a][2] * own.g[2];
-            }
-            SmoothNormalize(gm);
-            SmoothQuantize(r.g[i], gm);
-            if (own.mixed) {
-                r.mixed |= 1 << i;
-            }
-            r.thin[i] = (uint16_t)std::min(
-                edges.find(edgeKey(c[i].pos, c[(i + 1) % 3].pos, p.decal))->second.thin * 8192.0f, 65535.0f);
-            for (int e = 0; e < 2; e++) {
-                const int j = e == 0 ? (i + 1) % 3 : (i + 2) % 3;
-                const Edge& edge = edges.find(edgeKey(c[i].pos, c[j].pos, p.decal))->second;
-                uint8_t& kind = r.kind[i * 2 + e];
-                if (edge.count == 1) {
-                    kind = SMOOTH_END_NORMAL;
-                } else if (edge.count == 2) {
-                    const uint32_t other = edge.tri[0] == t ? edge.tri[1] : edge.tri[0];
-                    uint32_t theirs = NONE;
-                    for (int k = 0; k < 3; k++) {
-                        if (corners[other * 3 + k].pos == c[i].pos) {
-                            theirs = corners[other * 3 + k].cluster;
-                        }
+            const Corner* c = &corners[t * 3];
+            for (int i = 0; i < 3; i++) {
+                if (c[i].cluster == NONE) {
+                    continue;
+                }
+                const SmoothMtx& m = mSmoothMtx[p.mtx[i]];
+                const Cluster& own = clusters[c[i].cluster];
+                // World normal back into this vertex's model space: n = m * N (the inverse of the cofactor transform up
+                // to scale).
+                float gm[3];
+                const bool ownModel = own.model && sameSpace(own.mtx, p.mtx[i]);
+                if (ownModel) {
+                    memcpy(gm, own.gm, sizeof(gm));
+                } else {
+                    for (int a = 0; a < 3; a++) {
+                        gm[a] = m.m[a][0] * own.g[0] + m.m[a][1] * own.g[1] + m.m[a][2] * own.g[2];
                     }
-                    if (theirs == c[i].cluster) {
+                    SmoothNormalize(gm);
+                }
+                SmoothQuantize(r.g[i], gm);
+                if (own.mixed) {
+                    r.mixed |= 1 << i;
+                }
+                r.thin[i] = (uint16_t)std::min(
+                    edges.find(edgeKey(c[i].pos, c[(i + 1) % 3].pos, p.decal))->second.thin * 8192.0f, 65535.0f);
+                for (int e = 0; e < 2; e++) {
+                    const int j = e == 0 ? (i + 1) % 3 : (i + 2) % 3;
+                    const Edge& edge = edges.find(edgeKey(c[i].pos, c[j].pos, p.decal))->second;
+                    uint8_t& kind = r.kind[i * 2 + e];
+                    if (edge.flat) {
+                        continue;
+                    }
+                    if (edge.count == 1) {
                         kind = SMOOTH_END_NORMAL;
-                    } else if (theirs != NONE) {
-                        float tw[3], tm[3];
-                        SmoothCross(tw, own.g, clusters[theirs].g);
-                        // Nearly parallel or opposite normals (two sides of a sheet) have no shared line.
-                        if (SmoothDot(tw, tw) > 0.03f) {
-                            SmoothNormalize(tw);
-                            // A direction on the surface back into model space: the inverse matrix is the transposed
-                            // cofactor over the determinant, and the sign and length do not matter.
-                            for (int a = 0; a < 3; a++) {
-                                tm[a] = m.cof[a][0] * tw[0] + m.cof[a][1] * tw[1] + m.cof[a][2] * tw[2];
+                    } else if (edge.count == 2) {
+                        const uint32_t other = edge.tri[0] == t ? edge.tri[1] : edge.tri[0];
+                        uint32_t theirs = NONE;
+                        for (int k = 0; k < 3; k++) {
+                            if (corners[other * 3 + k].pos == c[i].pos) {
+                                theirs = corners[other * 3 + k].cluster;
                             }
-                            if (SmoothNormalize(tm)) {
-                                SmoothQuantize(r.t[i * 2 + e], tm);
-                                kind = SMOOTH_END_CREASE;
+                        }
+                        if (theirs == c[i].cluster) {
+                            kind = SMOOTH_END_NORMAL;
+                        } else if (theirs != NONE) {
+                            float tw[3], tm[3];
+                            SmoothCross(tw, own.g, clusters[theirs].g);
+                            // Nearly parallel or opposite normals (two sides of a sheet) have no shared line.
+                            if (SmoothDot(tw, tw) > 0.03f) {
+                                SmoothNormalize(tw);
+                                if (ownModel && clusters[theirs].model && sameSpace(own.mtx, clusters[theirs].mtx)) {
+                                    // The cross product of two normals is a direction on the surface, in model space
+                                    // as well.
+                                    SmoothCross(tm, own.gm, clusters[theirs].gm);
+                                } else {
+                                    // Back into model space: the inverse matrix is the transposed cofactor over the
+                                    // determinant, and the sign and length do not matter.
+                                    for (int a = 0; a < 3; a++) {
+                                        tm[a] = m.cof[a][0] * tw[0] + m.cof[a][1] * tw[1] + m.cof[a][2] * tw[2];
+                                    }
+                                }
+                                if (SmoothNormalize(tm)) {
+                                    SmoothQuantize(r.t[i * 2 + e], tm);
+                                    kind = SMOOTH_END_CREASE;
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+        for (uint32_t t = 0; t < count; t++) {
+            const SmoothPending& p = pending[tris[t]];
+            SmoothTri* e = &finals[t];
+            *e = {};
+            for (int s = 0; s < 6; s++) {
+                e->kind[s] = SMOOTH_END_STRAIGHT;
+            }
+            const uint32_t base = baseOf[t];
+            if (base == NONE) {
+                continue;
+            }
+            e->info = (p.decal ? 1 : 0) | (base != t ? 2 : 0);
+            for (int i = 0; i < 3; i++) {
+                const auto found = edges.find(edgeKey(corners[t * 3 + i].pos, corners[t * 3 + (i + 1) % 3].pos, pending[tris[base]].decal));
+                e->info |= (found != edges.end() ? std::min<uint32_t>(found->second.count, 3) : 0) << (2 + i * 2);
+            }
+            const SmoothTri& r = results[base];
+            // Corner i of this triangle is corner perm[i] of the face it lies on (the same one when it is its own).
+            int perm[3] = { 0, 1, 2 };
+            if (base != t) {
+                for (int i = 0; i < 3; i++) {
+                    for (int k = 0; k < 3; k++) {
+                        if (corners[base * 3 + k].pos == corners[t * 3 + i].pos) {
+                            perm[i] = k;
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < 3; i++) {
+                memcpy(e->g[i], r.g[perm[i]], sizeof(e->g[i]));
+                if ((r.mixed >> perm[i] & 1) || corners[base * 3 + perm[i]].cluster != corners[t * 3 + i].cluster) {
+                    e->mixed |= 1 << i;
+                }
+                for (int s = 0; s < 2; s++) {
+                    const int j = s == 0 ? (i + 1) % 3 : (i + 2) % 3;
+                    const int from = perm[i] * 2 + ((perm[i] + 1) % 3 == perm[j] ? 0 : 1);
+                    e->kind[i * 2 + s] = r.kind[from];
+                    memcpy(e->t[i * 2 + s], r.t[from], sizeof(e->t[0]));
+                    if (s == 0) { // the edge from corner i to i+1, whichever way the face it lies on runs along it
+                        e->thin[i] = r.thin[(perm[i] + 1) % 3 == perm[j] ? perm[i] : perm[j]];
+                    }
+                }
+            }
+        }
+
+        // 5. One entry, several instances. The instance with the most neighbours decides what is stored (an edge that
+        // is open in one actor and shared in another must be drawn the shared way; the open one has nobody to
+        // disagree with). Where another instance does have a neighbour and would need something else, nothing
+        // suits both: that edge is made straight for every triangle on it, in all instances, and the round is redone.
+        bool changed = false;
+        for (size_t g = 0; g < groups.size(); g++) {
+            const std::vector<uint32_t>& group = groups[g];
+            uint32_t best = group[0], bestScore = 0;
+            for (uint32_t t : group) {
+                uint32_t score = 0;
+                for (int i = 0; i < 3 && baseOf[t] != NONE; i++) {
+                    score += std::min<uint32_t>(edgeOf(t, i).count, 3);
+                }
+                if (score > bestScore) {
+                    best = t;
+                    bestScore = score;
+                }
+            }
+            winners[g] = best;
+            const SmoothTri& w = finals[best];
+            for (uint32_t t : group) {
+                if (t == best || baseOf[t] == NONE) {
+                    continue;
+                }
+                const SmoothTri& f = finals[t];
+                bool straighten[3] = { false, false, false }; // per edge (corner i to i+1)
+                for (int i = 0; i < 3; i++) {
+                    bool differs = (f.mixed >> i & 1) != (w.mixed >> i & 1);
+                    for (int k = 0; k < 3; k++) {
+                        differs = differs || std::abs(f.g[i][k] - w.g[i][k]) > 2;
+                    }
+                    if (differs) { // another welded normal: both edges at this corner
+                        straighten[i] = straighten[(i + 2) % 3] = true;
+                    }
+                    for (int e = 0; e < 2; e++) {
+                        const int s = i * 2 + e, edge = e == 0 ? i : (i + 2) % 3;
+                        bool same = f.kind[s] == w.kind[s] && std::abs(f.thin[edge] - w.thin[edge]) <= 2 + w.thin[edge] / 64;
+                        if (same && f.kind[s] == SMOOTH_END_CREASE) {
+                            bool equal = true, opposite = true;
+                            for (int k = 0; k < 3; k++) {
+                                equal = equal && std::abs(f.t[s][k] - w.t[s][k]) <= 2;
+                                opposite = opposite && std::abs(f.t[s][k] + w.t[s][k]) <= 2;
+                            }
+                            same = equal || opposite;
+                        }
+                        if (!same) {
+                            straighten[edge] = true;
+                        }
+                    }
+                }
+                for (int i = 0; i < 3; i++) {
+                    // Only where this instance has a neighbour that would notice.
+                    if (!straighten[i] || edgeOf(t, i).count < 2) {
+                        continue;
+                    }
+                    for (uint32_t u : group) {
+                        if (baseOf[u] != NONE && !edgeOf(u, i).flat) {
+                            edgeOf(u, i).flat = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!changed) {
+            break;
         }
     }
-    for (uint32_t t = 0; t < count; t++) {
-        const SmoothPending& p = pending[tris[t]];
-        SmoothTri* e = store(p);
+    for (size_t g = 0; g < groups.size(); g++) {
+        const SmoothTri& f = finals[winners[g]];
+        SmoothTri* e = store(pending[tris[winners[g]]]);
         e->state = SMOOTH_TRI_CHARACTER;
-        for (int s = 0; s < 6; s++) {
-            e->kind[s] = SMOOTH_END_STRAIGHT;
-        }
-        const uint32_t base = baseOf[t];
-        if (base == NONE) {
-            continue;
-        }
-        const SmoothTri& r = results[base];
-        // Corner i of this triangle is corner perm[i] of the face it lies on (the same one when it is its own).
-        int perm[3] = { 0, 1, 2 };
-        if (base != t) {
-            for (int i = 0; i < 3; i++) {
-                for (int k = 0; k < 3; k++) {
-                    if (corners[base * 3 + k].pos == corners[t * 3 + i].pos) {
-                        perm[i] = k;
-                    }
-                }
-            }
-        }
-        for (int i = 0; i < 3; i++) {
-            memcpy(e->g[i], r.g[perm[i]], sizeof(e->g[i]));
-            if ((r.mixed >> perm[i] & 1) || corners[base * 3 + perm[i]].cluster != corners[t * 3 + i].cluster) {
-                e->mixed |= 1 << i;
-            }
-            for (int s = 0; s < 2; s++) {
-                const int j = s == 0 ? (i + 1) % 3 : (i + 2) % 3;
-                const int from = perm[i] * 2 + ((perm[i] + 1) % 3 == perm[j] ? 0 : 1);
-                e->kind[i * 2 + s] = r.kind[from];
-                memcpy(e->t[i * 2 + s], r.t[from], sizeof(e->t[0]));
-                if (s == 0) { // the edge from corner i to i+1, whichever way the face it lies on runs along it
-                    e->thin[i] = r.thin[(perm[i] + 1) % 3 == perm[j] ? perm[i] : perm[j]];
-                }
-            }
-        }
+        e->mixed = f.mixed;
+        e->info = f.info;
+        memcpy(e->g, f.g, sizeof(e->g));
+        memcpy(e->t, f.t, sizeof(e->t));
+        memcpy(e->kind, f.kind, sizeof(e->kind));
+        memcpy(e->thin, f.thin, sizeof(e->thin));
     }
     mSmoothStats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
@@ -3462,6 +3845,12 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
         nw[i] = s.world;
         memcpy(normals[i], s.batch, sizeof(s.batch));
     }
+    // An edge that barely leaves its corner's tangent plane belongs to a flat panel (a shield face, a chest plate).
+    // Such panels stay flat: their bulge would be small but not zero, enough to swallow details laid just above them.
+    const auto flatFade = [this](float steep) {
+        const float t = std::clamp((steep - mSmoothFlat) / std::max(mSmoothFlat * 1.3f, 1e-6f), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
     for (int i = 0; i < 3; i++) {
         for (int e = 0; e < 2; e++) {
             const int j = e == 0 ? (i + 1) % 3 : (i + 2) % 3;
@@ -3492,7 +3881,7 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
                 if (steep > mSmoothTip) {
                     w *= (mSmoothTip + (steep - mSmoothTip) * 0.25f) / steep;
                 }
-                w = std::clamp(w, -bound, bound);
+                w = std::clamp(w, -bound, bound) * flatFade(steep);
                 o[0] = -w * nw[i][0] * (1.0f / 3.0f);
                 o[1] = -w * nw[i][1] * (1.0f / 3.0f);
                 o[2] = -w * nw[i][2] * (1.0f / 3.0f);
@@ -3510,7 +3899,8 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
                 const float along = SmoothDot(d, tw);
                 const float side[3] = { tw[0] * along - d[0], tw[1] * along - d[1], tw[2] * along - d[2] };
                 const float pull = std::sqrt(SmoothDot(side, side));
-                const float scale = (pull > bound ? bound / pull : 1.0f) * (1.0f / 3.0f);
+                const float scale = (pull > bound ? bound / pull : 1.0f) * flatFade(pull / std::max(length, 1e-6f)) *
+                                    (1.0f / 3.0f);
                 o[0] = side[0] * scale;
                 o[1] = side[1] * scale;
                 o[2] = side[2] * scale;
@@ -3519,6 +3909,29 @@ void Interpreter::SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], cons
     }
     mSmoothStats.patches++;
     if (mSmoothDebug) {
+        for (int i = 0; i < 3; i++) {
+            for (int e = 0; e < 2; e++) {
+                SmoothCheck& c = mSmoothChecks.emplace_back();
+                memcpy(c.a, v[i]->view_pos, sizeof(c.a));
+                memcpy(c.b, v[e == 0 ? (i + 1) % 3 : (i + 2) % 3]->view_pos, sizeof(c.b));
+                memcpy(c.o, offsets[i][e], sizeof(c.o));
+                c.key = tri->key;
+                c.actor = mSmoothActor;
+                c.kind = tri->kind[i * 2 + e];
+                c.mixed = tri->mixed >> i & 1;
+                c.info = tri->info;
+                c.edge = (uint8_t)(e == 0 ? i : (i + 2) % 3);
+                c.mtxIdx = mSmoothSlots[idx[i]].mtx;
+                c.mtxHash = 0;
+                for (int q = 0; q < 16; q++) {
+                    uint32_t bits;
+                    memcpy(&bits, &mSmoothMtx[c.mtxIdx].src[q / 4][q % 4], 4);
+                    c.mtxHash = (c.mtxHash ^ bits) * 0x9E3779B1u;
+                }
+                memcpy(c.g, tri->g[i], sizeof(c.g));
+                memcpy(c.own, mSmoothSlots[idx[i]].n, sizeof(c.own));
+            }
+        }
         mSmoothStats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     }
 }
@@ -8026,6 +8439,17 @@ void Interpreter::StartFrame() {
         mSmoothStrength = std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothStrength", 1.0f), 0.0f, 1.5f);
         mSmoothTip = std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothTipLimit", 0.8f), 0.1f, 1.0f);
         mSmoothThin = std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothThinLimit", 1.0f), 0.0f, 8.0f);
+        mSmoothFlat = std::sin(
+            std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothFlatAngle", 6.0f), 0.0f, 30.0f) * 0.01745329f);
+        // Debug aid for same-pose comparisons: with SmoothBlink = n the effect is on only in the odd n-second spans of
+        // the wall clock, so two screenshots of a frozen scene n seconds apart are an exact off/on pair.
+        const float blink = cvars->GetFloat("gNewDawn.Characters.SmoothBlink", 0.0f);
+        if (blink > 0.0f) {
+            const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+            if ((int64_t)std::floor(now / blink) % 2 == 0) {
+                mSmooth = false;
+            }
+        }
         mSmoothTolerance = std::clamp(cvars->GetFloat("gNewDawn.Characters.SmoothTolerance", 0.35f), 0.05f, 8.0f);
         mSmoothMaxLevel = std::clamp(cvars->GetInteger("gNewDawn.Characters.SmoothMaxLevel", 8), 1, 16);
         mSmoothDebug = cvars->GetInteger("gNewDawn.Characters.SmoothDebug", 0) != 0;
@@ -8143,6 +8567,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     Flush();
     if (mSmooth) {
         SmoothFinishActor();
+        SmoothAnalyze();
     }
     mTaaJitter = false;
     mRapi->FinishWorld(); // also closes a partial/debugger display-list walk

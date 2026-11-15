@@ -559,14 +559,19 @@ class Interpreter {
         uint8_t mixed;     // bit i: corner i's normal is an average of different normals
         uint8_t state;     // SMOOTH_TRI_*
         uint8_t stale;     // times the command was seen with other vertices (dynamic geometry gives up at 4)
+        uint8_t info;      // debug: bit 0 decal, bit 1 lies on another face, bits 2.. triangles on edge 0/1/2 (2 bits each)
     };
-    struct SmoothPending { // a triangle seen for the first time, waiting for the end of its actor
+    struct SmoothPending { // a triangle of a frame that is being logged for analysis
         uint64_t key;
         const void* v[3];
         int8_t n[3][3];
         uint32_t mtx[3];
         float pos[3][3];
+        int16_t ob[3][3]; // model-space positions
         bool decal;
+        bool fresh;     // not in the cache yet
+        bool character; // its actor turned out to be a skeleton (set when the actor is complete)
+        uint32_t actor; // which actor draw of the frame it belongs to
     };
     void SmoothBeginFrame();
     uint32_t SmoothSyncMatrix();
@@ -576,10 +581,11 @@ class Interpreter {
     void SmoothCorners(const SmoothTri* tri, const uint8_t idx[3], const LoadedVertex* const v[3], float normals[3][3],
                        float offsets[3][2][3]);
     void SmoothFinishActor();
-    void SmoothAnalyze(bool character);
+    void SmoothAnalyze();
     void SmoothSyncCamera();
     bool mSmooth = false, mSmoothProps = false, mSmoothDebug = false;
     float mSmoothStrength = 1.0f, mSmoothCrease = 0.82f, mSmoothTip = 0.8f, mSmoothThin = 1.0f, mSmoothTolerance = 0.35f;
+    float mSmoothFlat = 0.105f; // sine of the angle under which an edge counts as lying in a flat panel
     int mSmoothMaxLevel = 8;
     uint64_t mSmoothKey = 0;      // the triangle command being run (set by the triangle handlers)
     size_t mSmoothBaseDepth = 0;  // display list depth of the actor's own commands (where its lights were bound)
@@ -588,11 +594,29 @@ class Interpreter {
     std::vector<SmoothTri> mSmoothTable; // open addressing, power-of-two size
     size_t mSmoothCount = 0;
     std::vector<SmoothPending> mSmoothPending;
-    uint32_t mSmoothNewThisFrame = 0;
+    size_t mSmoothActorStart = 0; // first entry of mSmoothPending that belongs to the actor being drawn
+    uint32_t mSmoothActor = 0;    // running number of the actor being drawn (debug)
+    // A triangle that is not in the cache makes the next frame a logged one: every character triangle drawn is then
+    // written down and the actors with something new are analysed as a whole at the end of it.
+    bool mSmoothSawNew = false, mSmoothLogging = false;
+    int mSmoothBusy = 0, mSmoothCooldown = 0; // keeps geometry that is new every frame from being analysed every frame
     float mSmoothP[4][4] = {};
     float mSmoothCameraKey[4] = {};
     bool mSmoothCameraSet = false;
     struct { uint32_t tris, patches, pending, analysed, mismatched; uint64_t ns; } mSmoothStats = {};
+    // Debug check (gNewDawn.Characters.SmoothDebug): every edge end drawn this frame, to compare what the triangles
+    // sharing it were given.
+    struct SmoothCheck {
+        uint32_t a[3], b[3]; // bits of the end's own point and of the edge's other point (world)
+        float o[3];
+        uint64_t key;
+        uint32_t actor;
+        uint8_t kind, mixed, info, edge;
+        uint32_t mtxHash, mtxIdx;
+        int16_t g[3];
+        int8_t own[3];
+    };
+    std::vector<SmoothCheck> mSmoothChecks;
     bool SolveCameraPosition(float out[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
