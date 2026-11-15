@@ -152,12 +152,12 @@ void main() {
     vec3 H = normalize(uLightDir + V);
     float glint = pow(max(dot(Nw, H), 0.0), 36.0) * (0.4 + 0.6 * streak);
     float back = pow(max(dot(-V, uLightDir), 0.0), 3.0); // light through the thin sheet of water
-    vec3 albedo = vec3(0.80, 0.90, 0.95);
+    vec3 albedo = mix(vec3(0.55, 0.74, 0.88), vec3(0.85, 0.94, 1.0), streak); // darker blue channels between bright streaks
     vec3 col = albedo * (uSky * 0.75 + uLightColor * (0.18 + 0.5 * ndl) + uLightColor * (0.7 * back)) + uLightColor * glint * 2.6;
     // Ragged vertical foam bands: strongest in the thick ridges of the streak mask.
     float foam = smoothstep(0.45, 0.9, streak);
-    col = mix(col, vec3(1.0) * (uSky * 0.9 + uLightColor * 0.5), foam * 0.55);
-    float a = clamp(0.10 + 0.55 * streak + 0.15 * (0.5 + 0.5 * acc.x), 0.0, 0.85) * uStrength;
+    col = mix(col, vec3(1.35) * (uSky * 0.9 + uLightColor * 0.5), foam * 0.7);
+    float a = clamp(0.38 + 0.5 * streak + 0.12 * (0.5 + 0.5 * acc.x), 0.0, 0.92) * uStrength;
     a *= 1.0 - smoothstep(3.0, 10.0, footprint); // distant falls just keep their native texture
     float ndcz = clamp(gl_FragCoord.z * 2.0 - 1.0, -1.0, 1.0);
     float fogF = clamp(ndcz * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
