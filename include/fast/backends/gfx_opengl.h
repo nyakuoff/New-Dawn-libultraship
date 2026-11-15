@@ -35,8 +35,8 @@ struct ShaderProgram {
     uint8_t numInputs;
     bool usedTextures[SHADER_MAX_TEXTURES];
     uint8_t numFloats;
-    GLint attribLocations[16];
-    uint8_t attribSizes[16];
+    GLint attribLocations[24];
+    uint8_t attribSizes[24];
     uint8_t numAttribs;
     GLint hdr_location, hdr_sun_location, hdr_ambient_location, hdr_sky_location, hdr_fog_location;
     GLint sky_ambient_enabled_location, sky_irradiance_location;
@@ -67,6 +67,9 @@ struct ShaderProgram {
     GLint material_mirror_location;
     // New Dawn foliage light (-1 when the program is not a cut-out one).
     GLint fol_frame_location, fol_draw_location, fol_inv_location, fol_view_location;
+    // New Dawn smooth characters: set when the program has tessellation stages (drawn as 3-vertex patches).
+    bool smooth = false;
+    GLint smooth_vp_location = -1, smooth_params_location = -1;
 };
 
 struct FramebufferOGL {
@@ -172,6 +175,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
         return true;
     }
     void SetPerPixelLighting(const GfxPerPixelLightingState& state) override;
+    bool SupportsSmoothCharacters() const override;
+    void SetSmoothCharacters(const float* viewProj, const float* params) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -220,6 +225,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     bool mStencilMarkOn = false;
     uint8_t mStencilMarkClass = 0, mStencilMarkRef = 1;
     int32_t mPerPixelUploadedSerial = -1;
+    bool mSmoothAvailable = false; // OpenGL 4.0 tessellation
+    float mSmoothViewProj[16] = {};
+    float mSmoothParams[4] = {};
     ShaderProgram* mPerPixelUploadedProgram = nullptr;
 
     std::vector<FramebufferOGL> mFrameBuffers;
