@@ -2913,6 +2913,8 @@ void main() {
 // the OPAQUE depth buffer (so a water mesh that wrote depth cannot hide the bed). Everything is a premultiplied
 // overlay: out = src + dst * (1 - foam), with src = foam + (refracted/absorbed - original) * (1 - foam).
 // ---------------------------------------------------------------------------------------------------------------------
+#include "gfx_opengl_rivers_shaders.inc"
+
 static const char* kWaterSurfaceShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -2920,7 +2922,6 @@ uniform sampler2D uScene;
 uniform sampler2D uOpaqueColor;
 uniform sampler2D uVisibleDepth;
 uniform mat4 uViewProj;
-uniform float uTime;
 uniform float uFoam;
 uniform float uRefr;
 uniform float uPixelAngle;
@@ -2939,6 +2940,8 @@ uniform int uWaves;
 uniform float uWaveAmp;
 uniform float uSwash;       // ocean shoreline swash strength, 0 = off
 uniform int uDebug;         // 3: displaced height (red above / blue below the plane, grey = no wave), 4: slope
+uniform sampler2D uFlowBuf; // river flow (world xz velocity of the native texture scroll, 1 = covered); dummy when off
+uniform float uRiver;       // river streak strength, 0 = off
 
 float hash1(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
@@ -3092,6 +3095,24 @@ void main() {
     float graze = smoothstep(0.15, 0.5, V.y);
     float depthY = sky ? 1.0e4 : max(surfY - P.y, 0.0);
 
+    // Rivers: the flow buffer holds the native texture scroll as a world velocity; streak normals and foam are advected along it.
+    vec3 rs = vec3(0.0);
+    bool river = false;
+    vec2 flowV = vec2(0.0);
+    float rfade = 1.0 - smoothstep(8.0, 34.0, footprintS);
+    {
+        vec2 gH = dFdx(H.xz), gH2 = dFdy(H.xz);
+        if (uRiver > 0.0 && !sky) {
+            vec4 fl = texelFetch(uFlowBuf, p, 0);
+            if (fl.z > 0.5) {
+                river = true;
+                flowV = fl.xy;
+                rs = flowSurface(H.xz, flowV, gH, gH2);
+            }
+        }
+    }
+    vec2 riverSlope = rs.xy * (0.16 * uRiver * rfade);
+
     vec3 C = texelFetch(uScene, p, 0).rgb;
     vec3 D = C;
     float fogH = 0.0;
@@ -3100,7 +3121,7 @@ void main() {
         vec3 Bp = texelFetch(uOpaqueColor, p, 0).rgb;
         vec3 B = Bp; // the bed as seen through the (wobbling) surface
         if (!sky && uRefr > 0.0) {
-            vec2 slope = refractSlope(H.xz, footprintS) * 1.6 + big;
+            vec2 slope = refractSlope(H.xz, footprintS) * 1.6 + big + riverSlope * 1.6;
             vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
             vec3 Rw = refract(-V, N, 1.0 / 1.33);
             vec3 Rf = refract(-V, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
@@ -3151,8 +3172,9 @@ void main() {
             vec3 R = B * T + body * (1.0 - T);
             if (!sky) {
                 // Wave facets facing the light are brighter (a stand-in for the water's own ripple lighting).
-                vec2 ws = refractSlope(H.xz, footprintS);
+                vec2 ws = refractSlope(H.xz, footprintS) + riverSlope;
                 float facet = clamp(dot(ws, normalize(uLightDir.xz + vec2(1e-3))) * 3.2, -0.3, 0.3);
+                facet += clamp(dot(riverSlope, normalize(uLightDir.xz + vec2(1e-3))) * 2.6, -0.3, 0.3);
                 if (wave) {
                     // Swell faces towards the light are brighter, faces away darker; a thin crest in front of the sun glows
                     // with the water's own scatter colour.
@@ -3217,6 +3239,18 @@ void main() {
         foam *= 1.0 - smoothstep(3.0, 9.0, footprint);
         f = foam * uFoam * 0.65;
         foamCol = foamTint(H);
+    }
+    if (river && uFoam > 0.0 && !sky) {
+        // Streak foam: the thick ridges of the flowing mask, strongest where the water is shallow (banks, rocks in the
+        // stream) and where it runs fast. The depth-based contact foam above still marks the shoreline itself.
+        float sp = clamp(length(flowV) / 45.0, 0.0, 1.0);
+        float shallow = 1.0 - smoothstep(14.0, 110.0, depthY);
+        float rf = smoothstep(0.5, 0.92, rs.z) * (0.12 + 0.88 * shallow) * (0.3 + 0.7 * sp) *
+                   (1.0 - smoothstep(4.0, 14.0, footprintS)) * uFoam * min(uRiver, 1.5) * 0.7;
+        if (rf > f) {
+            f = rf;
+            foamCol = foamTint(H);
+        }
     }
     if (wave && uFoam > 0.0) {
         // Crest whitecaps and the wake foam of the ripple field (both are in the trace pass's alpha). Foam is only opaque where
@@ -3932,6 +3966,8 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uWaveBuf", PostFxGL::kWaveBufUnit },
                           { "uWaveDepth", PostFxGL::kWaveDepthUnit },
                           { "uRipple", PostFxGL::kRippleUnit },
+                          { "uFlowBuf", PostFxGL::kFlowBufUnit },
+                          { "uFlowNoise", PostFxGL::kFlowNoiseUnit },
                           { "uPsCube0", PostFxGL::kPointShadowUnit0 },
                           { "uPsCube1", PostFxGL::kPointShadowUnit1 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
@@ -4054,7 +4090,7 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units <= kPointShadowUnit1) {
+    if (units <= kRiverSpriteUnit) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
@@ -4286,8 +4322,8 @@ void main() { oColor = vec4(1.0); }
     mWaterReflection.id = BuildProgram("water reflection shader", waterReflection, 5, mWaterReflection.uniforms);
     const char* waterApply[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterReflectionApplyShader };
     mWaterReflectionApply.id = BuildProgram("water reflection upsample", waterApply, 4, mWaterReflectionApply.uniforms);
-    const char* waterSurface[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterSurfaceShader };
-    mWaterSurface.id = BuildProgram("water surface shader", waterSurface, 4, mWaterSurface.uniforms);
+    const char* waterSurface[] = { kVersion, kDepthLib, kWaterPlaneLib, kRiverFlowLib, kWaterSurfaceShader };
+    mWaterSurface.id = BuildProgram("water surface shader", waterSurface, 5, mWaterSurface.uniforms);
     {
         // Caustics/underwater: optional. Their texture array lives on its own unit (kCausticUnit) with a complete dummy
         // bound from creation on, so no program ever observes unit 0 for that sampler.
@@ -4326,11 +4362,26 @@ void main() { oColor = vec4(1.0); }
         glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveWave);
         glGenTextures(1, &mWaveDummy);
         const float zero4[4] = {};
-        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit }) {
+        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit, kFlowBufUnit }) {
             glActiveTexture(GL_TEXTURE0 + unit);
             glBindTexture(GL_TEXTURE_2D, mWaveDummy);
             if (unit == kWaveBufUnit) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_FLOAT, zero4);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            }
+        }
+        // Rivers and waterfalls: the flow noise and spray sprite lanes get a complete 1x1 texture now; the asset loader
+        // later replaces their contents in place (same texture names), so the lanes are never incomplete.
+        {
+            const uint8_t grey[4] = { 128, 128, 128, 0 };
+            GLuint* names[2] = { &mFlowNoise, &mRiverSprite };
+            const int lanes[2] = { kFlowNoiseUnit, kRiverSpriteUnit };
+            for (int i = 0; i < 2; i++) {
+                glGenTextures(1, names[i]);
+                glActiveTexture(GL_TEXTURE0 + lanes[i]);
+                glBindTexture(GL_TEXTURE_2D, *names[i]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, grey);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             }
@@ -5398,6 +5449,10 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     // The water surface runs before the soft-sprite effects (NEWDAWN_POSTFX_STAGE_WATER_XLU) so splashes and ripples draw above it
     const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
                          params.shadowUseExactProj != 0;
+    // Waterfalls do not need a water plane: a fall can have no WaterBox near it (docs/WATER_SIM.md).
+    const bool doFalls = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 &&
+                         (params.waterFalls > 0.0f || params.waterRivers > 0.0f) &&
+                         mFlowCount > 0 && params.shadowUseExactProj != 0 && mHdrActive;
     const bool doWeather = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosWeather &&
                            params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doAtmos = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.atmosParticles &&
@@ -5447,7 +5502,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     const bool doScene = !mHdrActive && stage == NEWDAWN_POSTFX_STAGE_SCENE_END && s.postFxOn && s.debugView != 2 &&
                          (s.bloomOn || s.gradeOn || mArt.on);
     if (!doShadow && !doAo && !doScene && !doWater && !captureWater && !doFog && !doAtmos && !doWeather && !doGi &&
-        !doVfx && !doLocal && !doGrass && !doCaustics && !doUnderwater && !doWorldGi) {
+        !doVfx && !doLocal && !doGrass && !doCaustics && !doUnderwater && !doWorldGi && !doFalls) {
         return;
     }
 
@@ -5478,7 +5533,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(kGrassTimerStage);
     }
     if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal || doCaustics ||
-        doUnderwater || doInterior || doProbe || doWorldGi) {
+        doUnderwater || doInterior || doProbe || doWorldGi || doFalls) {
         PrepareDepth(fb);
     }
     if (doProbe) {
@@ -5493,16 +5548,23 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     if (doWater && !(params.waterUnderwater > 0.0f && params.waterUnderwaterState >= 1.0f && mUnderwater.id)) {
         BeginTimer(kWaterTimerStage);
         RunWaterWaves(params, fb);
+        RunRiverFlow(params, fb);
         RunWaterSurface(params, fb);
         if (params.waterStrength > 0.0f || params.waterReflections != 0) {
             RunWater(params, fb);
         }
+        RunWaterfalls(params, fb);
         // The lanes go back to their complete dummy: no program ever observes a stale or unit-0 texture there.
-        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit }) {
+        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit, kFlowBufUnit }) {
             glActiveTexture(GL_TEXTURE0 + unit);
             glBindTexture(GL_TEXTURE_2D, mWaveDummy);
         }
         mWaveBufFrame = UINT32_MAX;
+        mFlowBufFrame = UINT32_MAX;
+        EndTimer(kWaterTimerStage);
+    } else if (doFalls) {
+        BeginTimer(kWaterTimerStage);
+        RunWaterfalls(params, fb);
         EndTimer(kWaterTimerStage);
     }
     if (doShadow) {
@@ -6114,6 +6176,289 @@ void PostFxGL::RunWaterWaves(const NewDawnPostFxParams& params, const Framebuffe
     CheckError("water waves");
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Rivers and waterfalls (docs/WATER_SIM.md). Everything here reads the triangles the interpreter recorded from the native
+// water draws (with the velocity of their texture scroll); nothing is written back to the game.
+// ---------------------------------------------------------------------------------------------------------------------
+bool PostFxGL::BuildRiverPrograms() {
+    if (mRiverAttempted) {
+        return mRiverFlow.id != 0;
+    }
+    mRiverAttempted = true;
+    const std::string version = "#version 330 core\n";
+    const std::string flowV = version + kRiverFlowVertex, flowF = version + kRiverFlowFragment;
+    const std::string fallV = version + kFallVertex, fallF = version + kRiverFlowLib + kFallFragment;
+    const std::string mistV = version + kMistVertex, mistF = version + kMistFragment;
+    GLint previousProgram;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+    BuildAtmosShader(mRiverFlow, flowV.c_str(), flowF.c_str());
+    if (BuildAtmosShader(mFallDraw, fallV.c_str(), fallF.c_str())) {
+        Use(mFallDraw);
+        glUniform1i(Loc("uVisibleDepth"), kFirstUnit + 3);
+        glUniform1i(Loc("uFlowNoise"), kFlowNoiseUnit);
+    }
+    if (BuildAtmosShader(mMistDraw, mistV.c_str(), mistF.c_str())) {
+        Use(mMistDraw);
+        glUniform1i(Loc("uSprite"), kRiverSpriteUnit);
+        glUniform1i(Loc("uVisibleDepth"), kFirstUnit + 3);
+        glUniform1i(Loc("uFlowNoise"), kFlowNoiseUnit);
+    }
+    glUseProgram(previousProgram);
+    glGenVertexArrays(1, &mFlowVao);
+    glGenBuffers(1, &mFlowVbo);
+    GLint previousVao = 0, previousVbo = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previousVao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previousVbo);
+    glBindVertexArray(mFlowVao);
+    glBindBuffer(GL_ARRAY_BUFFER, mFlowVbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(previousVao);
+    glBindBuffer(GL_ARRAY_BUFFER, previousVbo);
+    return mRiverFlow.id != 0;
+}
+
+// Loads the flow noise and the mist sprite into their lanes (the textures exist from Init as 1x1 dummies).
+bool PostFxGL::EnsureRiverAssets() {
+    const std::string root = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Assets.Path", "assets/newdawn");
+    if (root == mRiverAssetPath) {
+        return mRiverAssetsOk;
+    }
+    mRiverAssetPath = root;
+    const auto load = [&](GLuint tex, int unit, const std::filesystem::path& path, bool repeat) {
+        int w = 0, h = 0, n = 0;
+        auto* data = stbi_load(path.string().c_str(), &w, &h, &n, 4);
+        if (!data) {
+            SPDLOG_WARN("NewDawnRivers: missing {} (set gNewDawn.Assets.Path to the asset root); rivers and waterfalls are skipped",
+                        path.string());
+            return false;
+        }
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        stbi_image_free(data);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        return true;
+    };
+    const bool ok = load(mFlowNoise, kFlowNoiseUnit, std::filesystem::path(root) / "water" / "flow_noise_256.png", true) &&
+                    load(mRiverSprite, kRiverSpriteUnit, std::filesystem::path(root) / "atmos" / "dust_64.png", false);
+    mRiverAssetsOk = ok; // not retried (and not warned about) every frame
+    return ok;
+}
+
+// Re-rasterises the recorded river surfaces from the camera into the flow buffer (RG = world xz velocity, B = covered).
+void PostFxGL::RunRiverFlow(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    mFlowBufFrame = UINT32_MAX;
+    if (params.waterRivers <= 0.0f || mFlowCount == 0 || mFlowData == nullptr || !BuildRiverPrograms() ||
+        !EnsureRiverAssets()) {
+        return;
+    }
+    mFlowScratch.clear();
+    for (uint32_t t = 0; t < mFlowCount; t++) {
+        const float* tri = mFlowData + (size_t)t * NEWDAWN_FLOW_TRI_FLOATS;
+        if (tri[12] != 0.0f) {
+            continue; // a waterfall face
+        }
+        for (int i = 0; i < 3; i++) {
+            mFlowScratch.insert(mFlowScratch.end(), tri + i * 3, tri + i * 3 + 3);
+            mFlowScratch.insert(mFlowScratch.end(), tri + 9, tri + 12);
+        }
+    }
+    if (mFlowScratch.empty()) {
+        return;
+    }
+    const int w = fb.width, h = fb.height;
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    EnsureTarget(mFlowBuf, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    glBindFramebuffer(GL_FRAMEBUFFER, mFlowBuf.fbo);
+    glViewport(0, 0, w, h);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    Use(mRiverFlow);
+    glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glBindVertexArray(mFlowVao);
+    glBindBuffer(GL_ARRAY_BUFFER, mFlowVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(mFlowScratch.size() * sizeof(float)), mFlowScratch.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mFlowScratch.size() / 6));
+    glBindVertexArray(mVao);
+    mFlowBufFrame = mSettingsFrame;
+    CheckError("river flow");
+}
+
+// Waterfalls: a flowing layer over the native fall faces, then mist, spray and foam at their feet.
+void PostFxGL::RunWaterfalls(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if ((params.waterFalls <= 0.0f && params.waterRivers <= 0.0f) || mFlowCount == 0 || mFlowData == nullptr ||
+        !BuildRiverPrograms() || !EnsureRiverAssets() || !mFallDraw.id) {
+        return;
+    }
+    mFlowScratch.clear();
+    // Foot of each fall: per 48-unit cell the lowest vertex, the top, and the face normal (a fall is vertical, so one cell
+    // holds one column of its mesh).
+    struct Cell {
+        float low[3] = { 0, 1e9f, 0 }, high = -1e9f, nx = 0, nz = 0;
+    };
+    std::unordered_map<int64_t, Cell> cells;
+    // Painted streams (kind 2) go through the same overlay shader in their own mode, drawn after the falls.
+    std::vector<float> streams;
+    for (uint32_t t = 0; t < mFlowCount; t++) {
+        const float* tri = mFlowData + (size_t)t * NEWDAWN_FLOW_TRI_FLOATS;
+        if (tri[12] == 2.0f && params.waterRivers > 0.0f) {
+            for (int i = 0; i < 3; i++) {
+                streams.insert(streams.end(), tri + i * 3, tri + i * 3 + 3);
+                streams.insert(streams.end(), tri + 9, tri + 12);
+            }
+        }
+    }
+    for (uint32_t t = 0; t < mFlowCount; t++) {
+        const float* tri = mFlowData + (size_t)t * NEWDAWN_FLOW_TRI_FLOATS;
+        if (tri[12] != 1.0f || params.waterFalls <= 0.0f) {
+            continue;
+        }
+        for (int i = 0; i < 3; i++) {
+            mFlowScratch.insert(mFlowScratch.end(), tri + i * 3, tri + i * 3 + 3);
+            mFlowScratch.insert(mFlowScratch.end(), tri + 9, tri + 12);
+        }
+        const float e1[3] = { tri[3] - tri[0], tri[4] - tri[1], tri[5] - tri[2] };
+        const float e2[3] = { tri[6] - tri[0], tri[7] - tri[1], tri[8] - tri[2] };
+        float nx = e1[1] * e2[2] - e1[2] * e2[1], nz = e1[0] * e2[1] - e1[1] * e2[0];
+        const float nl = std::sqrt(nx * nx + nz * nz);
+        if (nl > 1e-3f) {
+            nx /= nl;
+            nz /= nl;
+        }
+        for (int i = 0; i < 3; i++) {
+            const float* p = tri + i * 3;
+            const int64_t key = ((int64_t)std::floor(p[0] / 48.0f) << 32) ^ (int64_t)(uint32_t)(int32_t)std::floor(p[2] / 48.0f);
+            Cell& cell = cells[key];
+            if (p[1] < cell.low[1]) {
+                cell.low[0] = p[0], cell.low[1] = p[1], cell.low[2] = p[2];
+            }
+            cell.high = std::max(cell.high, p[1]);
+            // face the camera so the mist leaves towards the viewer's side of the fall
+            const float sign = ((params.waterCameraEye[0] - p[0]) * nx + (params.waterCameraEye[2] - p[2]) * nz) < 0.0f ? -1.0f : 1.0f;
+            cell.nx += nx * sign;
+            cell.nz += nz * sign;
+        }
+    }
+    if (mFlowScratch.empty() && streams.empty()) {
+        return;
+    }
+    const int w = fb.width, h = fb.height;
+    float light[3], sky[3], fogColor[3];
+    for (int i = 0; i < 3; ++i) {
+        light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                              : params.waterLightColor[i];
+        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                            : params.waterSkyColor[i];
+        fogColor[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f)
+                                 : params.waterSkyColor[i];
+    }
+    float fogMul, fogOff;
+    FogCoefficients(params, fogMul, fogOff);
+    const float strength = std::min(params.waterFalls, 2.0f);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    Bind(3, mDepth.tex); // visible depth
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    glViewport(0, 0, w, h);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    const float pixelAngle = 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h;
+    const auto common = [&]() {
+        glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+        glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+        glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+        glUniform1f(Loc("uTime"), params.waterTime);
+        glUniform1f(Loc("uNear"), params.zNear);
+        glUniform1f(Loc("uFar"), params.zFar);
+        glUniform1f(Loc("uStrength"), strength);
+        glUniform1f(Loc("uPixelAngle"), pixelAngle);
+        glUniform1i(Loc("uDebug"), CvInt("gNewDawn.Water.FlowDebug", 0));
+        glUniform1f(Loc("uFogMul"), fogMul);
+        glUniform1f(Loc("uFogOff"), fogOff);
+        glUniform3fv(Loc("uFogColor"), 1, fogColor);
+        glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+        glUniform3fv(Loc("uLightDir"), 1, params.waterLightDir);
+        glUniform3fv(Loc("uLightColor"), 1, light);
+        glUniform3fv(Loc("uSky"), 1, sky);
+    };
+    Use(mFallDraw);
+    common();
+    glBindVertexArray(mFlowVao);
+    glBindBuffer(GL_ARRAY_BUFFER, mFlowVbo);
+    if (!mFlowScratch.empty()) {
+        glUniform1i(Loc("uMode"), 0);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(mFlowScratch.size() * sizeof(float)), mFlowScratch.data(), GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mFlowScratch.size() / 6));
+    }
+    if (!streams.empty()) {
+        glUniform1i(Loc("uMode"), 1);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(streams.size() * sizeof(float)), streams.data(), GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(streams.size() / 6));
+    }
+    // Mist, spray and foam at the foot of each fall: nearest first, at most 48, none beyond 4000 units.
+    struct Emitter {
+        float dist, pos[4], dir[4];
+    };
+    std::vector<Emitter> emitters;
+    for (const auto& [key, cell] : cells) {
+        const float height = cell.high - cell.low[1];
+        if (height < 36.0f) {
+            continue;
+        }
+        const float dx = cell.low[0] - params.waterCameraEye[0], dz = cell.low[2] - params.waterCameraEye[2];
+        const float dist = std::sqrt(dx * dx + dz * dz);
+        if (dist > 4000.0f) {
+            continue;
+        }
+        float nl = std::sqrt(cell.nx * cell.nx + cell.nz * cell.nz);
+        Emitter e;
+        e.dist = dist;
+        e.pos[0] = cell.low[0], e.pos[1] = cell.low[1], e.pos[2] = cell.low[2];
+        e.pos[3] = std::clamp(height / 180.0f, 0.45f, 1.5f);
+        e.dir[0] = nl > 1e-3f ? cell.nx / nl : 0.0f, e.dir[1] = 0.0f, e.dir[2] = nl > 1e-3f ? cell.nz / nl : 1.0f;
+        e.dir[3] = 34.0f;
+        emitters.push_back(e);
+    }
+    std::sort(emitters.begin(), emitters.end(), [](const Emitter& a, const Emitter& b) { return a.dist < b.dist; });
+    if (emitters.size() > 48) {
+        emitters.resize(48);
+    }
+    if (!emitters.empty() && mMistDraw.id) {
+        float emit[48][4] = {}, emitB[48][4] = {};
+        for (size_t i = 0; i < emitters.size(); i++) {
+            std::copy(emitters[i].pos, emitters[i].pos + 4, emit[i]);
+            std::copy(emitters[i].dir, emitters[i].dir + 4, emitB[i]);
+        }
+        Use(mMistDraw);
+        common();
+        const float projection = 1.0f / std::tan(params.fovyDegrees * 0.00872664626f);
+        glUniform2f(Loc("uProjection"), projection * float(h) / w, projection);
+        glUniform2f(Loc("uSize"), (float)w, (float)h);
+        glUniform1i(Loc("uCount"), (int)emitters.size());
+        glUniform4fv(Loc("uEmit[0]"), 48, &emit[0][0]);
+        glUniform4fv(Loc("uEmitB[0]"), 48, &emitB[0][0]);
+        glBindVertexArray(mVao);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, (GLsizei)emitters.size() * 30);
+    }
+    glBindVertexArray(mVao);
+    glDisable(GL_BLEND);
+    CheckError("waterfalls");
+}
+
 void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     const int w = fb.width, h = fb.height;
     const float foam = params.waterFoam;
@@ -6197,6 +6542,12 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
         glBindTexture(GL_TEXTURE_2D, mWaveBuf.tex);
     }
     glUniform1i(Loc("uWaves"), waves);
+    const bool rivers = mFlowBufFrame == mSettingsFrame && params.waterRivers > 0.0f;
+    if (rivers) {
+        glActiveTexture(GL_TEXTURE0 + kFlowBufUnit);
+        glBindTexture(GL_TEXTURE_2D, mFlowBuf.tex);
+    }
+    glUniform1f(Loc("uRiver"), rivers ? std::min(params.waterRivers, 2.0f) : 0.0f);
     glUniform1i(Loc("uDebug"), params.waterDebug);
     glUniform1f(Loc("uWaveAmp"), kWaveBaseAmp * params.waterWaves);
     // Swash is an ocean feature: it follows the swell setting, and the foam toggle/strength.
