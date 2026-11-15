@@ -9,6 +9,7 @@
 #include <chrono>
 #include <limits>
 #include <filesystem>
+#include <fstream>
 #include <cstring>
 #include <stb_image.h>
 #include <string>
@@ -34,6 +35,10 @@ constexpr float kSaturation = 1.08f;
 
 static int CvInt(const char* name, int def) {
     return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(name, def);
+}
+
+static std::string CvString(const char* name, const char* def) {
+    return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString(name, def);
 }
 
 static float CvFloat(const char* name, float def) {
@@ -110,6 +115,42 @@ vec2 density(vec3 p) {
     float h = max(length(p) - Rg, 0.0);
     return exp(-h / vec2(8.0, 1.2));
 }
+// Night sky (gNewDawn.Sky.Night): the Milky Way from a real all-sky panorama (NASA SVS Deep Star Maps, equatorial
+// coordinates) rotated by the game clock, plus a cool glow around the Moon. Stars are separate sharp point sprites.
+uniform mat3 uCelestial;   // world -> J2000 equatorial
+uniform sampler2D uMilkyWay;
+uniform float uMilkyScale;
+uniform float uMilkyGain;  // 0 = off, includes night/variant/weather visibility
+uniform vec3 uMoonDir;
+uniform float uMoonGlowAmt;
+float starExtinction(float e) {
+    float airmass = 1.0 / (max(e, 0.0) * 0.95 + 0.06);
+    return exp(-0.20 * (airmass - 1.0)) * smoothstep(0.0, 0.05, e);
+}
+vec3 nightSky(vec3 ray) {
+    vec3 col = vec3(0.0);
+    if (uMilkyGain > 0.0) {
+        vec3 v = uCelestial * ray;
+        float lat = 0.5 - asin(clamp(v.z, -1.0, 1.0)) / PI;
+        float ra0 = atan(v.y, v.x) / (2.0 * PI);
+        float ra1 = atan(-v.y, -v.x) / (2.0 * PI) + 0.5;
+#ifdef SKY_CAPTURE
+        vec3 tex = textureLod(uMilkyWay, vec2(ra0, lat), 5.0).rgb;
+#else
+        // Two phase-shifted longitudes: derivatives stay continuous across the atan seam.
+        bool first = abs(ra0) < 0.25;
+        vec3 tex = textureGrad(uMilkyWay, vec2(first ? ra0 : ra1, lat), vec2(first ? dFdx(ra0) : dFdx(ra1), dFdx(lat)),
+                               vec2(first ? dFdy(ra0) : dFdy(ra1), dFdy(lat))).rgb;
+#endif
+        col += tex * uMilkyScale * uMilkyGain * vec3(0.92, 0.98, 1.08) * starExtinction(ray.y);
+    }
+    if (uMoonGlowAmt > 0.0) {
+        float ang = acos(clamp(dot(ray, uMoonDir), -1.0, 1.0));
+        float halo = 0.030 * exp(-ang / 0.022) + 0.0060 * exp(-ang / 0.14) + 0.0012 * exp(-ang / 0.6);
+        col += vec3(0.50, 0.64, 1.0) * halo * uMoonGlowAmt * smoothstep(-0.08, 0.12, uMoonDir.y);
+    }
+    return col;
+}
 vec3 sky(vec3 ray) {
     vec3 origin = vec3(0.0, Rg + 0.2, 0.0);
     float distance = exitDistance(origin, ray);
@@ -168,10 +209,73 @@ void main() {
     vec3 rayAbove = normalize(vec3(ray.x, max(ray.y, 0.005), ray.z));
     // Match the game's fog radiance exactly at/below the horizon, preserving distant silhouettes.
     vec3 color = mix(uFog, sky(rayAbove), smoothstep(0.0, mix(0.05, 0.45, uOvercast), ray.y));
+    color += nightSky(ray);
 #ifdef SKY_CAPTURE
     color = cubeFinite(color);
 #endif
     oColor = vec4(color, 1.0);
+}
+)GLSL";
+
+// Real star catalogue (HYG v4.1): each star is a point sprite with a Gaussian PSF, flux 10^(-0.4 mag), its B-V colour,
+// atmospheric extinction/reddening near the horizon, scintillation that grows towards the horizon, and occlusion by the
+// volumetric clouds drawn before it. Full resolution, so the field stays crisp under MSAA and camera motion.
+static const char* kStarVertexShader = R"GLSL(
+layout(location = 0) in vec3 aDir;
+layout(location = 1) in float aMag;
+layout(location = 2) in vec3 aCol;
+uniform mat4 uViewProj;
+uniform float uNdcXScale;
+uniform float uFlipY;
+uniform mat3 uCelestial;
+uniform float uFlux;
+uniform float uPix;
+uniform float uTime;
+uniform float uCloudsOn;
+uniform vec2 uRes;
+uniform sampler2D uClouds;
+out vec3 vColor;
+out float vSigma;
+out vec2 vCenter;
+void main() {
+    vec3 d = transpose(uCelestial) * aDir;
+    vec4 clip = uViewProj * vec4(d, 0.0);
+    gl_PointSize = 1.0;
+    vColor = vec3(0.0);
+    vSigma = 1.0;
+    vCenter = vec2(0.0);
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    if (clip.w <= 0.0 || d.y <= 0.0) return;
+    vec2 ndc = clip.xy / clip.w / vec2(uNdcXScale, uFlipY);
+    if (abs(ndc.x) > 1.15 || abs(ndc.y) > 1.15) return;
+    float e = d.y;
+    float sigmaN = 0.62 + 0.20 * clamp(2.0 - aMag, 0.0, 3.5);
+    float peak = uFlux * pow(10.0, -0.4 * aMag) / (6.2831853 * sigmaN * sigmaN);
+    float phase = fract(sin(dot(aDir, vec3(12.9898, 78.233, 37.719))) * 43758.5453) * 6.2831853;
+    float amp = 0.04 + 0.42 * pow(clamp(1.0 - e * 2.5, 0.0, 1.0), 2.0);
+    float tw = 1.0 + amp * (0.6 * sin(uTime * 6.5 + phase) + 0.4 * sin(uTime * 11.3 + phase * 1.7));
+    float airmass = 1.0 / (e * 0.95 + 0.06);
+    float ext = exp(-0.20 * (airmass - 1.0)) * smoothstep(0.0, 0.05, e);
+    vec3 red = mix(vec3(1.0, 0.72, 0.50), vec3(1.0), clamp(e * 6.0, 0.0, 1.0));
+    float vis = 1.0;
+    if (uCloudsOn > 0.0) vis = 1.0 - textureLod(uClouds, ndc * 0.5 + 0.5, 1.5).a;
+    vColor = aCol * red * peak * max(tw, 0.0) * ext * vis;
+    float sigma = sigmaN * uPix;
+    vSigma = sigma;
+    vCenter = (ndc * 0.5 + 0.5) * uRes;
+    gl_PointSize = clamp(ceil(sigma * 6.0) + 2.0, 3.0, 63.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+)GLSL";
+
+static const char* kStarFragmentShader = R"GLSL(
+in vec3 vColor;
+in float vSigma;
+in vec2 vCenter;
+out vec4 oColor;
+void main() {
+    vec2 p = gl_FragCoord.xy - vCenter;
+    oColor = vec4(vColor * exp(-dot(p, p) / (2.0 * vSigma * vSigma)), 0.0);
 }
 )GLSL";
 
@@ -2866,7 +2970,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uFlareEmitter", PostFxGL::kFlareUnit },
                           { "uFlareSprites", PostFxGL::kFlareSpritesUnit },
                           { "uFlareClouds", PostFxGL::kFlareCloudUnit }, { "uScene", 8 }, { "uDepth", 9 },
-                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 }, { "uCausticTex", PostFxGL::kCausticUnit }, { "uUwShafts", 10 } }) {
+                          { "uGiRaw", 10 }, { "uGiShadow", 10 }, { "uGiHistory", 11 }, { "uRayMask", 8 }, { "uRays", 11 }, { "uRaySky", 10 }, { "uShadowCmp", 11 }, { "uCausticTex", PostFxGL::kCausticUnit }, { "uMilkyWay", PostFxGL::kMilkyWayUnit }, { "uClouds", 8 }, { "uUwShafts", 10 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -3089,6 +3193,22 @@ bool PostFxGL::BuildPrograms() {
     const char* cloudMarch[] = { kVersion, kSkyPaletteLib, kCloudMarchShader };
     const char* cloudApply[] = { kVersion, kCloudApplyShader };
     mCloudMarch.id = BuildProgram("volumetric clouds", cloudMarch, 3, mCloudMarch.uniforms);
+    {
+        // Milky Way panorama lane: a complete 2D dummy is bound before any program that declares uMilkyWay is built.
+        GLint previousActive;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+        glActiveTexture(GL_TEXTURE0 + kMilkyWayUnit);
+        glGenTextures(1, &mMilkyWayDummy);
+        glBindTexture(GL_TEXTURE_2D, mMilkyWayDummy);
+        const uint16_t zero[3] = {};
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, 1, 1, 0, GL_RGB, GL_HALF_FLOAT, zero);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(previousActive);
+    }
+    const char* starVs[] = { kVersion, kStarVertexShader };
+    const char* starFs[] = { kVersion, kStarFragmentShader };
+    mStars.id = BuildProgramWithVertex("night stars", starVs, 2, starFs, 2, mStars.uniforms);
     mCloudApply.id = BuildProgram("cloud upscale", cloudApply, 2, mCloudApply.uniforms);
     const char* skyEnvironment[] = { kVersion, "#define SKY_CAPTURE\n", kSkyPaletteLib, kSkyCubeDirectionLib,
                                      kPhysicalSkyShader };
@@ -3355,6 +3475,7 @@ void PostFxGL::BeginTimer(int stage) {
                                 : (stage == 17) ? "water caustics"
                                 : (stage == 18) ? "underwater"
                                 : (stage == 19) ? "grass"
+                                : (stage == 20) ? "night stars"
                                                : "sky ambient cube";
             SPDLOG_INFO("NewDawnPostFx: stage {} ({}) averages {:.3f} ms GPU over {} runs", stage, label,
                         mQueryTotalMs[stage] / 300.0, 300);
@@ -3574,6 +3695,7 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniform1f(Loc("uOvercast"), look.overcast);
     glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
     glUniform1f(Loc("uCoverage"), look.coverage);
+    SetNightUniforms(params);
     // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
     static const auto epoch = std::chrono::steady_clock::now();
@@ -3582,6 +3704,199 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     const double drift = CvInt("gNewDawn.Atmos.Wind", 0) ? -NewDawnWindTravel(NewDawnWindSeconds()) : seconds;
     glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018 * look.windMul, 1024.0)),
                 static_cast<float>(std::fmod(drift * 0.009 * look.windMul, 1024.0)));
+}
+
+// Night sky assets (never committed): `<gNewDawn.Assets.Path>/nightsky/{stars.bin,milkyway_eq.f16}`, baked by
+// tools/newdawn/nightsky/prep_nightsky.py from the HYG v4.1 catalogue and NASA SVS Deep Star Maps 2020.
+bool PostFxGL::EnsureNightSkyAssets() {
+    const std::string root = CvString("gNewDawn.Assets.Path", "assets/newdawn");
+    if (root == mNightAssetPath)
+        return mMilkyWayTex != 0 && mStarCount > 0;
+    mNightAssetPath = root;
+    if (mMilkyWayTex) {
+        glDeleteTextures(1, &mMilkyWayTex);
+        mMilkyWayTex = 0;
+    }
+    mStarCount = 0;
+    const auto dir = std::filesystem::path(root) / "nightsky";
+    GLint previousActive;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+    {
+        std::ifstream f(dir / "milkyway_eq.f16", std::ios::binary);
+        char magic[4];
+        uint32_t w = 0, h = 0;
+        float scale = 1.0f;
+        if (f.read(magic, 4) && std::memcmp(magic, "NDMW", 4) == 0 && f.read((char*)&w, 4) && f.read((char*)&h, 4) &&
+            f.read((char*)&scale, 4) && w > 0 && h > 0 && w <= 8192 && h <= 4096) {
+            std::vector<uint16_t> data((size_t)w * h * 3);
+            if (f.read((char*)data.data(), data.size() * 2)) {
+                glActiveTexture(GL_TEXTURE0 + kMilkyWayUnit);
+                glGenTextures(1, &mMilkyWayTex);
+                glBindTexture(GL_TEXTURE_2D, mMilkyWayTex);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_HALF_FLOAT, data.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glGenerateMipmap(GL_TEXTURE_2D);
+                mMilkyWayScale = scale;
+            }
+        }
+    }
+    {
+        std::ifstream f(dir / "stars.bin", std::ios::binary);
+        char magic[4];
+        uint32_t count = 0;
+        if (f.read(magic, 4) && std::memcmp(magic, "NDST", 4) == 0 && f.read((char*)&count, 4) && count > 0 &&
+            count < 200000) {
+            std::vector<float> data((size_t)count * 7);
+            if (f.read((char*)data.data(), data.size() * 4)) {
+                if (!mStarVao) {
+                    glGenVertexArrays(1, &mStarVao);
+                    glGenBuffers(1, &mStarVbo);
+                }
+                glBindVertexArray(mStarVao);
+                glBindBuffer(GL_ARRAY_BUFFER, mStarVbo);
+                glBufferData(GL_ARRAY_BUFFER, data.size() * 4, data.data(), GL_STATIC_DRAW);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 28, (void*)0);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 28, (void*)12);
+                glEnableVertexAttribArray(2);
+                glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 28, (void*)16);
+                mStarCount = (int)count;
+            }
+        }
+    }
+    glActiveTexture(previousActive);
+    if (mMilkyWayTex && mStarCount > 0) {
+        SPDLOG_INFO("NewDawnNightSky: loaded {} stars and the Milky Way panorama from {}", mStarCount, dir.string());
+    } else {
+        SPDLOG_WARN("NewDawnNightSky: missing/unsupported assets in {} (stars.bin, milkyway_eq.f16); the native stars "
+                    "stay. Set gNewDawn.Assets.Path to the asset root.",
+                    dir.string());
+    }
+    return mMilkyWayTex != 0 && mStarCount > 0;
+}
+
+// Night visibility of stars and the Milky Way: astronomical twilight (sun about 17 degrees down), the variant's own
+// multiplier (dimmed under the final-day storm, 0 in cursed Ikana and the poisoned swamp), rain and overcast.
+static float NightVisibility(const NewDawnPostFxParams& params) {
+    if (!CvInt("gNewDawn.Sky.Night", 0) || params.skyStarVis <= 0.0f)
+        return 0.0f;
+    const float t = std::clamp((-params.skySunDir[1] - 0.03f) / 0.27f, 0.0f, 1.0f);
+    const float dark = t * t * (3.0f - 2.0f * t);
+    const float weather = 1.0f - 0.9f * std::clamp(params.skyWeather, 0.0f, 1.0f);
+    const float overcast = 1.0f - 0.8f * std::clamp(params.skyOvercast, 0.0f, 1.0f);
+    return dark * params.skyStarVis * weather * overcast * std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
+}
+
+// World -> J2000 equatorial. The sun moves in a plane through the origin (the game's sunPos is
+// (-sin a, cos a, cos a / 6)), so the whole sky turns about that plane's normal by the same hour angle: the north
+// celestial pole is the plane normal (about 9.5 degrees above the northern -Z horizon). The sun's J2000 right
+// ascension is fixed at 6h (June), so galactic centre culminates in the south near midnight.
+static void CelestialMatrix(float clock, float out[9]) {
+    const double pi = 3.14159265358979323846;
+    const double a = (clock - 0.5) * 2.0 * pi;
+    double zc[3] = { 0.0, 0.16440, -0.98639 };
+    double b[3] = { 0.0, 0.98639, 0.16440 }; // the sun at noon
+    // t = zc x b
+    double t[3] = { zc[1] * b[2] - zc[2] * b[1], zc[2] * b[0] - zc[0] * b[2], zc[0] * b[1] - zc[1] * b[0] };
+    const double alpha = pi * 0.5;
+    const double ca = std::cos(alpha), sa = std::sin(alpha);
+    // M = [b t zc] * [s t0 z]^T, with s = (ca, sa, 0), t0 = (-sa, ca, 0), z = (0, 0, 1)
+    double M[3][3];
+    for (int i = 0; i < 3; ++i) {
+        M[i][0] = b[i] * ca + t[i] * (-sa);
+        M[i][1] = b[i] * sa + t[i] * ca;
+        M[i][2] = zc[i];
+    }
+    // R_Q(-a): rotation by -a about Q = -zc, i.e. by +a about zc. Rodrigues with axis zc, angle a.
+    const double c = std::cos(a), s = std::sin(a);
+    double R[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R[i][j] = c * (i == j) + (1.0 - c) * zc[i] * zc[j];
+    R[0][1] += -s * zc[2]; R[0][2] += s * zc[1];
+    R[1][0] += s * zc[2];  R[1][2] += -s * zc[0];
+    R[2][0] += -s * zc[1]; R[2][1] += s * zc[0];
+    // eq = M^T * R * world; store row-major, uploaded transposed.
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            double v = 0.0;
+            for (int k = 0; k < 3; ++k)
+                v += M[k][i] * R[k][j];
+            out[i * 3 + j] = (float)v;
+        }
+    }
+}
+
+void PostFxGL::SetNightUniforms(const NewDawnPostFxParams& params) {
+    float vis = NightVisibility(params);
+    float moon = 0.0f;
+    if (CvInt("gNewDawn.Sky.Night", 0)) {
+        const float t = std::clamp((-params.skySunDir[1] - 0.02f) / 0.2f, 0.0f, 1.0f);
+        moon = t * t * (3.0f - 2.0f * t) * params.skyMoonGlow * std::clamp(CvFloat("gNewDawn.Sky.MoonGlow", 1.0f), 0.0f, 4.0f);
+    }
+    if ((vis <= 0.0f && moon <= 0.0f) || !EnsureNightSkyAssets()) {
+        vis = 0.0f;
+        moon = 0.0f;
+    }
+    float m[9];
+    CelestialMatrix(params.skyClock, m);
+    glUniformMatrix3fv(Loc("uCelestial"), 1, GL_TRUE, m);
+    glUniform1f(Loc("uMilkyScale"), mMilkyWayScale);
+    glUniform1f(Loc("uMilkyGain"), vis * std::clamp(CvFloat("gNewDawn.Sky.MilkyWay", 1.0f), 0.0f, 4.0f) * 0.6f);
+    const float moonDir[3] = { -params.skySunDir[0], -params.skySunDir[1], -params.skySunDir[2] };
+    glUniform3fv(Loc("uMoonDir"), 1, moonDir);
+    glUniform1f(Loc("uMoonGlowAmt"), moon);
+    glUniform1i(Loc("uMilkyWay"), kMilkyWayUnit);
+    if (mMilkyWayTex) {
+        // Keep the panorama (or the dummy when assets are missing) on its lane for every program that declares it.
+        GLint previousActive;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+        glActiveTexture(GL_TEXTURE0 + kMilkyWayUnit);
+        glBindTexture(GL_TEXTURE_2D, mMilkyWayTex);
+        glActiveTexture(previousActive);
+    }
+}
+
+void PostFxGL::RunNightStars(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    const float vis = NightVisibility(params);
+    if (vis <= 0.0f || !mStars.id || !EnsureNightSkyAssets())
+        return;
+    GlStateGuard guard;
+    guard.Neutralise();
+    BeginTimer(kNightTimerStage);
+    glBindVertexArray(mStarVao);
+    Use(mStars);
+    glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    float m[9];
+    CelestialMatrix(params.skyClock, m);
+    glUniformMatrix3fv(Loc("uCelestial"), 1, GL_TRUE, m);
+    // HDR units: the display exposure is about 0.05, so a mag 6 star peaks near 0.5, Vega near 50.
+    glUniform1f(Loc("uFlux"), vis * std::clamp(CvFloat("gNewDawn.Sky.StarBrightness", 1.0f), 0.0f, 8.0f) * 300.0f);
+    glUniform1f(Loc("uPix"), std::max((float)fb.height, 1.0f) / 1080.0f);
+    static const auto epoch = std::chrono::steady_clock::now();
+    glUniform1f(Loc("uTime"), (float)std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
+    const bool clouds = mCloudsDrawnFrame == mSkyFrame && mClouds.tex != 0;
+    glUniform1f(Loc("uCloudsOn"), clouds ? mFlareCloudOpacity : 0.0f);
+    glUniform2f(Loc("uRes"), (float)fb.width, (float)fb.height);
+    Bind(0, clouds ? mClouds.tex : mFogNeutral);
+    glUniform1i(Loc("uClouds"), kFirstUnit);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+    glViewport(0, 0, fb.width, fb.height);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glDrawArrays(GL_POINTS, 0, mStarCount);
+    glDisable(GL_PROGRAM_POINT_SIZE);
+    EndTimer(kNightTimerStage);
+    CheckError("night stars");
 }
 
 void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex) {
@@ -3616,6 +3931,7 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
     EndTimer(kSkyTimerStage);
     CheckError("physical sky");
     RunClouds(params, fb);
+    RunNightStars(params, fb);
     mRaySkyReady = CvFloat("gNewDawn.Sky.Strength", 1.0f) >= 0.999f;
     RunSkyAmbient(params);
 }
@@ -3687,6 +4003,7 @@ void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL
     glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
     Draw(fb.fbo, fb.width, fb.height);
     mFlareCloudOpacity = strength;
+    mCloudsDrawnFrame = mSkyFrame;
     EndTimer(kCloudTimerStage);
     CheckError("volumetric clouds");
 }
@@ -4977,7 +5294,7 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     const float sunHeight = std::clamp(params.shadowSunDir[1], 0.0f, 1.0f);
     const float density = 0.32f / std::clamp(startDistance, 800.0f, 2400.0f) * params.fogDensityScale *
                           (1.4f - 0.7f * sunHeight);
-    const float sunFade = params.fogVolumetric == 1 ? std::clamp((sunHeight + 0.02f) / 0.22f, 0.0f, 1.0f) : 0.0f;
+    const float sunFade = params.fogVolumetric == 1 && !params.shadowIsMoon ? std::clamp((sunHeight + 0.02f) / 0.22f, 0.0f, 1.0f) : 0.0f;
     float fog[3], sun[3], ambient[3];
     for (int i = 0; i < 3; ++i) {
         fog[i] = DecodeColor(params.fogColor[i]) *
