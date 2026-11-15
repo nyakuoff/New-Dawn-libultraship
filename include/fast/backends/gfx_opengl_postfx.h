@@ -161,6 +161,7 @@ class PostFxGL {
     static constexpr int kFlowBufUnit = 36;
     static constexpr int kFlowNoiseUnit = 37;
     static constexpr int kRiverSpriteUnit = 38;
+    static constexpr int kFoamTexUnit = 39; // shoreline foam texture
     static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
     static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
@@ -253,6 +254,7 @@ class PostFxGL {
     // waterfall faces and draws mist, spray and foam at their feet.
     bool BuildRiverPrograms();
     bool EnsureRiverAssets();
+    void EnsureFoamTexture();
     void RunRiverFlow(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterfalls(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterWaves(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
@@ -425,8 +427,9 @@ class PostFxGL {
     GLuint mWaveDummy = 0;
     Program mRiverFlow, mFallDraw, mMistDraw;
     Target mFlowBuf;
-    GLuint mFlowNoise = 0, mRiverSprite = 0, mFlowVao = 0, mFlowVbo = 0;
-    bool mRiverAttempted = false, mRiverAssetsOk = false;
+    GLuint mFoamTex = 0, mFlowNoise = 0, mRiverSprite = 0, mFlowVao = 0, mFlowVbo = 0;
+    bool mRiverAttempted = false, mRiverAssetsOk = false, mFoamAssetOk = false;
+    std::string mFoamAssetPath;
     std::string mRiverAssetPath;
     uint32_t mFlowBufFrame = UINT32_MAX; // settings frame whose flow buffer is valid
     const float* mFlowData = nullptr;

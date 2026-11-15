@@ -2960,6 +2960,7 @@ uniform float uSwash;       // ocean shoreline swash strength, 0 = off
 uniform int uDebug;         // 3: displaced height (red above / blue below the plane, grey = no wave), 4: slope
 uniform sampler2D uFlowBuf; // river flow (world xz velocity of the native texture scroll, 1 = covered); dummy when off
 uniform float uRiver;       // river streak strength, 0 = off
+uniform sampler2D uFoamTex; // tileable foam (R lace, G clumps, B bubbles, A density), committed CC0
 
 float hash1(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
@@ -3084,6 +3085,12 @@ void main() {
     if (!sky && P.y >= planeY) {
         if (uSwash > 0.0) {
             swashOverlay(p, d, P, lvl, gslope); // ground just above the plane (a near-flat beach is within the depth tolerance)
+        } else if (uFoam > 0.0 && P.y < planeY + 1.4 && lvl < 1.0) {
+            // Meniscus: bank pixels a hair above the plane are the waterline itself; without foam on them the line is peppered
+            // with the dark bank showing through (depth quantisation).
+            float fm = (1.0 - smoothstep(0.3, 1.4, P.y - planeY)) * (1.0 - smoothstep(2.5, 8.0, length(ray) * uPixelAngle)) * uFoam * uSurfaceVisibility;
+            vec3 tintM = mix(vec3(1.0), uScatter / max(max(uScatter.r, uScatter.g), max(uScatter.b, 1e-3)), 0.2);
+            oColor = vec4(foamTint(P) * 1.2 * tintM * fm * 0.9, fm * 0.9);
         }
         return;
     }
@@ -3243,24 +3250,36 @@ void main() {
     float f = 0.0;
     vec3 foamCol = vec3(0.0);
     if (uFoam > 0.0 && !sky) {
+        // Shoreline foam: a thin, crisp bright line on the waterline plus broken lacy foam that thins out over a short
+        // distance, both read from the committed foam texture (R lace, A density) so they stay lace and not noise. Distance
+        // to the waterline comes from the thickness and its screen gradient (a gentle shore gets the same line as a steep one).
         float n1 = vnoise(H.xz / 38.0 + vec2(0.05, -0.03) * uTime);
-        float n2 = vnoise(H.xz / 11.0 + vec2(-0.12, 0.08) * uTime);
-        float n3 = vnoise(H.xz / 3.6 + vec2(0.2, 0.14) * uTime);
-        float fine = mix(0.5, n3, 1.0 - smoothstep(0.5, 1.5, footprint));
-        float bandW = 7.0 * (0.65 + 0.7 * n1);
-        // Convert the vertical thickness into a horizontal distance to the contact line with its screen-space gradient, so a
-        // gently sloping shore gets a band as wide as a steep one and a flat shallow bed gets none.
         float grad = length(vec2(dFdx(depthY), dFdy(depthY))) / max(footprint, 1e-3);
-        float edge = depthY / clamp(grad, 0.12, 1.0) + (n2 - 0.5) * 7.0;
-        float contact = 1.0 - smoothstep(0.0, bandW, edge);
-        // Wash lines travelling toward the shore.
-        float wash = smoothstep(0.6, 0.95, 0.5 + 0.5 * sin(edge * 0.16 + uTime * 1.1 + n1 * 5.0));
-        wash *= 1.0 - smoothstep(bandW * 0.8, bandW * 2.4, edge);
-        float lace = smoothstep(0.30, 0.62, 0.55 * n2 + 0.45 * fine);
-        float foam = clamp(contact * (0.25 + 0.75 * lace) + wash * lace * 0.75, 0.0, 1.0);
-        foam *= 1.0 - smoothstep(3.0, 9.0, footprint);
-        f = foam * uFoam * 0.65;
-        foamCol = foamTint(H);
+        float edge = depthY / clamp(grad, 0.12, 1.0);
+        // The waterline surges in and out slowly (staggered along the shore), and the foam texture drifts with the river flow
+        // or a slow wind drift; two layers half a cycle apart hide the loop.
+        float surge = 0.5 + 0.5 * sin(uTime * 0.8 + n1 * 6.2831853 + dot(H.xz, vec2(0.013, 0.009)));
+        edge = max(edge - surge * 2.2, 0.0);
+        vec2 drift = river ? flowV * 0.5 : vec2(1.6, -1.0);
+        vec2 gF = dFdx(H.xz) / 40.0, gF2 = dFdy(H.xz) / 40.0;
+        float ph0 = fract(uTime / 3.0), ph1 = fract(uTime / 3.0 + 0.5);
+        vec4 ft0 = textureGrad(uFoamTex, H.xz / 40.0 - drift * ph0 * 3.0 / 40.0, gF, gF2);
+        vec4 ft1 = textureGrad(uFoamTex, H.xz / 40.0 + vec2(0.37, 0.61) - drift * ph1 * 3.0 / 40.0, gF, gF2);
+        float w0 = 1.0 - abs(2.0 * ph0 - 1.0);
+        vec4 ft = mix(ft1, ft0, w0);
+        float lineW = max(1.0, footprint * 1.4);
+        float line = (1.0 - smoothstep(0.3 * lineW, lineW, edge)) * (0.8 + 0.2 * ft.r);
+        float reach = 7.0 + 8.0 * n1;
+        float fall = 1.0 - smoothstep(0.0, reach, edge);
+        fall *= fall;
+        float dens = clamp(ft.a * 1.5 + ft.r * 0.6 + ft.b * 0.6, 0.0, 1.0);
+        float lacy = smoothstep(1.0 - fall, 1.0 - fall + 0.3, dens * 1.15) * smoothstep(0.0, 0.2, fall);
+        float core = max(line, lacy);
+        float foam = core * (1.0 - smoothstep(3.0, 9.0, footprint));
+        f = min(foam, 0.95) * uFoam;
+        // HDR white; the thin fringe (low alpha) picks up the water's own scatter colour, a cheap subsurface tint.
+        vec3 tint = mix(vec3(1.0), uScatter / max(max(uScatter.r, uScatter.g), max(uScatter.b, 1e-3)), 0.45);
+        foamCol = foamTint(H) * 1.2 * mix(tint, vec3(1.0), smoothstep(0.35, 0.9, core));
     }
     if (river && uFoam > 0.0 && !sky) {
         // Streak foam: the thick ridges of the flowing mask, strongest where the water is shallow (banks, rocks in the
@@ -3990,6 +4009,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uRipple", PostFxGL::kRippleUnit },
                           { "uFlowBuf", PostFxGL::kFlowBufUnit },
                           { "uFlowNoise", PostFxGL::kFlowNoiseUnit },
+                          { "uFoamTex", PostFxGL::kFoamTexUnit },
                           { "uPsCube0", PostFxGL::kPointShadowUnit0 },
                           { "uPsCube1", PostFxGL::kPointShadowUnit1 } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
@@ -4112,7 +4132,7 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units <= kRiverSpriteUnit) {
+    if (units <= kFoamTexUnit) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
@@ -4397,9 +4417,9 @@ void main() { oColor = vec4(1.0); }
         // later replaces their contents in place (same texture names), so the lanes are never incomplete.
         {
             const uint8_t grey[4] = { 128, 128, 128, 0 };
-            GLuint* names[2] = { &mFlowNoise, &mRiverSprite };
-            const int lanes[2] = { kFlowNoiseUnit, kRiverSpriteUnit };
-            for (int i = 0; i < 2; i++) {
+            GLuint* names[3] = { &mFlowNoise, &mRiverSprite, &mFoamTex };
+            const int lanes[3] = { kFlowNoiseUnit, kRiverSpriteUnit, kFoamTexUnit };
+            for (int i = 0; i < 3; i++) {
                 glGenTextures(1, names[i]);
                 glActiveTexture(GL_TEXTURE0 + lanes[i]);
                 glBindTexture(GL_TEXTURE_2D, *names[i]);
@@ -6274,6 +6294,34 @@ bool PostFxGL::EnsureRiverAssets() {
     return ok;
 }
 
+// Loads the shoreline foam texture into its lane (a 1x1 dummy until then; loaded once per asset root).
+void PostFxGL::EnsureFoamTexture() {
+    const std::string root = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetString("gNewDawn.Assets.Path", "assets/newdawn");
+    if (root == mFoamAssetPath) {
+        return;
+    }
+    mFoamAssetPath = root;
+    const auto path = std::filesystem::path(root) / "water" / "foam_lace_512.png";
+    int w = 0, h = 0, n = 0;
+    auto* data = stbi_load(path.string().c_str(), &w, &h, &n, 4);
+    if (!data) {
+        SPDLOG_WARN("NewDawnWater: missing {} (set gNewDawn.Assets.Path to the asset root); shoreline foam is skipped", path.string());
+        return;
+    }
+    GLint previousActive;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActive);
+    glActiveTexture(GL_TEXTURE0 + kFoamTexUnit);
+    glBindTexture(GL_TEXTURE_2D, mFoamTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    stbi_image_free(data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glActiveTexture(previousActive);
+}
+
 // Re-rasterises the recorded river surfaces from the camera into the flow buffer (RG = world xz velocity, B = covered).
 void PostFxGL::RunRiverFlow(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     mFlowBufFrame = UINT32_MAX;
@@ -6498,6 +6546,9 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
             rect[i * 4 + j] = params.waterBoxes[i][j];
         }
         surfaceY[i] = params.waterBoxes[i][4];
+    }
+    if (foam > 0.0f) {
+        EnsureFoamTexture();
     }
     // Work on a copy of the colour so the game framebuffer is never sampled while bound.
     glDisable(GL_SCISSOR_TEST);
