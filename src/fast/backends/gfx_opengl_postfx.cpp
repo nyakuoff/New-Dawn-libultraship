@@ -6483,7 +6483,8 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     Bind(3, mGiHistory[write].tex);
     Use(mGiApply);
     geometry();
-    glUniform1f(Loc("uStrength"), params.giStrength);
+    // With world-space GI on, the screen-space term stays as near-field detail (contact colour, actors) at half weight.
+    glUniform1f(Loc("uStrength"), params.giStrength * (params.giWorld ? 0.5f : 1.0f));
     const float debug = static_cast<float>(CvInt("gNewDawn.GI.Debug", 0)); // 0 off, N: show only bounce * N
     glUniform1f(Loc("uDebug"), debug > 0.0f ? debug : 1.0f);
     glEnable(GL_BLEND);

@@ -20,9 +20,11 @@
 #include "ship/config/ConsoleVariable.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace Fast {
 namespace {
@@ -246,6 +248,7 @@ uniform vec4 uLight[24];
 uniform vec3 uLightRgb[24];
 uniform float uBounce;
 uniform float uBaked;
+uniform vec2 uGain; // how much of the sun/sky (x) and of the local lights (y) is sent on as bounce
 void main() {
     ivec3 dim = textureSize(uVoxAlbedo, 0);
     ivec3 w = ivec3(ivec2(gl_FragCoord.xy), uLayer);
@@ -274,16 +277,17 @@ void main() {
         local += uLightRgb[i] * lit;
     }
     vec4 probes = wgiIrradiance(P + N * uVoxSize, N);
-    vec3 E = 2.4 * local / (2.4 + local) + probes.rgb * uBounce;
+    vec3 E = 2.4 * local / (2.4 + local) * uGain.y + probes.rgb * uBounce;
     if (nb.a > 0.5) {
         oRadiance = vec4(pow(a.rgb, vec3(2.2)) * uBaked + a.rgb * E, 1.0);
         return;
     }
     float nl = dot(N, uSunDir);
-    if (nl > 0.0 && uSunRgb.r + uSunRgb.g + uSunRgb.b > 0.0 && !wgiTrace(from, uSunDir, 1e9, hit, t)) E += uSunRgb * nl;
+    vec3 day = vec3(0.0);
+    if (nl > 0.0 && uSunRgb.r + uSunRgb.g + uSunRgb.b > 0.0 && !wgiTrace(from, uSunDir, 1e9, hit, t)) day = uSunRgb * nl;
     vec3 sky = uSkyRgb;
     if (uSkyCube != 0) sky = texture(uSkyIrradiance, N).rgb * dot(uSkyRgb, vec3(0.2126, 0.7152, 0.0722));
-    oRadiance = vec4(a.rgb * (E + sky * probes.a), 1.0);
+    oRadiance = vec4(a.rgb * (E + (day + sky * probes.a) * uGain.x), 1.0);
 }
 )GLSL";
 
@@ -362,6 +366,7 @@ uniform float uFlipY;
 uniform float uStrength;
 uniform float uOcclusion;
 uniform float uReceive;
+uniform float uDay; // 0 no sun (night, interiors) .. 1 full daylight
 uniform float uFogMul;
 uniform float uFogOff;
 uniform int uDebug;
@@ -394,9 +399,10 @@ void main() {
     vec4 va = textureLod(uVoxAlbedo, q / vec3(dim), 0.0);
     vec3 scene = max(texelFetch(uScene, p, 0).rgb, vec3(0.0));
     float Y = dot(scene, kLuma);
-    // The pixel's own estimate (the lit colour's display value, as the voxels use) carries the texture detail and
-    // keeps painted darks dark; the voxel average carries the true hue and level. World surfaces use both.
-    vec3 proxy = pow(scene, vec3(0.5 * uReceive));
+    // The pixel's own estimate (the square root of the lit colour, the local-light pass's convention) carries the
+    // texture detail and keeps painted darks dark; the voxel average carries the true hue and level. World
+    // surfaces use the geometric mean of the two.
+    vec3 proxy = sqrt(scene) * 0.9;
     vec3 voxel = pow(va.rgb / max(va.a, 1e-3), vec3(uReceive));
     vec3 albedo = mix(proxy, sqrt(proxy * voxel), smoothstep(0.05, 0.35, va.a));
     // Towards the faces of the window the probes know less and less: fade out over the last two probe cells.
@@ -406,9 +412,13 @@ void main() {
     // Native fog already hides distant surfaces; light added on top of the fog colour would read as haze.
     float fog = clamp((d * 2.0 - 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
     float k = inside * (1.0 - fog);
-    vec3 bounce = e.rgb * albedo * (uStrength * 0.7 * k);
+    vec3 bounce = e.rgb * albedo * (uStrength * k);
     // Already bright (sunlit) surfaces need the fill less: keeps highlights from clipping.
     bounce *= 1.0 - 0.6 * smoothstep(0.6, 1.6, Y);
+    // Deep shade stays deep: in daylight the bounce may raise a pixel by at most about 60% of its own level, so dark
+    // rock and painted blacks are tinted rather than greyed. By lamplight (night, interiors) it may fill freely.
+    float ratio = dot(bounce, kLuma) / max(Y, 1e-4);
+    bounce /= 1.0 + ratio / mix(3.0, 0.6, uDay);
     oColor.rgb = bounce;
     // Optional: enclosed places see less sky, so the flat ambient they were given is pulled down.
     oFactor.rgb = vec3(mix(1.0, mix(1.0 - uOcclusion, 1.0, smoothstep(0.0, 0.7, e.a)), k));
@@ -686,6 +696,9 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
             WorldGiClearSlabs(g.origin, desired, g.dim, g.perProbe, vox, g.probeIrr, g.probeDist);
             std::copy_n(desired, 3, g.origin);
             g.want = std::max<uint32_t>(g.want, 3);
+            if (mStats)
+                SPDLOG_INFO("NewDawnWorldGI: window moved to {},{},{} (frame {})", desired[0], desired[1], desired[2],
+                            g.frames);
         }
     }
     const bool warm = g.frames < (uint32_t)kWarmFrames;
@@ -703,8 +716,17 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
         glUniform1i(Loc("uSteps"), t.steps);
     };
 
+    // gNewDawn.GI.WorldFreeze=1 (debug, timing): keep the grids as they are and only run the apply pass.
+    const bool frozen = CvI("gNewDawn.GI.WorldFreeze", 0) != 0 && g.sweeps > 8;
     // 1. Voxelise whatever room geometry was recorded this frame.
-    if (mWgiTris != nullptr && mWgiTriCount > 0) {
+    // Stats only: wall-clock cost of a build (first voxelisation of a scene), bracketed by glFinish.
+    const bool timeBuild = mStats && g.frames < 2 && mWgiTriCount > 0;
+    std::chrono::steady_clock::time_point buildStart;
+    if (timeBuild) {
+        glFinish();
+        buildStart = std::chrono::steady_clock::now();
+    }
+    if (!frozen && mWgiTris != nullptr && mWgiTriCount > 0) {
         glBindVertexArray(g.vao);
         glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)mWgiTriCount * NEWDAWN_GI_TRI_FLOATS * sizeof(float), mWgiTris,
@@ -727,6 +749,12 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
             SPDLOG_INFO("NewDawnWorldGI: {} room triangles voxelised (frame {})", mWgiTriCount, g.frames);
         g.tris = mWgiTriCount;
     }
+    if (timeBuild) {
+        glFinish();
+        SPDLOG_INFO("NewDawnWorldGI: voxelising {} triangles took {:.2f} ms (frame {}, with glFinish)", mWgiTriCount,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count(),
+                    g.frames);
+    }
 
     // 2. Relight a block of radiance slices.
     const float sun = std::clamp(CvF("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f);
@@ -738,6 +766,8 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
         skyRgb[i] = params.giWorldSkyColor[i] * fill * skyScale;
     }
     const bool lights = g.lightFrame == frameIndex;
+    float hysteresis = 0.0f;
+    if (!frozen) {
     Use(g.inject);
     grid();
     glUniform3fv(Loc("uSunDir"), 1, params.giWorldSunDir);
@@ -748,8 +778,14 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform4fv(Loc("uLight[0]"), kMaxLights, &g.lightPos[0][0]);
     glUniform3fv(Loc("uLightRgb[0]"), kMaxLights, &g.lightRgb[0][0]);
     glUniform1f(Loc("uBounce"), std::clamp(CvF("gNewDawn.GI.WorldBounce", 1.0f), 0.0f, 1.0f));
+    // Art direction: daylight is plentiful, so only part of it is sent on (the game's ambient already stands for
+    // some of it); a lamp's pool is small and capped, so its bounce is pushed to carry across a room.
+    glUniform2f(Loc("uGain"), std::clamp(CvF("gNewDawn.GI.WorldSunGain", 0.5f), 0.0f, 4.0f),
+                std::clamp(CvF("gNewDawn.GI.WorldLocalGain", 3.0f), 0.0f, 16.0f));
     // Baked surfaces are displayed as their painted colour, pulled down by the local-light pass's darkening.
-    glUniform1f(Loc("uBaked"), skyScale * (params.localEnabled ? 1.0f - std::clamp(params.localDarken, 0.0f, 0.9f) : 1.0f));
+    // Only part of it is sent on: the paint already contains the artists' own bounce.
+    glUniform1f(Loc("uBaked"), std::clamp(CvF("gNewDawn.GI.WorldBakedGain", 0.6f), 0.0f, 4.0f) * skyScale *
+                                   (params.localEnabled ? 1.0f - std::clamp(params.localDarken, 0.0f, 0.9f) : 1.0f));
     glBindFramebuffer(GL_FRAMEBUFFER, g.radFbo);
     glViewport(0, 0, g.dim[0], g.dim[1]);
     for (int i = 0, n = std::min(t.slices * boost, g.dim[2]); i < n; ++i) {
@@ -788,7 +824,7 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     const float longBlend = std::clamp(CvF("gNewDawn.GI.WorldHysteresis", 0.88f), 0.0f, 0.98f);
-    const float hysteresis = std::min(longBlend, 1.0f - 1.0f / (float)(g.sweeps + 1));
+    hysteresis = std::min(longBlend, 1.0f - 1.0f / (float)(g.sweeps + 1));
     Use(g.blend);
     grid();
     glUniform1i(Loc("uBase"), base);
@@ -812,6 +848,7 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
         ++g.sweeps;
     }
     ++g.updates;
+    } // !frozen
     ++g.frames;
     g.lastFrame = frameIndex;
     if (mStats && g.frames % 300 == 0)
@@ -819,6 +856,20 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
                     "{:.2f},{:.2f},{:.2f} cube {} origin {},{},{}",
                     g.frames, g.sweeps, hysteresis, lights ? g.lightCount : -1, sunRgb[0], sunRgb[1], sunRgb[2], skyRgb[0],
                     skyRgb[1], skyRgb[2], mSkyAmbientReady, g.origin[0], g.origin[1], g.origin[2]);
+
+    if (CvI("gNewDawn.GI.WorldLog", 0) != 0 && g.frames % 30 == 0) {
+        // Debug evidence: the mean of the whole probe field. It must not depend on where the camera looks.
+        std::vector<float> px((size_t)kAtlasCols * kTile * kAtlasRows * kTile * 4);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g.probeFbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, kAtlasCols * kTile, kAtlasRows * kTile, GL_RGBA, GL_FLOAT, px.data());
+        double sum[4] = {};
+        for (size_t i = 0; i < px.size(); ++i)
+            sum[i & 3] += px[i];
+        const double n = (double)(px.size() / 4);
+        SPDLOG_INFO("NewDawnWorldGI: probe field mean {:.5f},{:.5f},{:.5f} sky {:.4f} frame {} tris {}", sum[0] / n,
+                    sum[1] / n, sum[2] / n, sum[3] / n, g.frames, g.tris);
+    }
 
     // 4. Apply to the scene.
     const int debug = CvI("gNewDawn.GI.WorldDebug", 0);
@@ -833,7 +884,8 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform1f(Loc("uStrength"), params.giWorldStrength);
     glUniform1f(Loc("uOcclusion"), std::clamp(CvF("gNewDawn.GI.WorldOcclusion", 0.0f), 0.0f, 1.0f));
     glUniform1i(Loc("uDebug"), debug);
-    glUniform1f(Loc("uReceive"), std::clamp(CvF("gNewDawn.GI.WorldReceive", 1.5f), 1.0f, 2.2f));
+    glUniform1f(Loc("uReceive"), std::clamp(CvF("gNewDawn.GI.WorldReceive", 1.0f), 1.0f, 2.2f));
+    glUniform1f(Loc("uDay"), std::clamp((0.2126f * sunRgb[0] + 0.7152f * sunRgb[1] + 0.0722f * sunRgb[2]) / 0.5f, 0.0f, 1.0f));
     // The native fog factor, as the local-light pass derives it from the depth buffer.
     float fogMul = 0.0f, fogOff = 0.0f;
     if (params.fogNear >= 997 && params.fogNear < 1000) {

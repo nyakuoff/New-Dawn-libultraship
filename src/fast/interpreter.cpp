@@ -1380,7 +1380,8 @@ void Interpreter::GiTextureAverage(int tile, float rgba[4]) {
     }
     const bool paletted = tex->Type == TextureType::Palette4bpp || tex->Type == TextureType::Palette8bpp;
     const uint8_t* palette = paletted ? mRdp->palettes[0] : nullptr;
-    const uint64_t key = (uint64_t)(uintptr_t)tex->ImageData ^ ((uint64_t)(uintptr_t)(paletted ? mRdp->palette_dram_addr[0] : nullptr) * 0x9E3779B97F4A7C15ull) ^ mRdp->texture_tile[tile].palette;
+    const uint64_t paletteKey = paletted ? (uint64_t)(uintptr_t)mRdp->palette_dram_addr[0] * 0x9E3779B97F4A7C15ull : 0;
+    const uint64_t key = (uint64_t)(uintptr_t)tex->ImageData ^ paletteKey ^ mRdp->texture_tile[tile].palette;
     if (auto found = mGiTexAverage.find(key); found != mGiTexAverage.end()) {
         std::copy_n(found->second.data(), 4, rgba);
         return;
