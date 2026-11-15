@@ -7291,6 +7291,8 @@ void PostFxGL::RunEmissive(const NewDawnPostFxParams& params, const FramebufferO
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     CheckError("emissive");
+}
+
 // Point-light shadows. Picks the one or two lights that matter most around the player (bright, close, not a moving
 // fairy), culls the frame's recorded casters to each light's range, and, only when that caster set or the light
 // changed, renders them into a distance cube map. The cube is sampled by the local-light pass. Nothing here touches
