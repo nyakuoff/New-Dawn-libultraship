@@ -331,6 +331,7 @@ class PostFxGL {
     float mLocalPos[kMaxLocal][4] = {}; // this frame's lights: world position, range
     float mLocalRgb[kMaxLocal][3] = {};
     bool mLocalFairy[kMaxLocal] = {};
+    bool mLocalFlame[kMaxLocal] = {}; // the light sits on a VFX flame (Lighting.FlameLight)
     int mLocalCount = 0;
     // Point-light shadows (gNewDawn.Shadows.PointLights, docs/LOCAL_LIGHTS.md): a distance cube map for the one or two
     // lights that matter most near the player, rendered from the recorded casters only when they or the light change.

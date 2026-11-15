@@ -1057,6 +1057,8 @@ uniform mat4 uViewProj;
 uniform int uLightCount;
 uniform vec4 uLight[24];    // world position, range
 uniform vec3 uLightRgb[24]; // HDR radiance (strength and flicker already applied)
+uniform float uLightFlame[24]; // 1 for fire lights (torches, braziers, candles): they light dark surfaces better, see uFlameAlbedo
+uniform float uFlameAlbedo;
 uniform float uDebug;
 uniform float uDarken;
 uniform float uFogMul;
@@ -1156,7 +1158,7 @@ void main() {
         oFactor = vec4(0.0);
         return;
     }
-    vec3 E = vec3(0.0);
+    vec3 E = vec3(0.0), Ef = vec3(0.0);
     for (int i = 0; i < uLightCount; ++i) {
         vec3 V = uLight[i].xyz - P;
         float R = uLight[i].w, d2 = dot(V, V);
@@ -1165,7 +1167,7 @@ void main() {
         vec3 L = V / max(dist, 0.001);
         // Smooth range window (Karis) over a softened inverse-square core; ~1 at the flame, 0 at the range.
         float x = dist / R, window = clamp(1.0 - x * x * x * x, 0.0, 1.0);
-        float core = R * 0.2;
+        float core = R * (uLightFlame[i] > 0.5 ? 0.13 : 0.2); // fires fall off faster: a pool, not a wash
         float atten = window * window * core * core / (d2 + core * core);
         // Wrapped Lambert: the depth-derived normal is faceted, so the terminator is softened.
         float wrap = mix(0.3, 0.7, uSoft);
@@ -1175,11 +1177,17 @@ void main() {
         float vis = localVisibility(P, uLight[i].xyz, jitter);
         if (i == uPsIdx0) vis *= pointShadowVis(uPsCube0, uPsLight0, P, N, jitter);
         else if (i == uPsIdx1) vis *= pointShadowVis(uPsCube1, uPsLight1, P, N, jitter);
-        E += uLightRgb[i] * (lit * vis);
+        if (uLightFlame[i] > 0.5) Ef += uLightRgb[i] * (lit * vis);
+        else E += uLightRgb[i] * (lit * vis);
     }
     // Bounded: walls beside a torch glow without clipping, and the cap is per channel so the hue survives.
     const float cap = 2.4;
-    E = cap * E / (cap + E);
+    {
+        vec3 T = E + Ef;
+        vec3 kc = cap / (cap + T);
+        E *= kc;
+        Ef *= kc;
+    }
     vec3 c = max(scene.rgb, vec3(0.0));
     float Y = dot(c, giLuma);
     // The painted scene is the albedo: its square root lifts crushed blacks while keeping hue. A bright, already-lit
@@ -1192,16 +1200,19 @@ void main() {
     // dark band against the (undarkened) sky. Characters (stencil-marked draws) get a reduced uDarken from the second draw.
     float fog = clamp((d * 2.0 - 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
     float D = uDarken * (1.0 - fog);
-    float keep = smoothstep(0.0, 0.45, dot(E, giLuma));
+    float keep = smoothstep(0.0, 0.45, dot(E + Ef, giLuma));
     vec3 moon = mix(vec3(1.0), vec3(0.90, 0.97, 1.10), min(D * 1.3, 1.0)); // cool, dim fill
     vec3 base = c * mix(1.0 - D, 1.0, keep) * mix(moon, vec3(1.0), keep);
     base = max(base, min(c, vec3(0.0055)));
     if (uDebug > 0.0) {
-        oColor = vec4(E * uDebug, 0.0);
+        oColor = vec4((E + Ef) * uDebug, 0.0);
         oFactor = vec4(0.0);
         return;
     }
-    oColor = vec4(albedo * E * need, 0.0);
+    // Fire light on a dark surface: the dark authored colour would swallow it, so fires see at least this albedo (only
+    // where their light reaches; the unlit scene between the lights keeps its darkness).
+    vec3 albedoF = max(albedo, vec3(uFlameAlbedo));
+    oColor = vec4((albedo * E + albedoF * Ef) * need, 0.0);
     oFactor = vec4(clamp(base / max(c, vec3(0.0001)), 0.0, 1.0), 1.0);
 }
 )GLSL";
@@ -6620,6 +6631,7 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
     std::fill(&pos[0][0], &pos[0][0] + kMax * 4, 0.0f);
     std::fill(&rgb[0][0], &rgb[0][0] + kMax * 3, 0.0f);
     std::fill(fairy, fairy + kMax, false);
+    std::fill(mLocalFlame, mLocalFlame + kMax, false);
     count = 0;
     static const auto epoch = std::chrono::steady_clock::now();
     const float seconds =
@@ -6636,7 +6648,38 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
     const float blend =
         smoothLights ? 1.0f - std::exp(-static_cast<float>(std::clamp(now - lastNow, 0.0, 0.5)) / 0.6f) : 1.0f;
     lastNow = now;
-    auto add = [&](const float* p, float radiusIn, const float* colIn, float boost) {
+    // Flames (gNewDawn.Lighting.FlameLight): the VFX flames recorded last frame, with their world height. A light that sits
+    // on a flame (the game's own torch light, or the one tied to a flame the game gives none) is a flame light: it gets
+    // the flame's reach, a warm colour and more intensity, so torches and braziers throw real light pools. The global
+    // darkening, the floor and every other light are untouched.
+    struct FlameInfo {
+        float pos[3];
+        float height; // world half-height of the flame sprite
+    };
+    std::vector<FlameInfo> flameList;
+    const bool flameLight = CvInt("gNewDawn.Lighting.FlameLight", 0) != 0;
+    const float flameGain = std::clamp(CvFloat("gNewDawn.Lighting.FlameStrength", 1.0f), 0.0f, 4.0f);
+    const float flameReach = std::clamp(CvFloat("gNewDawn.Lighting.FlameRange", 1.0f), 0.25f, 3.0f);
+    const bool flamesFresh = params.vfxEnabled && mFlameScene == params.giSceneId && frameIndex - mFlameFrame <= 2u;
+    if (flameLight && flamesFresh) {
+        const float tanHalf = std::tan(params.fovyDegrees * 0.00872664626f);
+        for (size_t i = 0; i + NEWDAWN_VFX_FLOATS <= mFlameLights.size(); i += NEWDAWN_VFX_FLOATS) {
+            const float* f = &mFlameLights[i];
+            flameList.push_back({ { f[12], f[13], f[14] }, f[6] * f[4] * tanHalf });
+        }
+    }
+    if (mStats && !flameList.empty()) {
+        static int logged = 0;
+        if (logged++ % 300 == 0) {
+            for (const FlameInfo& fl : flameList)
+                SPDLOG_INFO("NewDawnFlameLight: flame ({:.0f},{:.0f},{:.0f}) half-height {:.1f}", fl.pos[0], fl.pos[1], fl.pos[2], fl.height);
+            for (int i = 0; i < params.localCount; ++i)
+                SPDLOG_INFO("NewDawnFlameLight: game light {} ({:.0f},{:.0f},{:.0f}) radius {:.0f} rgb {:.2f},{:.2f},{:.2f}", i,
+                            params.localLights[i][0], params.localLights[i][1], params.localLights[i][2], params.localLights[i][3],
+                            params.localColors[i][0], params.localColors[i][1], params.localColors[i][2]);
+        }
+    }
+    auto add = [&](const float* p, float radiusIn, const float* colIn, float boost, float flameH = 0.0f) {
         if (count >= kMax)
             return;
         const uint64_t key = (static_cast<uint64_t>(static_cast<int32_t>(std::floor(p[0] / 8.0f))) & 0xFFFFF) |
@@ -6673,14 +6716,35 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
                                       0.30f * std::sin(seconds * 18.2f + seed * 1.7f + 1.0f) +
                                       0.10f * std::sin(seconds * 32.0f + seed * 2.3f + 2.0f));
         fairy[count] = boost < 0.99f; // Tatl and other fairies: moving glows, never shadow-casting lights
+        mLocalFlame[count] = flameH > 0.0f && boost >= 0.99f;
         pos[count][0] = p[0], pos[count][1] = p[1], pos[count][2] = p[2];
         pos[count][3] = std::clamp(radius * 1.3f, 90.0f, 700.0f);
+        float gain = 1.0f;
+        if (flameH > 0.0f && boost >= 0.99f) {
+            // Reach follows the flame's size (a candle a few steps, a brazier a few body lengths); the colour is the
+            // game's own pulled toward a warm fire colour; intensity is raised for fires only.
+            pos[count][3] = std::clamp(std::max(pos[count][3], std::clamp(flameH * 6.0f, 110.0f, 330.0f) * flameReach), 90.0f, 700.0f);
+            const float warmFire[3] = { 1.0f, 0.60f, 0.28f };
+            const float lum = 0.2126f * lightRgb[0] + 0.7152f * lightRgb[1] + 0.0722f * lightRgb[2];
+            for (int i = 0; i < 3; ++i)
+                lightRgb[i] = lightRgb[i] * 0.35f + warmFire[i] * (lum / 0.662f) * 0.65f; // 0.662: the luminance of warmFire
+            gain = 3.0f * flameGain;
+        }
         for (int i = 0; i < 3; ++i)
-            rgb[count][i] = lightRgb[i] * k * f * boost * params.localStrength * params.localGain * 4.0f;
+            rgb[count][i] = lightRgb[i] * k * f * boost * gain * params.localStrength * params.localGain * 4.0f;
         ++count;
     };
-    for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i)
-        add(params.localLights[i], params.localLights[i][3], params.localColors[i], params.localBoost[i]);
+    for (int i = 0; i < params.localCount && i < NEWDAWN_LOCAL_LIGHTS; ++i) {
+        float flameH = 0.0f;
+        for (const FlameInfo& fl : flameList) {
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; ++a)
+                d2 += (params.localLights[i][a] - fl.pos[a]) * (params.localLights[i][a] - fl.pos[a]);
+            if (d2 < 90.0f * 90.0f)
+                flameH = std::max(flameH, fl.height);
+        }
+        add(params.localLights[i], params.localLights[i][3], params.localColors[i], params.localBoost[i], flameH);
+    }
     // VFX flames the game gives no light to (recorded last frame): tie a warm light to each, nearest first.
     if (params.vfxEnabled && mFlameScene == params.giSceneId && frameIndex - mFlameFrame <= 2u) {
         struct Flame {
@@ -6721,7 +6785,15 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
             float col[3];
             for (int a = 0; a < 3; ++a)
                 col[a] = warmRgb[a];
-            add(fl.f + 12, 150.0f, col, 1.0f);
+            float h = 0.0f;
+            for (const FlameInfo& f2 : flameList) {
+                float d2 = 0.0f;
+                for (int a = 0; a < 3; ++a)
+                    d2 += (fl.f[12 + a] - f2.pos[a]) * (fl.f[12 + a] - f2.pos[a]);
+                if (d2 < 4.0f * 4.0f)
+                    h = f2.height;
+            }
+            add(fl.f + 12, 150.0f, col, 1.0f, h);
         }
     }
     for (auto it = smoothed.begin(); it != smoothed.end();)
@@ -6775,6 +6847,13 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     }
     glUniform4fv(Loc("uLight"), kMax, &pos[0][0]);
     glUniform3fv(Loc("uLightRgb"), kMax, &rgb[0][0]);
+    {
+        float flame[kMax];
+        for (int i = 0; i < kMax; ++i)
+            flame[i] = mLocalFlame[i] ? 1.0f : 0.0f;
+        glUniform1fv(Loc("uLightFlame"), kMax, flame);
+        glUniform1f(Loc("uFlameAlbedo"), std::clamp(CvFloat("gNewDawn.Lighting.FlameAlbedo", 0.16f), 0.0f, 0.6f));
+    }
     const float debug = static_cast<float>(CvInt("gNewDawn.Lighting.LocalDebug", 0)); // N: show only the light * N
     glUniform1f(Loc("uDebug"), debug);
     float fogMul, fogOff;

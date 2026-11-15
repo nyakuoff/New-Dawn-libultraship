@@ -35,7 +35,7 @@ uniform mat4 uViewProj;
 uniform float uNdcXScale, uFlipY, uTime;
 uniform vec2 uProjection, uSize;
 uniform vec3 uWind;
-uniform float uEmbers;
+uniform float uEmbers, uGlowRadius;
 uniform int uMode; // 0 flame layers, 1 embers
 out vec2 vUv;
 out float vViewZ, vAlpha, vLayerKind, vSeed, vSize;
@@ -134,12 +134,12 @@ void main() {
         vAlpha = aPrim.a;
         return;
     }
-    if (uMode == 2) { // light glow: the native quad's footprint, soft halo sprite
+    if (uMode == 2) { // light glow: an analytic core + halo profile (fragment shader) on a quad uGlowRadius x the native disc
         vLayer = 10;
         vLayerKind = 5.0;
-        vec2 size = vec2(aB.y, aB.z) * 2.0 * 2.0; // sprite disc fills half the texture
+        vec2 halfExt = vec2(aB.y, aB.z) * uGlowRadius;
         vUv = vec2(u01.x, 1.0 - u01.y);
-        gl_Position = vec4((aA.y + q.x * size.x * 0.5) * w, (aA.z + q.y * size.y * 0.5) * uFlipY * w, 0.0, w);
+        gl_Position = vec4((aA.y + q.x * halfExt.x) * w, (aA.z + q.y * halfExt.y) * uFlipY * w, 0.0, w);
         vViewZ = w;
         vSize = H;
         vAlpha = aPrim.a;
@@ -267,8 +267,23 @@ void main() {
         return;
     }
     if (uMode == 2) {
-        rgb = vPrim.rgb * vec3(2.2, 1.9, 1.5);
-        a = pow(t.a * t.r, 1.8) * vAlpha * 0.8;
+        // Flame bloom, not a disc: a small hot core and a falloff-shaped halo that reaches zero smoothly at the quad edge
+        // (HDR bloom adds the rest). The game's glow alpha (about 50/255, flickering) scales it; warm lights get the
+        // flame ramp (white-yellow core, orange halo), other colours (Tatl, fairies) keep their hue, much dimmer.
+        vec2 d = vUv * 2.0 - 1.0;
+        float r2 = dot(d, d);
+        float win = max(1.0 - r2, 0.0);
+        win *= win;
+        float core = exp(-r2 * 90.0);
+        float halo = 1.0 / (1.0 + 26.0 * r2);
+        vec3 tint = vPrim.rgb / max(max(vPrim.r, max(vPrim.g, vPrim.b)), 0.01);
+        float warm = clamp((tint.r - tint.b) * 2.0, 0.0, 1.0);
+        float rr = sqrt(r2);
+        vec3 ramp = mix(vec3(1.0, 0.84, 0.58), vec3(1.0, 0.46, 0.14), smoothstep(0.0, 0.55, rr));
+        vec3 colour = mix(mix(vec3(1.0), tint, smoothstep(0.0, 0.7, rr)), ramp, warm);
+        float amp = clamp(vAlpha * 5.0, 0.0, 1.6);
+        rgb = colour * (core * 2.6 + halo * win * 0.55) * amp * mix(0.6, 1.0, warm);
+        a = 1.0;
     } else if (uMode == 1) {
         rgb = vec3(7.0, 2.4, 0.45) * mix(0.6, 1.4, fract(vSeed * 91.7));
         a = t.a * t.r * vAlpha;
@@ -448,6 +463,8 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glUniform2f(Loc("uNearFar"), p.zNear, p.zFar);
     glUniform1i(Loc("uDebug"), Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Vfx.DebugView", 0));
     glUniform1f(Loc("uStrength"), std::clamp(p.vfxStrength, 0.0f, 4.0f));
+    // The light glow quad: this fraction of the native disc's radius (the old flat disc was 1).
+    glUniform1f(Loc("uGlowRadius"), std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Vfx.GlowRadius", 0.5f), 0.1f, 2.0f));
     glUniform3f(Loc("uWind"), 0.0f, 0.0f, 0.0f);
     static const auto epoch = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
