@@ -1655,6 +1655,181 @@ void Interpreter::SubmitGrass() {
                              (uint32_t)(mGrassTris.size() / NEWDAWN_GRASS_TRI_FLOATS));
 }
 
+// Mean colour (gamma space, alpha-weighted) and mean alpha of the texture loaded for a tile, from its CPU data. Cached
+// per data pointer and palette; about a thousand texels are sampled. Unknown formats give neutral grey.
+void Interpreter::GiTextureAverage(int tile, float rgba[4]) {
+    const auto& lt = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+    const Fast::Texture* tex = lt.raw_tex_metadata.resource.get();
+    rgba[0] = rgba[1] = rgba[2] = 0.5f;
+    rgba[3] = 1.0f;
+    if (tex == nullptr || tex->ImageData == nullptr || tex->Width == 0 || tex->Height == 0) {
+        return;
+    }
+    const bool paletted = tex->Type == TextureType::Palette4bpp || tex->Type == TextureType::Palette8bpp;
+    const uint8_t* palette = paletted ? mRdp->palettes[0] : nullptr;
+    const uint64_t paletteKey = paletted ? (uint64_t)(uintptr_t)mRdp->palette_dram_addr[0] * 0x9E3779B97F4A7C15ull : 0;
+    const uint64_t key = (uint64_t)(uintptr_t)tex->ImageData ^ paletteKey ^ mRdp->texture_tile[tile].palette;
+    if (auto found = mGiTexAverage.find(key); found != mGiTexAverage.end()) {
+        std::copy_n(found->second.data(), 4, rgba);
+        return;
+    }
+    const uint8_t* data = tex->ImageData;
+    const uint32_t w = tex->Width, h = tex->Height, pixels = w * h;
+    uint32_t bits = 0; // per pixel
+    switch (tex->Type) {
+        case TextureType::RGBA32bpp: bits = 32; break;
+        case TextureType::RGBA16bpp: case TextureType::GrayscaleAlpha16bpp: bits = 16; break;
+        case TextureType::Palette8bpp: case TextureType::Grayscale8bpp: case TextureType::GrayscaleAlpha8bpp: bits = 8; break;
+        case TextureType::Palette4bpp: case TextureType::Grayscale4bpp: case TextureType::GrayscaleAlpha4bpp: bits = 4; break;
+        default: break;
+    }
+    if (bits == 0 || (uint64_t)pixels * bits / 8 > tex->ImageDataSize || (paletted && palette == nullptr)) {
+        return; // not cached: a palette may be loaded later
+    }
+    const auto rgba16 = [](uint16_t c, float out[4]) {
+        out[0] = (float)(c >> 11) / 31.0f;
+        out[1] = (float)((c >> 6) & 31) / 31.0f;
+        out[2] = (float)((c >> 1) & 31) / 31.0f;
+        out[3] = (float)(c & 1);
+    };
+    const uint32_t step = std::max(1u, pixels / 1024u);
+    double sum[4] = {};
+    uint32_t count = 0;
+    for (uint32_t i = step / 2; i < pixels; i += step, ++count) {
+        float c[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+        const uint32_t nibble = (data[i / 2] >> ((i & 1) ? 0 : 4)) & 15;
+        switch (tex->Type) {
+            case TextureType::RGBA32bpp:
+                for (int k = 0; k < 4; ++k) c[k] = data[i * 4 + k] / 255.0f;
+                break;
+            case TextureType::RGBA16bpp:
+                rgba16((uint16_t)((data[i * 2] << 8) | data[i * 2 + 1]), c);
+                break;
+            case TextureType::Palette8bpp: {
+                // Same lookup as ImportTextureCi8 (two 128-entry halves, big endian RGBA5551).
+                const uint8_t* half = mRdp->palettes[data[i] / 128];
+                if (half != nullptr) rgba16((uint16_t)((half[(data[i] % 128) * 2] << 8) | half[(data[i] % 128) * 2 + 1]), c);
+                break;
+            }
+            case TextureType::Palette4bpp: {
+                const uint8_t* pal = mRdp->palettes[mRdp->texture_tile[tile].palette / 8];
+                const uint32_t idx = (mRdp->texture_tile[tile].palette % 8) * 16 + nibble;
+                if (pal != nullptr) rgba16((uint16_t)((pal[idx * 2] << 8) | pal[idx * 2 + 1]), c);
+                break;
+            }
+            case TextureType::Grayscale8bpp: c[0] = c[1] = c[2] = data[i] / 255.0f; break;
+            case TextureType::Grayscale4bpp: c[0] = c[1] = c[2] = nibble / 15.0f; break;
+            case TextureType::GrayscaleAlpha16bpp: c[0] = c[1] = c[2] = data[i * 2] / 255.0f; c[3] = data[i * 2 + 1] / 255.0f; break;
+            case TextureType::GrayscaleAlpha8bpp: c[0] = c[1] = c[2] = (data[i] >> 4) / 15.0f; c[3] = (data[i] & 15) / 15.0f; break;
+            case TextureType::GrayscaleAlpha4bpp: c[0] = c[1] = c[2] = (nibble >> 1) / 7.0f; c[3] = (float)(nibble & 1); break;
+            default: break;
+        }
+        for (int k = 0; k < 3; ++k) sum[k] += c[k] * c[3];
+        sum[3] += c[3];
+    }
+    if (count > 0 && sum[3] > 1e-3) {
+        for (int k = 0; k < 3; ++k) rgba[k] = (float)(sum[k] / sum[3]);
+        rgba[3] = (float)(sum[3] / count);
+    }
+    if (mGiTexAverage.size() > 8192) {
+        mGiTexAverage.clear();
+    }
+    mGiTexAverage[key] = { rgba[0], rgba[1], rgba[2], rgba[3] };
+}
+
+void Interpreter::RecordGiTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
+    constexpr size_t kMaxGiTriangles = 400000;
+    if (mGiTris.size() >= kMaxGiTriangles * NEWDAWN_GI_TRI_FLOATS) {
+        return;
+    }
+    const float* a = v1->view_pos;
+    const float* b = v2->view_pos;
+    const float* c = v3->view_pos;
+    const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+    float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len < 1e-4f) {
+        return;
+    }
+    // Front faces wind counter-clockwise on screen; mirrored culling and front-face culling turn the visible side over.
+    const bool flip = ((mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) != 0) !=
+                      ((mRsp->geometry_mode & get_attr(CULL_BOTH)) == get_attr(CULL_FRONT));
+    for (float& x : n) {
+        x /= flip ? -len : len;
+    }
+    // Albedo: the colour combiner evaluated once on the average texture colours, with the light term set to white
+    // (lit geometry) or to the baked vertex colour (unlit geometry). The display-space value is used as the
+    // reflectance as it is: the game's textures are painted dark (decoded to linear, wood and stone come out at
+    // 0.02-0.1 and would bounce next to nothing), and their display values sit where real albedos do.
+    const bool twoCycle = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
+    float tex[2][4];
+    GiTextureAverage(mRdp->first_tile_index, tex[0]);
+    if (twoCycle) {
+        GiTextureAverage(mRdp->first_tile_index + 1 < 8 ? mRdp->first_tile_index + 1 : mRdp->first_tile_index, tex[1]);
+    } else {
+        std::copy_n(tex[0], 4, tex[1]);
+    }
+    float shade[3] = { 1.0f, 1.0f, 1.0f };
+    if ((mRsp->geometry_mode & G_LIGHTING) == 0) {
+        shade[0] = (v1->color.r + v2->color.r + v3->color.r) / 765.0f;
+        shade[1] = (v1->color.g + v2->color.g + v3->color.g) / 765.0f;
+        shade[2] = (v1->color.b + v2->color.b + v3->color.b) / 765.0f;
+    }
+    const float prim[4] = { mRdp->prim_color.r / 255.0f, mRdp->prim_color.g / 255.0f, mRdp->prim_color.b / 255.0f,
+                            mRdp->prim_color.a / 255.0f };
+    const float env[4] = { mRdp->env_color.r / 255.0f, mRdp->env_color.g / 255.0f, mRdp->env_color.b / 255.0f,
+                           mRdp->env_color.a / 255.0f };
+    float combined[3] = {};
+    for (int cycle = 0; cycle < (twoCycle ? 2 : 1); ++cycle) {
+        const uint32_t m = (uint32_t)(mRdp->combine_mode >> (cycle * 28));
+        const uint32_t sel[4] = { m & 0xf, (m >> 4) & 0xf, (m >> 8) & 0x1f, (m >> 13) & 7 };
+        const float* t0 = tex[cycle]; // the second cycle sees the two texels swapped
+        const float* t1 = tex[1 - cycle];
+        float next[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            float v[4];
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t x = sel[k];
+                switch (x) {
+                    case G_CCMUX_COMBINED: v[k] = combined[ch]; break;
+                    case G_CCMUX_TEXEL0: v[k] = t0[ch]; break;
+                    case G_CCMUX_TEXEL1: v[k] = t1[ch]; break;
+                    case G_CCMUX_PRIMITIVE: v[k] = prim[ch]; break;
+                    case G_CCMUX_SHADE: v[k] = shade[ch]; break;
+                    case G_CCMUX_ENVIRONMENT: v[k] = env[ch]; break;
+                    default:
+                        if (k == 0) { // A: 6 = 1, 7 = noise
+                            v[k] = x == 6 ? 1.0f : (x == 7 ? 0.5f : 0.0f);
+                        } else if (k == 2) { // C: the alpha inputs; LOD fraction 0 is the close-up texture
+                            v[k] = x == G_CCMUX_COMBINED_ALPHA ? 1.0f : x == G_CCMUX_TEXEL0_ALPHA ? t0[3]
+                                 : x == G_CCMUX_TEXEL1_ALPHA ? t1[3] : x == G_CCMUX_PRIMITIVE_ALPHA ? prim[3]
+                                 : x == G_CCMUX_SHADE_ALPHA ? 1.0f : x == G_CCMUX_ENV_ALPHA ? env[3]
+                                 : x == G_CCMUX_PRIM_LOD_FRAC ? mRdp->prim_lod_fraction / 255.0f : 0.0f;
+                        } else { // B: key/convert constants; D: 6 = 1
+                            v[k] = (k == 3 && x == 6) ? 1.0f : 0.0f;
+                        }
+                        break;
+                }
+            }
+            next[ch] = (v[0] - v[1]) * v[2] + v[3];
+        }
+        std::copy_n(next, 3, combined);
+    }
+    float albedo[3];
+    for (int ch = 0; ch < 3; ++ch) {
+        albedo[ch] = std::clamp(combined[ch], 0.0f, 0.9f);
+    }
+    // Unlit room geometry is the game's baked lighting: the renderer treats it as a light source of its own colour.
+    const float baked = (mRsp->geometry_mode & G_LIGHTING) == 0 ? 1.0f : 0.0f;
+    const LoadedVertex* verts[3] = { v1, v2, v3 };
+    for (const LoadedVertex* v : verts) {
+        mGiTris.insert(mGiTris.end(), v->view_pos, v->view_pos + 3);
+        mGiTris.insert(mGiTris.end(), albedo, albedo + 3);
+        mGiTris.insert(mGiTris.end(), n, n + 3);
+        mGiTris.push_back(baked);
+    }
+}
+
 void Interpreter::RecordShadowTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3) {
     constexpr size_t kMaxShadowVertices = 2 * 1024 * 1024;
     if (mShadowVertices.size() + 9 > kMaxShadowVertices * 3) {
@@ -2927,7 +3102,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
-            mGrass || mInterior) {
+            mGrass || mInterior || mGiRecord) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -2936,6 +3111,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         if (mShadowOnly) {
             // Coverage pass: only the world position (casters) and z/w (a branch-by-depth command may read them).
+            if (mGiRecord && (mRsp->geometry_mode & G_LIGHTING) == 0) {
+                d->color.r = v->cn[0]; // world GI reads the baked vertex colour of unlit room geometry
+                d->color.g = v->cn[1];
+                d->color.b = v->cn[2];
+            }
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -3067,7 +3247,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior) {
+        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord) {
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -3170,13 +3350,45 @@ void Interpreter::EndShadowOnly() {
     memcpy(mSegmentPointers, mShadowOnlySegments, sizeof(mSegmentPointers));
     mMatrixLoadsSinceLights = mShadowOnlyMatrixLoads;
     mShadowOnly = false;
+    mShadowOnlyGi = false;
     mShadowOnlyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - mShadowOnlyStart;
 }
 
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    // New Dawn world GI: solid, depth-writing room triangles, taken before any rejection (and before the MM3D swap:
+    // the N64 room stays the right shape for bounce light). Render state only; nothing is drawn differently.
+    if (mGiRecord && !is_rect) {
+        const uint32_t om = mRdp->other_mode_l;
+        bool solid = (om & Z_UPD) == Z_UPD && (om & ZMODE_DEC) != ZMODE_DEC && (om & G_ZS_PRIM) == 0 &&
+            !((om & (3 << 24)) == (G_BL_0 << 24) && (om & (3 << 20)) == (G_BL_CLR_MEM << 20));
+        // Rooms draw many plain floors and walls in the texture-edge modes too. They count when the texture is (nearly)
+        // opaque; real cut-outs (fences, leaves, railings) would become solid slabs, so they are left out.
+        if (solid && ((om & CVG_X_ALPHA) == CVG_X_ALPHA || (om & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD) &&
+            AlphaCombinerUsesTexel0(mRdp->combine_mode,
+                                    (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE)) {
+            float average[4];
+            GiTextureAverage(mRdp->first_tile_index, average);
+            solid = average[3] >= 0.75f;
+        }
+        if (solid) {
+            RecordGiTriangle(&mRsp->loaded_vertices[vtx1_idx], &mRsp->loaded_vertices[vtx2_idx],
+                             &mRsp->loaded_vertices[vtx3_idx]);
+        }
+        if (mGiDebug) { // gNewDawn.GI.WorldLog=1: every distinct room draw state once, with the albedo it was given
+            const auto& lt = mRdp->loaded_texture[mRdp->texture_tile[mRdp->first_tile_index].tmem_index];
+            const std::string name = lt.raw_tex_metadata.resource ? lt.raw_tex_metadata.resource->GetInitData()->Path : "-";
+            static std::unordered_set<std::string> seen;
+            if (seen.insert(name + std::to_string(om) + std::to_string(mRdp->combine_mode)).second) {
+                const float* t = solid && mGiTris.size() >= NEWDAWN_GI_TRI_FLOATS
+                                     ? &mGiTris[mGiTris.size() - NEWDAWN_GI_TRI_FLOATS] : nullptr;
+                SPDLOG_INFO("GIDBG {} tex={} omL={:x} cc={:x} geo={:x} albedo={:.2f},{:.2f},{:.2f}", solid ? "solid" : "SKIP",
+                            name, om, mRdp->combine_mode, mRsp->geometry_mode, t ? t[3] : 0, t ? t[4] : 0, t ? t[5] : 0);
+            }
+        }
+    }
     if (mShadowOnly) {
         // Culled room entry (coverage pass): record it as a caster, never draw it.
-        if (!is_rect && mShadowRecording && OpaqueCasterMode(mRdp->other_mode_l)) {
+        if (!is_rect && mShadowRecording && !mShadowOnlyGi && OpaqueCasterMode(mRdp->other_mode_l)) {
             RecordShadowTriangle(&mRsp->loaded_vertices[vtx1_idx], &mRsp->loaded_vertices[vtx2_idx],
                                  &mRsp->loaded_vertices[vtx3_idx]);
             mShadowOnlyTris++;
@@ -5938,6 +6150,14 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         return false;
     }
     const int stage = C0(0, 8);
+    if (stage == NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN || stage == NEWDAWN_POSTFX_STAGE_GI_ROOM_END) {
+        // World GI room scope: only decides whether later triangles are also recorded; no flush, nothing drawn.
+        gfx->mGiRecord = stage == NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN && gfx->mPostFxActive && gfx->mRendersToFb &&
+                         !gfx->mFbActive && gfx->mRapi->GiWantsGeometry();
+        gfx->mGiDebug = gfx->mGiRecord &&
+            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.GI.WorldLog", 0) != 0;
+        return false;
+    }
     if (stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN || stage == NEWDAWN_POSTFX_STAGE_WIND_END) {
         // Only changes how later triangles are built: no batch flush needed, so per-actor scopes stay cheap.
         gfx->mWindSway = stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN && gfx->mPostFxActive;
@@ -5947,9 +6167,13 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN) {
         // w1 is a display list of room entries the game culled. It only runs while casters are being recorded (never on
         // another backend or with the effect off, where it would draw the entries), and the end marker restores state.
+        // World GI hands over its own list (the GI bit): it runs only on the frames room geometry is recorded for the
+        // voxel grid, and never records casters.
         gfx->Flush();
-        if (gfx->mPostFxActive && gfx->mShadowRecording && !gfx->mShadowOnly) {
+        const bool giList = ((cmd->words.w0 >> NEWDAWN_POSTFX_SHADOW_ONLY_GI_SHIFT) & 1) != 0;
+        if (gfx->mPostFxActive && (giList ? gfx->mGiRecord : gfx->mShadowRecording) && !gfx->mShadowOnly) {
             gfx->BeginShadowOnly();
+            gfx->mShadowOnlyGi = giList;
             g_exec_stack.call(cmd, reinterpret_cast<F3DGfx*>(cmd->words.w1));
         }
         return false;
@@ -5971,6 +6195,7 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
                                       (params.shadowEnabled != 0 || params.atmosWeather || params.localShadows != 0),
                                   gfx->mPostFxActive && (params.waterEnabled != 0 || params.atmosBiome != 0 ||
                                                          params.fogVolumetric != 0 || params.giEnabled != 0 ||
+                                                         params.giWorld != 0 ||
                                                          params.vfxEnabled != 0 || params.grassEnabled != 0));
         return false;
     }
@@ -5997,6 +6222,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             gfx->SubmitShadowCasters();
             gfx->SubmitGrass();
             gfx->mGrass = false;
+            gfx->mRapi->SetGiTriangles(gfx->mGiTris.empty() ? nullptr : gfx->mGiTris.data(),
+                                       (uint32_t)(gfx->mGiTris.size() / NEWDAWN_GI_TRI_FLOATS));
             gfx->SubmitInterior(effective);
             gfx->mInterior = false;
         } else if ((stage == NEWDAWN_POSTFX_STAGE_SCENE_END && (effective.waterEnabled != 0 || effective.vfxEnabled != 0)) ||
@@ -6013,6 +6240,9 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             }
         }
         gfx->mRapi->RunPostFx(stage, effective, gfx->mGameFb);
+        if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END) {
+            gfx->mGiTris.clear();
+        }
         if (stage == NEWDAWN_POSTFX_STAGE_WORLD_BEGIN) {
             gfx->BeginTaa(effective);
         }
@@ -6972,6 +7202,8 @@ void Interpreter::StartFrame() {
         (postFxEnabled || shadowsEnabled || waterEnabled ||
          Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.HDR.Enabled", 0) != 0);
     mShadowRecording = false;
+    mGiRecord = false;
+    mGiTris.clear();
     mShadowOverflowLogged = false;
     mShadowVertices.clear();
     mShadowFoliage = false;
