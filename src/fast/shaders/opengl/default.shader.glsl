@@ -127,6 +127,14 @@
     uniform float uHdrAmbient;
     uniform float uHdrSky;
     uniform float uHdrFog;
+    @if(o_alpha)
+        // New Dawn foliage light (render only). Frame: eye | sun direction, strength | sun radiance; the eye's w is 1
+        // when uFolDraw.yzw is the origin of the actor the leaves belong to. Draw: on | origin. View: game viewport.
+        uniform vec4 uFolFrame[3];
+        uniform vec4 uFolDraw;
+        uniform vec4 uFolView;
+        uniform mat4 uFolInv;
+    @end
     vec3 hdrDecode(vec3 c) {
         c = max(c, vec3(0.0));
         return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
@@ -743,6 +751,34 @@
                 }
             @end
         }
+        @if(o_alpha)
+            if (uHdrWorld && uFolDraw.x > 0.5 && uFolFrame[1].w > 0.0) {
+                // World position of this leaf fragment from its depth, then the sun's light passing through the card
+                // when the sun is behind it as seen from the camera (strongest at dawn and dusk), and a darker interior
+                // towards the trunk.
+                vec2 fp = (gl_FragCoord.xy - uFolView.xy) / max(uFolView.zw, vec2(1.0));
+                vec4 wp = uFolInv * vec4(fp * 2.0 - 1.0, gl_FragCoord.z * 2.0 - 1.0, 1.0);
+                vec3 fpos = wp.xyz / wp.w;
+                vec3 fv = fpos - uFolFrame[0].xyz;
+                fv /= max(length(fv), 1.0);
+                vec3 fl = uFolFrame[1].xyz;
+                float fback = clamp(dot(fv, fl), 0.0, 1.0);
+                vec3 fn = cross(dFdx(fpos), dFdy(fpos));
+                fn = length(fn) > 1e-8 ? normalize(fn) : vec3(0.0, 1.0, 0.0);
+                float fside = clamp(dot(fn, fv) * dot(fn, fl) * 3.0 + 0.35, 0.0, 1.0);
+                float fglow = pow(fback, 2.0) * fside;
+                float fluma = dot(texel.rgb, vec3(0.2126, 0.7152, 0.0722));
+                // The leaf's hue (not its baked brightness: backlit leaves are baked dark) tints the light passing through.
+                vec3 fhue = texel.rgb / max(max(texel.r, max(texel.g, texel.b)), 0.002);
+                vec3 trans = fhue * fhue * uFolFrame[2].xyz * fglow * uFolFrame[1].w * 1.1 * (0.6 + 0.4 * clamp(fluma * 6.0, 0.0, 1.0));
+                float fao = 1.0;
+                if (uFolFrame[0].w > 0.5) {
+                    vec3 rel = fpos - uFolDraw.yzw;
+                    fao = mix(0.62, 1.0, smoothstep(6.0, 60.0, length(rel.xz))) * mix(0.8, 1.0, smoothstep(0.0, 70.0, rel.y));
+                }
+                texel.rgb = texel.rgb * mix(1.0, fao, min(uFolFrame[1].w, 1.0)) + trans;
+            }
+        @end
         @if(o_material_maps)
             if (materialDiffuse) {
                 vec3 specular = materialSpecular(materialN, materialRoughness, materialWeight, hdrDiffuse);

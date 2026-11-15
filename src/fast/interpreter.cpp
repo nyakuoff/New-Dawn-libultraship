@@ -3858,7 +3858,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // foliage shadows use the same displaced copy. Geometry, animation and collision
     // are untouched: the loaded vertices themselves are never modified.
     LoadedVertex swayed[3];
-    if (mWindSway && !is_rect && comb->usedTextures[0] && mRenderingState.mTextures[0] != nullptr && tex_height[0] > 0 &&
+    if (mWindSway && mWindDisplace && !is_rect && comb->usedTextures[0] && mRenderingState.mTextures[0] != nullptr && tex_height[0] > 0 &&
         (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA && (mRdp->other_mode_l & G_ZS_PRIM) == 0 &&
         (!mWindRoom || mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].swayPlant) &&
         WindTriangleUpright(v_arr, mWindRoom ? 0.75f : 0.95f)) {
@@ -3970,6 +3970,41 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         Flush();
         mRapi->SetAlphaToCoverage(alpha_to_coverage);
         mRenderingState.alpha_to_coverage = alpha_to_coverage;
+    }
+
+    // New Dawn foliage light: cut-out leaves of the wind-scoped plants (room plant textures, foliage actors) get light
+    // through them in the shader. The renderer holds the actor's origin and the inverse projection for depth unprojection.
+    {
+        // The cut-out render mode (actor foliage clears texture_edge when the combiner has alpha, room cut-outs keep it).
+        const bool cutout = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+        const bool foliage = mFoliageLight && cutout && !is_rect && mRapi->HdrWorldActive() && comb->usedTextures[0] &&
+                             mRenderingState.mTextures[0] != nullptr &&
+                             (!mWindRoom ||
+                              mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].swayPlant);
+        float origin[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (foliage && !mWindRoom) {
+            const float(*m)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            origin[0] = m[3][0], origin[1] = m[3][1], origin[2] = m[3][2], origin[3] = 1.0f;
+        }
+        const bool moved = foliage && (std::fabs(origin[0] - mFoliageOrigin[0]) > 0.25f ||
+                                       std::fabs(origin[1] - mFoliageOrigin[1]) > 0.25f ||
+                                       std::fabs(origin[2] - mFoliageOrigin[2]) > 0.25f || origin[3] != mFoliageOrigin[3]);
+        if (foliage != mFoliageDrawOn || moved) {
+            Flush();
+            float inv[16];
+            if (foliage && Invert4x4(mRsp->P_matrix, inv)) {
+                const float xScale = AdjXForAspectRatio(1.0f);
+                const int vp[4] = { (int)mRenderingState.viewport.x, (int)mRenderingState.viewport.y,
+                                    (int)mRenderingState.viewport.width, (int)mRenderingState.viewport.height };
+                mRapi->SetFoliageDraw(true, origin, inv, xScale > 1e-6f ? 1.0f / xScale : 1.0f,
+                                      mRapi->GetClipParameters().invertY ? -1.0f : 1.0f, vp);
+                mFoliageDrawOn = true;
+                memcpy(mFoliageOrigin, origin, sizeof(origin));
+            } else {
+                mRapi->SetFoliageDraw(false, origin, inv, 1.0f, 1.0f, nullptr);
+                mFoliageDrawOn = false;
+            }
+        }
     }
 
     // Per-pixel lighting reads the lights from uniforms, so a batch can only be drawn while the
@@ -6162,6 +6197,8 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         // Only changes how later triangles are built: no batch flush needed, so per-actor scopes stay cheap.
         gfx->mWindSway = stage == NEWDAWN_POSTFX_STAGE_WIND_BEGIN && gfx->mPostFxActive;
         gfx->mWindRoom = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_ROOM_SHIFT) & 1);
+        gfx->mWindDisplace = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_SWAY_SHIFT) & 1);
+        gfx->mFoliageLight = gfx->mWindSway && ((cmd->words.w0 >> NEWDAWN_POSTFX_WIND_FOLIAGE_SHIFT) & 1);
         return false;
     }
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN) {
@@ -6189,6 +6226,16 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         // Water only needs the camera of this frame, not the casters.
         gfx->BeginVfxRecording(gfx->mPostFxActive && params.vfxEnabled != 0);
         gfx->BeginGrassRecording(gfx->mPostFxActive && params.grassEnabled != 0);
+        {
+            // Sun for the light through the leaves: linear radiance the way the grass lights its blades.
+            auto decode = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
+            const float sunK = std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
+                                              "gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) * 0.5f;
+            const float col[3] = { decode(params.foliageSunColor[0]) * sunK, decode(params.foliageSunColor[1]) * sunK,
+                                   decode(params.foliageSunColor[2]) * sunK };
+            gfx->mRapi->SetFoliageFrame(params.giCameraEye, params.foliageSunDir, col,
+                                        gfx->mPostFxActive && params.foliageLight ? params.foliageStrength : 0.0f);
+        }
         gfx->BeginInteriorRecording(gfx->mPostFxActive && (params.interiorEnabled != 0 || params.emissiveEnabled != 0),
                                     params.interiorDebug != 0);
         gfx->BeginShadowRecording(gfx->mPostFxActive &&

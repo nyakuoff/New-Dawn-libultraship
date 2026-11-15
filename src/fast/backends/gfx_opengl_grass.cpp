@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace Fast {
@@ -42,7 +43,12 @@ uniform vec3 uWind;   // dir x, dir z, gust
 uniform vec3 uPhase;  // travelling-wave phases (radians)
 uniform vec2 uInvSize;
 uniform sampler2D uGround;
+uniform int uPushCount, uFlower, uSegs;   // pushers (Link, nearby actors, their recent trail); ground-cover pass; height segments
+uniform vec4 uPush[36];                    // x, z, age in seconds, radius
+uniform vec4 uFlowerMix;                   // weights of daisy, buttercup, wildflower, clover
+uniform float uFlowerDensity, uTrans;      // ground-cover amount; extra sun-through-blades strength (0 = original look)
 out vec2 vUv;
+flat out int vKind;
 out vec3 vGround;
 out float vHeight, vTrans, vTipTint, vPatch;
 
@@ -67,13 +73,30 @@ const vec2 kCorner[6] = vec2[6](vec2(0,0), vec2(1,0), vec2(1,1), vec2(0,0), vec2
 
 void cull() {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    vUv = vec2(0.0); vGround = vec3(0.0); vHeight = 0.0; vTrans = 0.0; vTipTint = 0.0; vPatch = 0.0;
+    vUv = vec2(0.0); vGround = vec3(0.0); vHeight = 0.0; vTrans = 0.0; vTipTint = 0.0; vPatch = 0.0; vKind = 0;
+}
+
+// Sum of the pushes on a point: away from each pusher, strong at its feet, springing back over about a second.
+vec3 pushAt(vec2 xz) {
+    vec2 sum = vec2(0.0);
+    for (int i = 0; i < uPushCount; ++i) {
+        vec4 q = uPush[i];
+        vec2 d = xz - q.xy;
+        float dist = length(d);
+        if (dist >= q.w) continue;
+        float fall = 1.0 - smoothstep(q.w * 0.30, q.w, dist);
+        float age = q.z;
+        float life = exp(-3.2 * age) * (1.0 + 0.45 * sin(age * 7.5)) * (1.0 - smoothstep(0.85, 1.2, age));
+        sum += (dist > 0.3 ? d / dist : vec2(1.0, 0.0)) * (fall * max(life, 0.0));
+    }
+    float l = length(sum);
+    return vec3(l > 1.0 ? sum / l : sum, min(l, 1.0));
 }
 
 void main() {
     int slot = gl_InstanceID % uSlotCount;
     int ix = int(floor(aR0.x / uCell + 0.5)), iz = int(floor(aR0.y / uCell + 0.5));
-    uint seed = ihash(uint(ix * 1973 + 9277) ^ ihash(uint(iz * 6271 + 19349) + uint(slot) * 26699u + 1u));
+    uint seed = ihash(uint(ix * 1973 + 9277) ^ ihash(uint(iz * 6271 + 19349) + uint(slot) * 26699u + 1u + (uFlower != 0 ? 7777u : 0u)));
     float r0 = rnd(seed), r1 = rnd(seed);
     vec2 pxz = aR0.xy + vec2(r0, r1) * uCell;
     vec3 p0 = vec3(aR0.zw, aR1.x), p1 = aR1.yzw, p2 = aR2.xyz;
@@ -93,16 +116,33 @@ void main() {
     if (vis <= 0.0) { cull(); return; }
 
     float r2 = rnd(seed), r3 = rnd(seed), r4 = rnd(seed), r5 = rnd(seed), r6 = rnd(seed);
+    float kindF = 0.0;
+    if (uFlower != 0) {
+        // Ground cover grows in meadow-scale patches (a function of the world position only); a patch is mostly one kind.
+        vis *= 1.0 - smoothstep(0.30, 0.45, u);
+        float pn = 0.5 + 0.25 * sin(root.x * 0.0155 + 1.3 * sin(root.z * 0.0112)) + 0.25 * sin(root.z * 0.0191 - root.x * 0.0071 + 2.1);
+        float pg = smoothstep(0.50, 0.76, pn);
+        if (r6 > pg * uFlowerDensity * 0.85 || vis <= 0.0) { cull(); return; }
+        uint ps = ihash(uint(int(floor(root.x / 85.0)) * 4099 + 3) ^ ihash(uint(int(floor(root.z / 85.0)) * 6791 + 11)));
+        float kr = mix(r5, rnd(ps), 0.82);
+        float tot = max(dot(uFlowerMix, vec4(1.0)), 1e-4);
+        kr *= tot;
+        kindF = kr < uFlowerMix.x ? 0.0 : (kr < uFlowerMix.x + uFlowerMix.y ? 1.0 : (kr < uFlowerMix.x + uFlowerMix.y + uFlowerMix.z ? 2.0 : 3.0));
+    }
     float comp = clamp(sqrt(uDensityNear / max(f, 0.05)), 1.0, 2.4); // sparser far field: bigger tufts keep coverage
     float pd = length(root.xz - uFocus.xz);
     float lay = mix(0.45, 1.0, smoothstep(6.0, 28.0, pd)); // bent down right at the player's feet only (render only)
     float h = 11.0 * uHeight * (0.65 + 0.8 * r2) * (1.0 + 0.3 * (comp - 1.0)) * vis * lay;
     float wd = 11.0 * sqrt(uHeight) * (0.95 + 0.4 * r3) * (1.0 + 0.35 * (comp - 1.0)) * vis * mix(0.85, 1.0, lay);
+    if (uFlower != 0) { // a cluster of a few stems: small next to the grass, a little taller than the shortest blades
+        h = 15.0 * (0.7 + 0.5 * r2) * vis * lay;
+        wd = 16.0 * (0.8 + 0.5 * r3) * vis * mix(0.85, 1.0, lay);
+    }
 
     int id = gl_VertexID;
     int q = id / 12, r = id % 12, seg = r / 6, k = r % 6;
     vec2 cn = kCorner[k];
-    float v = (float(seg) + cn.y) * 0.5;
+    float v = (float(seg) + cn.y) / float(uSegs);
     float lateral = cn.x - 0.5;
     float yaw = r4 * 3.14159265 + float(q) * 1.5707963;
     vec3 right = vec3(cos(yaw), 0.0, sin(yaw));
@@ -119,6 +159,11 @@ void main() {
     vec2 d = (uWind.xy * amp * 0.30 + perp * sin(uPhase.z + r6 * 13.0) * 0.05 * uWind.z) * h * bendW * uWindScale;
     pos.xz += d;
     pos.y -= length(d) * 0.35 * bendW;
+    if (uPushCount > 0) { // bent away from Link and other actors (render only), then back up
+        vec3 pu = pushAt(root.xz);
+        pos.xz += pu.xy * (0.85 * h * bendW);
+        pos.y -= pu.z * 0.45 * h * bendW;
+    }
 
     vec4 clipRoot = uViewProj * vec4(root, 1.0);
     if (clipRoot.w <= 1.0) { cull(); return; }
@@ -126,7 +171,8 @@ void main() {
     vec2 guv = clamp(ndcRoot * 0.5 + 0.5, vec2(0.003), vec2(0.997));
     vGround = groundSample(guv);
 
-    int variant = int(r3 * 4.0) & 3;
+    int variant = uFlower != 0 ? int(kindF) : (int(r3 * 4.0) & 3);
+    vKind = uFlower;
     vec2 cell = vec2(float(variant & 1), float(variant >> 1));
     float flip = r5 > 0.5 ? 1.0 : 0.0;
     vUv = (cell + vec2(mix(cn.x, 1.0 - cn.x, flip), 1.0 - v)) * 0.5;
@@ -137,6 +183,8 @@ void main() {
     // Sun behind the tuft as seen from the eye: light shines through the blades.
     vec3 viewDir = normalize(root - uEye);
     vTrans = pow(clamp(dot(viewDir, uSunDir), 0.0, 1.0), 3.0) * v;
+    // Foliage light: wider lobe, and a sun-above term (thin blades glow when the sun is overhead too), tips most.
+    vTrans += uTrans * (pow(clamp(dot(viewDir, uSunDir), 0.0, 1.0), 1.8) * 0.9 * v + 0.28 * clamp(uSunDir.y, 0.0, 1.0) * v * v);
 
     vec4 clip = uViewProj * vec4(pos, 1.0);
     clip.x /= uNdcXScale;
@@ -149,6 +197,7 @@ const char* kFragment = R"GLSL(#version 330 core
 in vec2 vUv;
 in vec3 vGround;
 in float vHeight, vTrans, vTipTint, vPatch;
+flat in int vKind;
 uniform sampler2D uAtlas;
 uniform int uAlphaToCoverage;
 uniform float uLodBias;
@@ -167,6 +216,13 @@ void main() {
     }
     vec3 g = vGround;
     float l = dot(g, vec3(0.2126, 0.7152, 0.0722));
+    if (vKind != 0) { // ground cover keeps its own colour; only the light of the ground reaches it
+        vec3 lit = mix(vec3(l), g, 0.30) * 2.4 * mix(0.55, 1.0, vHeight);
+        vec3 rgb = t.rgb * lit;
+        rgb += t.rgb * g * uSunColor * (1.6 * vTrans);
+        oColor = vec4(rgb, a);
+        return;
+    }
     g = mix(vec3(l), g, 1.25);                                   // richer than the flat ground texture
     g *= mix(vec3(1.00, 0.97, 0.80), vec3(0.84, 1.06, 0.84), vPatch); // dry straw <-> lush green meadow patches
     g *= vec3(1.0 + 0.06 * vTipTint, 1.0 + 0.04 * vTipTint * vHeight, 1.0 - 0.10 * vTipTint); // hue drift between tufts
@@ -195,6 +251,22 @@ GLuint Compile(GLenum type, const char* text) {
 float CvFloat(const char* name, float def) {
     return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(name, def);
 }
+
+// Where actors recently walked: samples of (x, z, birth time, radius), aged by wall clock so the blades spring back over
+// about a second whatever the frame rate. Read-only copies of positions the game side hands over.
+struct PushSample {
+    float x, z, t, r;
+};
+struct PushLast {
+    uint32_t key;
+    float x, z;
+    bool used;
+};
+constexpr int kMaxPush = 36, kLive = NEWDAWN_GRASS_PUSHERS, kTrail = kMaxPush - kLive;
+constexpr float kPushLife = 1.25f, kPushSpacing = 6.0f;
+PushSample gTrail[kTrail];
+int gTrailHead = 0;
+PushLast gLast[kLive];
 
 float Decode(float c) {
     return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
@@ -236,6 +308,9 @@ bool PostFxGL::BuildGrassProgram() {
         GLenum type;
         glGetActiveUniform(mGrass.id, i, sizeof(name), &length, &size, &type, name);
         mGrass.uniforms[name] = glGetUniformLocation(mGrass.id, name);
+        std::string base(name);
+        if (base.size() > 3 && base.compare(base.size() - 3, 3, "[0]") == 0)
+            mGrass.uniforms[base.substr(0, base.size() - 3)] = mGrass.uniforms[name]; // arrays are looked up by bare name
     }
     Use(mGrass);
     glUniform1i(Loc("uGround"), kGroundUnit);
@@ -271,6 +346,28 @@ bool PostFxGL::BuildGrassProgram() {
     glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY_EXT */, std::min(maxAniso, 16.0f));
     glGenerateMipmap(GL_TEXTURE_2D);
 
+    // Optional ground-cover atlas (flowers, clover); without it only the flowers stay off.
+    {
+        std::filesystem::path fpath = std::filesystem::path(root) / "grass" / "flower_atlas.png";
+        if (!fpath.is_absolute())
+            fpath = Ship::Context::LocateFileAcrossAppDirs(fpath.string());
+        int fw = 0, fh = 0, fn = 0;
+        auto* fdata = stbi_load(fpath.string().c_str(), &fw, &fh, &fn, 4);
+        if (fdata && fw == fh && fw >= 128 && fw <= 4096) {
+            glGenTextures(1, &mFlowerAtlas);
+            glBindTexture(GL_TEXTURE_2D, mFlowerAtlas);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fw, fh, 0, GL_RGBA, GL_UNSIGNED_BYTE, fdata);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameterf(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY_EXT */, std::min(maxAniso, 16.0f));
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else {
+            SPDLOG_WARN("NewDawnGrass: no ground-cover atlas {}; flowers stay off", fpath.string());
+        }
+        stbi_image_free(fdata);
+    }
     glGenVertexArrays(1, &mGrassVao);
     glGenBuffers(1, &mGrassVbo);
     SPDLOG_INFO("NewDawnGrass: loaded tuft atlas from {}", path.string());
@@ -431,6 +528,67 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
     const double travel = NewDawnWindTravel(t);
     glUniform3f(Loc("uPhase"), (float)std::fmod(travel * 1.7, kTwoPi), (float)std::fmod(travel * 1.3, kTwoPi),
                 (float)std::fmod(t * 6.0, kTwoPi));
+    // Pushers: the live positions plus the recent trail (age in seconds), nothing when the feature is off.
+    float push[kMaxPush * 4] = {};
+    int pushCount = 0;
+    if (p.grassBend) {
+        const float now = (float)t;
+        for (int i = 0; i < p.grassPushCount && i < kLive; ++i) {
+            const float* a = p.grassPush[i];
+            PushLast* last = nullptr;
+            for (auto& l : gLast)
+                if (l.used && l.key == p.grassPushKey[i])
+                    last = &l;
+            if (!last) {
+                for (auto& l : gLast)
+                    if (!l.used)
+                        last = &l;
+                if (!last)
+                    last = &gLast[i % kLive];
+                *last = { p.grassPushKey[i], a[0], a[2], true };
+            }
+            const float dx = a[0] - last->x, dz = a[2] - last->z;
+            if (dx * dx + dz * dz >= kPushSpacing * kPushSpacing) {
+                if (dx * dx + dz * dz < 300.0f * 300.0f) // a teleport leaves no trail
+                    gTrail[gTrailHead++ % kTrail] = { last->x, last->z, now, a[3] * 0.8f };
+                last->x = a[0];
+                last->z = a[2];
+            }
+            push[pushCount * 4 + 0] = a[0];
+            push[pushCount * 4 + 1] = a[2];
+            push[pushCount * 4 + 2] = 0.0f;
+            push[pushCount * 4 + 3] = a[3];
+            ++pushCount;
+        }
+        for (auto& l : gLast) { // forget actors that are gone
+            bool seen = false;
+            for (int i = 0; i < p.grassPushCount && i < kLive; ++i)
+                seen |= l.key == p.grassPushKey[i];
+            if (!seen)
+                l.used = false;
+        }
+        for (const auto& s : gTrail) {
+            const float age = now - s.t;
+            if (s.r > 0.0f && age >= 0.0f && age < kPushLife && pushCount < kMaxPush) {
+                push[pushCount * 4 + 0] = s.x;
+                push[pushCount * 4 + 1] = s.z;
+                push[pushCount * 4 + 2] = age;
+                push[pushCount * 4 + 3] = s.r;
+                ++pushCount;
+            }
+        }
+    } else {
+        for (auto& s : gTrail)
+            s.r = 0.0f;
+        for (auto& l : gLast)
+            l.used = false;
+    }
+    glUniform1i(Loc("uPushCount"), pushCount);
+    if (pushCount > 0)
+        glUniform4fv(Loc("uPush"), pushCount, push);
+    glUniform1f(Loc("uTrans"), p.foliageLight ? std::clamp(p.foliageStrength, 0.0f, 3.0f) : 0.0f);
+    glUniform4fv(Loc("uFlowerMix"), 1, p.grassFlowerMix);
+    glUniform1f(Loc("uFlowerDensity"), p.grassFlowerDensity);
     const bool a2c = fb.msaa_level > 1;
     glUniform1i(Loc("uAlphaToCoverage"), a2c);
     // Alpha-to-coverage hides the shimmer of a sharper mip, so the MSAA path samples finer levels.
@@ -458,22 +616,39 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
     for (const auto& band : mGrassCells)
         total += band.size();
     glBufferData(GL_ARRAY_BUFFER, total * sizeof(float), nullptr, GL_STREAM_DRAW);
-    size_t offset = 0;
-    for (int band = 0; band < 4; ++band) {
-        const auto& records = mGrassCells[band];
-        if (records.empty())
-            continue;
-        glBufferSubData(GL_ARRAY_BUFFER, offset * sizeof(float), records.size() * sizeof(float), records.data());
-        for (int i = 0; i < 3; ++i) {
-            glEnableVertexAttribArray(i);
-            glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, kRecordFloats * sizeof(float),
-                                  (const void*)((offset + i * 4) * sizeof(float)));
-            glVertexAttribDivisor(i, kBands[band]);
+    const bool flowers = p.grassFlowers && p.grassFlowerDensity > 0.01f && mFlowerAtlas != 0;
+    for (int pass = 0; pass < (flowers ? 2 : 1); ++pass) {
+        // Pass 1: ground cover on the nearer cells (a single height segment is enough for small flowers).
+        glUniform1i(Loc("uFlower"), pass);
+        glUniform1i(Loc("uSegs"), pass ? 1 : 2);
+        if (pass) {
+            glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+            glBindTexture(GL_TEXTURE_2D, mFlowerAtlas);
         }
-        glUniform1i(Loc("uSlotCount"), kBands[band]);
-        const GLsizei cellCount = (GLsizei)(records.size() / kRecordFloats);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, kTuftVertices, cellCount * kBands[band]);
-        offset += records.size();
+        size_t offset = 0;
+        for (int band = 0; band < 4; ++band) {
+            const auto& records = mGrassCells[band];
+            if (records.empty())
+                continue;
+            if (pass == 0)
+                glBufferSubData(GL_ARRAY_BUFFER, offset * sizeof(float), records.size() * sizeof(float), records.data());
+            if (pass == 0 || band < 2) {
+                for (int i = 0; i < 3; ++i) {
+                    glEnableVertexAttribArray(i);
+                    glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, kRecordFloats * sizeof(float),
+                                          (const void*)((offset + i * 4) * sizeof(float)));
+                    glVertexAttribDivisor(i, kBands[band]);
+                }
+                glUniform1i(Loc("uSlotCount"), kBands[band]);
+                const GLsizei cellCount = (GLsizei)(records.size() / kRecordFloats);
+                glDrawArraysInstanced(GL_TRIANGLES, 0, pass ? 12 : kTuftVertices, cellCount * kBands[band]);
+            }
+            offset += records.size();
+        }
+    }
+    if (flowers) {
+        glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+        glBindTexture(GL_TEXTURE_2D, mGrassAtlas);
     }
     for (int i = 0; i < 3; ++i)
         glVertexAttribDivisor(i, 0);

@@ -201,7 +201,7 @@ class PostFxGL {
     bool mGrassGroundReady = false; // the ground-only colour copy of this frame exists (taken before actors are drawn)
     Program mGrass;
     bool mGrassAttempted = false;
-    GLuint mGrassAtlas = 0, mGrassVao = 0, mGrassVbo = 0;
+    GLuint mGrassAtlas = 0, mGrassVao = 0, mGrassVbo = 0, mFlowerAtlas = 0; // mFlowerAtlas stays 0 when the file is missing
     Target mGrassGround; // single-sample copy of the finished ground colour, sampled at every tuft root
     const float* mGrassData = nullptr;
     uint32_t mGrassCount = 0;

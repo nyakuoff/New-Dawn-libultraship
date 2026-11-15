@@ -168,6 +168,14 @@ class GfxRenderingAPI {
     virtual void SetGrassTriangles(const float* data, uint32_t count) {
     }
     // New Dawn emissive surfaces: stencil class (0 none, 4 night glass, 8 lamps/signs) of the triangles drawn from now on.
+    // New Dawn foliage light. Frame: sun direction/colour and strength; Draw: whether the next draws are foliage cut-outs
+    // (origin xyz = the actor the leaves belong to, w = 1 when valid), the inverse view-projection used to recover world
+    // positions from depth, and the game viewport. Callers flush before changing it.
+    virtual void SetFoliageFrame(const float* eye, const float* sunDir, const float* sunColor, float strength) {
+    }
+    virtual void SetFoliageDraw(bool on, const float* origin, const float* invViewProj, float ndcXScale, float flipY,
+                                const int* viewport) {
+    }
     virtual void SetStencilMark(uint8_t mark) {
     }
     // True while the renderer will redraw recorded VFX sprites itself (so the native draw may be skipped).

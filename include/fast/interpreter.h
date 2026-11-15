@@ -704,6 +704,10 @@ class Interpreter {
     NewDawnWindState mWindState = {};
     bool mWindSway = false; // inside a New Dawn wind scope (room or foliage actor), render-only sway
     bool mWindRoom = false; // the scope is room geometry: only plant cut-out textures sway there
+    bool mWindDisplace = false;   // the scope displaces the cut-outs (gNewDawn.Atmos.Wind)
+    bool mFoliageLight = false;   // the scope adds light through the leaves (gNewDawn.Foliage.Light)
+    bool mFoliageDrawOn = false;  // the renderer's current foliage draw state
+    float mFoliageOrigin[4] = {}; // actor origin (xyz) and validity (w) of the renderer's current foliage draw state
     uint32_t mShadowSerial = 0;
     size_t mShadowFoliageFloats = 0;
     std::unordered_map<uint32_t, std::vector<float>> mShadowFoliageByTex;
