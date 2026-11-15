@@ -3247,7 +3247,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[1] = vn->n[1];
             d->normal[2] = vn->n[2];
         }
-        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord) {
+        if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord || mVfx) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
