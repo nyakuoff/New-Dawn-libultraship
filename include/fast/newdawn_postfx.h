@@ -6,6 +6,8 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_END 16   /* end of a shadow-only display list (restores every piece of state it touched) */
+#define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN 15 /* w1 = a display list of room entries the game culled this frame: run only while casters are recorded, it records casters and draws nothing */
 #define NEWDAWN_POSTFX_STAGE_WATER_XLU 14 /* actors drawn, soft-sprite effects (splashes, ripples) not yet: the water surface pass runs here so those draw above it */
 #define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
@@ -184,6 +186,8 @@ typedef struct NewDawnPostFxParams {
     float localBoost[NEWDAWN_LOCAL_LIGHTS];          /* per-light intensity multiplier (1; below 1 for fairies) */
     float localDarken;       /* 0..~0.8: how far the unlit scene is pulled down (night outdoors, lamp-lit interiors) */
     float localGain;         /* light intensity multiplier (interiors are lit harder) */
+    int32_t localShadows;    /* gNewDawn.Shadows.PointLights: 0..2 lights that get a shadow cube map (needs the casters recorded) */
+    float localFocus[3];     /* the player's position: the shadow-casting lights are the ones that matter around it */
     /* New Dawn grass: render-only instanced tufts on grass-textured ground, drawn at the opaque-end marker. Needs HDR. */
     int32_t grassEnabled;
     float grassDensity;      /* 0..2 multiplier on the tuft count */

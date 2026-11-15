@@ -649,6 +649,18 @@ class Interpreter {
     float mShadowNdcXScale = 1.0f;
     float mShadowFlipY = 1.0f;
     std::vector<float> mShadowVertices;
+    // Shadow-only mode (gNewDawn.Shadows.Coverage): the game hands over the room entries it culled this frame as a
+    // display list. Running it only records their triangles as shadow casters; nothing is drawn, and the RSP/RDP
+    // state is restored afterwards so the frame continues exactly as if it had never run.
+    bool mShadowOnly = false;
+    uint32_t mShadowOnlyTris = 0; // casters this frame that came from the coverage pass (diagnostics)
+    uint64_t mShadowOnlyNs = 0, mShadowOnlyStart = 0; // CPU time spent in the coverage pass this frame (diagnostics)
+    RSP mShadowOnlyRsp{};
+    RDP mShadowOnlyRdp{};
+    uintptr_t mShadowOnlySegments[MAX_SEGMENT_POINTERS]{};
+    uint32_t mShadowOnlyMatrixLoads = 0;
+    void BeginShadowOnly();
+    void EndShadowOnly();
     // Alpha-tested casters (gNewDawn.Shadows.Foliage): x,y,z,u,v per vertex, grouped by GL texture id.
     bool mShadowFoliage = false;
     // New Dawn VFX recording (render-side only).
