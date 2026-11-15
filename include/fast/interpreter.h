@@ -9,6 +9,7 @@
 #include <map>
 #include <list>
 #include <cstddef>
+#include <array>
 #include <vector>
 #include <stack>
 #include <string>
@@ -482,6 +483,9 @@ class Interpreter {
     bool SwayClassify(std::string_view path);
     void RecordGrassTriangle(const LoadedVertex* const v[3]);
     void SubmitGrass();
+    // New Dawn world GI: opaque room triangles (inside the GI room scope) with an albedo estimate and face normal.
+    void RecordGiTriangle(const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3);
+    void GiTextureAverage(int tile, float rgba[4]);
     void BeginShadowRecording(bool enabled, bool captureCamera = false);
     void EndShadowRecording();
     void SubmitShadowCasters();
@@ -664,6 +668,10 @@ class Interpreter {
     // New Dawn grass: world-space ground triangles with a grass texture (NEWDAWN_GRASS_TRI_FLOATS floats each).
     bool mGrass = false, mGrassDebug = false;
     std::vector<float> mGrassTris;
+    // New Dawn world GI: recording is on only inside a room scope, on the frames the renderer asks for geometry.
+    bool mGiRecord = false, mGiDebug = false;
+    std::vector<float> mGiTris; // NEWDAWN_GI_TRI_FLOATS floats each
+    std::unordered_map<uint64_t, std::array<float, 4>> mGiTexAverage; // texture data (and palette) -> mean colour
     // Debug.Stats profiles only displacement work (including timer overhead), averaged over 300 frames.
     bool mWindProfile = false;
     uint32_t mWindProfileFrames = 0;

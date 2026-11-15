@@ -6,6 +6,8 @@
  * Plain C so game code can fill it. Allocate it from the per-frame graphics pool: the display list is walked once
  * per interpolated output frame, so the pointer must stay valid until the frame is done.
  */
+#define NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN 15 /* world GI: static room geometry scope (render-side capture only) */
+#define NEWDAWN_POSTFX_STAGE_GI_ROOM_END 16
 #define NEWDAWN_POSTFX_STAGE_WATER_XLU 14 /* actors drawn, soft-sprite effects (splashes, ripples) not yet: the water surface pass runs here so those draw above it */
 #define NEWDAWN_POSTFX_STAGE_GROUND_END 13 /* room geometry done, actors not yet drawn: grass takes its ground colour here */
 #define NEWDAWN_POSTFX_STAGE_WIND_BEGIN 11 /* render-only foliage sway scope (room geometry) */
@@ -25,6 +27,9 @@
 
 /* One recorded grass ground triangle: world xyz of its three vertices. */
 #define NEWDAWN_GRASS_TRI_FLOATS 9
+
+/* One recorded world-GI room triangle: per vertex world xyz, reflectance rgb, face normal xyz, baked (0 lit, 1 unlit). */
+#define NEWDAWN_GI_TRI_FLOATS 30
 
 /* One recorded VFX sprite: cls, ndcX, ndcY, ndcZ, viewDepth, halfW, halfH, seed, primRGBA(4), world xyz, unused, envRGBA(4). */
 #define NEWDAWN_VFX_FLOATS 20
@@ -89,6 +94,14 @@ typedef struct NewDawnPostFxParams {
     int32_t giEnabled, giSceneId;
     float giStrength;
     float giCameraEye[3];
+    /* World-space GI (docs/WORLD_GI.md): a voxel copy of the room geometry and an irradiance probe grid, both built by
+       the renderer. Everything here is a read-only snapshot. 0 off, 1 High, 2 Ultra. */
+    int32_t giWorld;
+    float giWorldStrength;
+    float giWorldBoundsMin[3], giWorldBoundsMax[3]; /* the scene's collision bounds: the volume the grids cover */
+    float giWorldSunDir[3];   /* unit vector towards the sun or moon; zero when no directional light reaches the scene */
+    float giWorldSunColor[3]; /* its colour 0..1, horizon/night fades applied */
+    float giWorldSkyColor[3]; /* ambient colour 0..1 of an outdoor scene (sky fill); zero indoors */
 
     /* New Dawn sun shafts: raymarched in-scattering through the shadow map. Only used when shadowEnabled is set. */
     int32_t shaftEnabled;
