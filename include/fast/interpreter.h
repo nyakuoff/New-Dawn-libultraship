@@ -687,6 +687,7 @@ class Interpreter {
     std::vector<float> mGrassTris;
     // New Dawn world GI: recording is on only inside a room scope, on the frames the renderer asks for geometry.
     bool mGiRecord = false, mGiDebug = false;
+    bool mShadowOnlyGi = false; // the record-only list being run is world GI's: no shadow casters from it
     std::vector<float> mGiTris; // NEWDAWN_GI_TRI_FLOATS floats each
     std::unordered_map<uint64_t, std::array<float, 4>> mGiTexAverage; // texture data (and palette) -> mean colour
     // New Dawn interior polish: world-space triangles of window/emissive textures (11 floats each, see RecordInteriorTriangle).

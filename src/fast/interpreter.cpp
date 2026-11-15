@@ -3111,6 +3111,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         if (mShadowOnly) {
             // Coverage pass: only the world position (casters) and z/w (a branch-by-depth command may read them).
+            if (mGiRecord && (mRsp->geometry_mode & G_LIGHTING) == 0) {
+                d->color.r = v->cn[0]; // world GI reads the baked vertex colour of unlit room geometry
+                d->color.g = v->cn[1];
+                d->color.b = v->cn[2];
+            }
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -3345,6 +3350,7 @@ void Interpreter::EndShadowOnly() {
     memcpy(mSegmentPointers, mShadowOnlySegments, sizeof(mSegmentPointers));
     mMatrixLoadsSinceLights = mShadowOnlyMatrixLoads;
     mShadowOnly = false;
+    mShadowOnlyGi = false;
     mShadowOnlyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - mShadowOnlyStart;
 }
 
@@ -3382,7 +3388,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
     if (mShadowOnly) {
         // Culled room entry (coverage pass): record it as a caster, never draw it.
-        if (!is_rect && mShadowRecording && OpaqueCasterMode(mRdp->other_mode_l)) {
+        if (!is_rect && mShadowRecording && !mShadowOnlyGi && OpaqueCasterMode(mRdp->other_mode_l)) {
             RecordShadowTriangle(&mRsp->loaded_vertices[vtx1_idx], &mRsp->loaded_vertices[vtx2_idx],
                                  &mRsp->loaded_vertices[vtx3_idx]);
             mShadowOnlyTris++;
@@ -6161,10 +6167,13 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN) {
         // w1 is a display list of room entries the game culled. It only runs while casters are being recorded (never on
         // another backend or with the effect off, where it would draw the entries), and the end marker restores state.
-        // World GI records room geometry from the same list, so its grid also gets the meshes behind the camera.
+        // World GI hands over its own list (the GI bit): it runs only on the frames room geometry is recorded for the
+        // voxel grid, and never records casters.
         gfx->Flush();
-        if (gfx->mPostFxActive && (gfx->mShadowRecording || gfx->mGiRecord) && !gfx->mShadowOnly) {
+        const bool giList = ((cmd->words.w0 >> NEWDAWN_POSTFX_SHADOW_ONLY_GI_SHIFT) & 1) != 0;
+        if (gfx->mPostFxActive && (giList ? gfx->mGiRecord : gfx->mShadowRecording) && !gfx->mShadowOnly) {
             gfx->BeginShadowOnly();
+            gfx->mShadowOnlyGi = giList;
             g_exec_stack.call(cmd, reinterpret_cast<F3DGfx*>(cmd->words.w1));
         }
         return false;

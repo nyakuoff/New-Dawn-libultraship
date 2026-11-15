@@ -8,6 +8,7 @@
  */
 #define NEWDAWN_POSTFX_STAGE_GI_ROOM_BEGIN 17 /* world GI: static room geometry scope (render-side capture only) */
 #define NEWDAWN_POSTFX_STAGE_GI_ROOM_END 18
+#define NEWDAWN_POSTFX_SHADOW_ONLY_GI_SHIFT 8 /* bit of the SHADOW_ONLY_BEGIN command word: a world-GI list (records room geometry for the voxel grid, never shadow casters) */
 #define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_END 16   /* end of a shadow-only display list (restores every piece of state it touched) */
 #define NEWDAWN_POSTFX_STAGE_SHADOW_ONLY_BEGIN 15 /* w1 = a display list of room entries the game culled this frame: run only while casters are recorded, it records casters and draws nothing */
 #define NEWDAWN_POSTFX_STAGE_WATER_XLU 14 /* actors drawn, soft-sprite effects (splashes, ripples) not yet: the water surface pass runs here so those draw above it */
