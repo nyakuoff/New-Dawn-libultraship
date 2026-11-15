@@ -3129,7 +3129,11 @@ void main() {
             }
         }
     }
-    vec2 riverSlope = rs.xy * (0.16 * uRiver * rfade);
+    if (uDebug == 6) {
+        oColor = vec4(river ? vec3(rs.z, 0.5 + flowV * 0.01) : vec3(0.0), 1.0); // flow mask and direction
+        return;
+    }
+    vec2 riverSlope = rs.xy * (0.7 * uRiver * rfade);
 
     vec3 C = texelFetch(uScene, p, 0).rgb;
     vec3 D = C;
@@ -3192,7 +3196,7 @@ void main() {
                 // Wave facets facing the light are brighter (a stand-in for the water's own ripple lighting).
                 vec2 ws = refractSlope(H.xz, footprintS) + riverSlope;
                 float facet = clamp(dot(ws, normalize(uLightDir.xz + vec2(1e-3))) * 3.2, -0.3, 0.3);
-                facet += clamp(dot(riverSlope, normalize(uLightDir.xz + vec2(1e-3))) * 2.6, -0.3, 0.3);
+                facet += clamp(dot(riverSlope, normalize(uLightDir.xz + vec2(1e-3))) * 3.0, -0.45, 0.45);
                 if (wave) {
                     // Swell faces towards the light are brighter, faces away darker; a thin crest in front of the sun glows
                     // with the water's own scatter colour.
@@ -3263,8 +3267,8 @@ void main() {
         // stream) and where it runs fast. The depth-based contact foam above still marks the shoreline itself.
         float sp = clamp(length(flowV) / 45.0, 0.0, 1.0);
         float shallow = 1.0 - smoothstep(14.0, 110.0, depthY);
-        float rf = smoothstep(0.5, 0.92, rs.z) * (0.12 + 0.88 * shallow) * (0.3 + 0.7 * sp) *
-                   (1.0 - smoothstep(4.0, 14.0, footprintS)) * uFoam * min(uRiver, 1.5) * 0.7;
+        float rf = smoothstep(0.3, 0.8, rs.z) * (0.3 + 0.7 * shallow) * (0.35 + 0.65 * sp) *
+                   (1.0 - smoothstep(4.0, 14.0, footprintS)) * uFoam * min(uRiver, 1.5) * 0.9;
         if (rf > f) {
             f = rf;
             foamCol = foamTint(H);
