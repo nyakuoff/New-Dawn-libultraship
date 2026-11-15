@@ -1038,15 +1038,20 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 #ifndef USE_OPENGLES
     // New Dawn local lights: character-classified draws (the same classifier as the rim/specular) mark stencil 1 so the
     // darkening pass can spare enemies, NPCs, Link and props. Only the HDR game framebuffer is marked.
-    const bool markStencil = HdrWorldActive() && mPostFx && mPostFx->LocalMarking() &&
-                             mPerPixelLightState.characterLight[3] > 0.0f &&
-                             mCurrentShaderProgram->per_pixel_character_location >= 0;
-    if (markStencil != mStencilMarkOn) {
+    const bool markCharacter = HdrWorldActive() && mPostFx && mPostFx->LocalMarking() &&
+                               mPerPixelLightState.characterLight[3] > 0.0f &&
+                               mCurrentShaderProgram->per_pixel_character_location >= 0;
+    // New Dawn emissive surfaces (interior polish) write their own stencil class (4 or 8); the HDR emission pass reads it.
+    const bool markEmissive = mStencilMarkClass != 0 && HdrWorldActive() && mPostFx && mPostFx->LocalMarking();
+    const bool markStencil = markCharacter || markEmissive;
+    const uint8_t markRef = markEmissive ? mStencilMarkClass : 1;
+    if (markStencil != mStencilMarkOn || (markStencil && markRef != mStencilMarkRef)) {
         mStencilMarkOn = markStencil;
         if (markStencil) {
+            mStencilMarkRef = markRef;
             glEnable(GL_STENCIL_TEST);
             glStencilMask(0xFF);
-            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilFunc(GL_ALWAYS, markRef, 0xFF);
             glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         } else {
             glDisable(GL_STENCIL_TEST);

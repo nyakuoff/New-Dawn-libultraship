@@ -22,6 +22,9 @@ uniform float uTime;
 uniform vec2 uProjection, uSize;
 uniform float uNdcXScale, uFlipY;
 uniform int uKind, uBiome;
+uniform int uBeamCount;
+uniform vec4 uBeam0[12], uBeam1[12], uBeam2[12], uBeamL[12];
+out float vBeam;
 out vec2 vUv;
 out vec3 vWorld;
 out float vFade, vViewZ, vNear;
@@ -50,6 +53,31 @@ void main() {
     float nearFade = uBiome == 6 ? smoothstep(30.0, 80.0, distance) : (uKind <= 1 ? smoothstep(150.0, 190.0, distance) : smoothstep(18.0, 55.0, distance));
     vFade = nearFade * (1.0-smoothstep(extent*0.65, extent*0.94, distance));
     if (uKind == 2) vFade *= 0.12+0.88*pow(0.5+0.5*sin(uTime*(0.9+seed.y*1.2)+phase*3.0),2.0);
+    // Interior window beams: every other mote of the interior biome lives in a beam (spawned inside its prism and free to
+    // drift out of it); it is only lit while it is inside. The beam membership matches the interior light pass.
+    vBeam = 0.0;
+    bool inBeam = uBiome == 4 && uBeamCount > 0 && (id & 1u) == 0u;
+    if (inBeam) {
+        int bi = int(hash(id*7u+3u) % uint(uBeamCount));
+        vec3 C = uBeam0[bi].xyz, bn = uBeam1[bi].xyz, U = uBeam2[bi].xyz, L = uBeamL[bi].xyz;
+        vec2 h = vec2(uBeam0[bi].w, uBeam1[bi].w);
+        vec3 V = cross(bn, U);
+        float s0 = pow(seed.z, 1.25) * 560.0;
+        p = C + U*((seed.x*2.0-1.0)*h.x) + V*((seed.y*2.0-1.0)*h.y) + L*s0;
+        // slow hover and turbulence, bigger than the other interior motes so they cross the beam edge now and then
+        p += vec3(sin(uTime*0.21+phase)*9.0+sin(uTime*0.47+phase*2.0)*3.0, sin(uTime*0.16+phase*1.7)*10.0+sin(uTime*0.4+phase)*3.0,
+                  cos(uTime*0.18+phase)*9.0+cos(uTime*0.44+phase*3.0)*3.0);
+        relative = p - uEye;
+        distance = length(relative);
+        // membership of the drifted position in the beam (soft edges, falling off along the beam)
+        vec3 a = p - C;
+        float s = dot(a, bn) / max(dot(L, bn), 0.12);
+        vec3 q = a - L*s;
+        float soft = 6.0 + 0.04*s;
+        vBeam = smoothstep(-soft, soft, h.x - abs(dot(q,U))) * smoothstep(-soft, soft, h.y - abs(dot(q,V))) * exp(-s/520.0);
+        vNear = 1.0 - smoothstep(30.0, 110.0, distance);
+        vFade = smoothstep(25.0, 70.0, distance) * (1.0 - smoothstep(700.0, 1000.0, distance));
+    }
     vec2 corners[6] = vec2[6](vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     vec2 q = corners[gl_VertexID];
     vUv = q*0.5+0.5;
@@ -82,6 +110,8 @@ in vec2 vUv;
 in vec3 vWorld;
 in float vFade, vViewZ, vNear;
 flat in float vSeed;
+in float vBeam;
+uniform vec3 uBeamColor;
 uniform float uTime;
 out vec4 oColor;
 uniform sampler2D uAtmosSprite;
@@ -147,6 +177,7 @@ void main() {
         if (uKind == 1) radiance *= vec3(0.95,1.0,0.65);
         // Underwater particulates are lit by the filtered sun and by the water's own glow, so they stay visible in shade.
         if (uBiome == 6) radiance = (radiance*vec3(0.55,0.9,1.0) + vec3(0.16,0.34,0.4)*bright*twinkle*(1.0-0.5*uNight))*3.0;
+        radiance += uBeamColor*vBeam*bright*twinkle*(uKind <= 1 ? 7.0 : 0.0);
         for (int i=0;i<uLightCount;i++) {
             float distance = length(vWorld-uLights[i].xyz);
             float influence = max(1.0-distance/max(uLights[i].w,1.0),0.0);
@@ -342,6 +373,21 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glUniform1f(Loc("uNight"), p.atmosNight);
     glUniform1f(Loc("uRain"), p.atmosRain);
     glUniform3fv(Loc("uSunColor"), 1, p.atmosSunColor);
+    {
+        float beam0[NEWDAWN_INTERIOR_WINDOWS][4], beam1[NEWDAWN_INTERIOR_WINDOWS][4], beam2[NEWDAWN_INTERIOR_WINDOWS][4],
+            beamL[NEWDAWN_INTERIOR_WINDOWS][4];
+        PackInteriorWindows(p, beam0, beam1, beam2, beamL);
+        // Dust in the window beams (interior biome only; off when the window light is off).
+        const int beams = p.atmosBiome == 4 && p.interiorEnabled && p.interiorMotes > 0.0f ? p.interiorWindowCount : 0;
+        glUniform1i(Loc("uBeamCount"), std::min(beams, (int)NEWDAWN_INTERIOR_WINDOWS));
+        glUniform4fv(Loc("uBeam0[0]"), NEWDAWN_INTERIOR_WINDOWS, &beam0[0][0]);
+        glUniform4fv(Loc("uBeam1[0]"), NEWDAWN_INTERIOR_WINDOWS, &beam1[0][0]);
+        glUniform4fv(Loc("uBeam2[0]"), NEWDAWN_INTERIOR_WINDOWS, &beam2[0][0]);
+        glUniform4fv(Loc("uBeamL[0]"), NEWDAWN_INTERIOR_WINDOWS, &beamL[0][0]);
+        const float s = p.interiorStrength;
+        const float color[3] = { p.interiorColor[0] * s, p.interiorColor[1] * s, p.interiorColor[2] * s };
+        glUniform3fv(Loc("uBeamColor"), 1, color);
+    }
     glUniform1i(Loc("uLightCount"), p.atmosLightCount);
     glUniform4fv(Loc("uLights[0]"), NEWDAWN_ATMOS_LIGHTS, &p.atmosLights[0][0]);
     glUniform3fv(Loc("uLightColors[0]"), NEWDAWN_ATMOS_LIGHTS, &p.atmosLightColors[0][0]);
@@ -364,7 +410,8 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUniform1i(Loc("uKind"), 0);
-    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, p.atmosBiome == 4 ? 1024 : 3000);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6,
+                          p.atmosBiome == 4 ? (p.interiorEnabled && p.interiorWindowCount > 0 ? 2048 : 1024) : 3000);
     if (p.atmosBiome == 2 || p.atmosBiome == 3) {
         if (p.atmosNight < 1.0f) {
             glUniform1i(Loc("uKind"), 1);

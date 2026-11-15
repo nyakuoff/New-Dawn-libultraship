@@ -167,6 +167,9 @@ class GfxRenderingAPI {
     // New Dawn grass: NEWDAWN_GRASS_TRI_FLOATS floats per recorded ground triangle; valid until RunPostFx returns.
     virtual void SetGrassTriangles(const float* data, uint32_t count) {
     }
+    // New Dawn emissive surfaces: stencil class (0 none, 4 night glass, 8 lamps/signs) of the triangles drawn from now on.
+    virtual void SetStencilMark(uint8_t mark) {
+    }
     // True while the renderer will redraw recorded VFX sprites itself (so the native draw may be skipped).
     virtual bool VfxReplacing() const {
         return false;

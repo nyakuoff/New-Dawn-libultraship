@@ -1206,6 +1206,242 @@ void main() {
 }
 )GLSL";
 
+
+// Interior polish: light through window and door openings. Each opening is an oriented rectangle (centre, inward normal,
+// horizontal axis, half extents) recorded from the draw stream; the beam leaves it along a direction set by the time of
+// day. Dual-source blend: result = shaft in-scatter + framebuffer * pool boost, per MSAA sample.
+//  - pool: where the beam meets a surface (depth-reconstructed), lit by a soft-edged, pane-barred projection of the
+//    opening, shadowed by a short screen-space march toward it;
+//  - shaft: the view ray's path through the beam volume, forward-scattered (Henyey-Greenstein) and clamped at the
+//    first surface.
+static const char* kInteriorLightShader = R"GLSL(
+in vec2 vUv;
+layout(location = 0, index = 0) out vec4 oColor;
+layout(location = 0, index = 1) out vec4 oFactor;
+uniform sampler2D uScene;
+uniform mat4 uViewProj;
+uniform vec3 uEye;
+uniform int uCount;
+uniform vec4 uWin0[12]; // centre xyz, half width
+uniform vec4 uWin1[12]; // inward normal xyz, half height
+uniform vec4 uWin2[12]; // horizontal axis xyz, panes (x + 16 y)
+uniform vec4 uWinL[12]; // beam direction xyz (into the room), unused
+uniform vec3 uColor;    // linear light colour including intensity and user strength
+uniform float uPool, uShaft;
+float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float hg(float c) {
+    const float g = 0.5;
+    return 0.25 * (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * c, 1.5);
+}
+// Soft rectangular membership with pane bars; q = (u, v) from the opening centre, soft = penumbra half width.
+float openMask(vec2 q, vec2 h, float soft, float panes) {
+    vec2 a = h - abs(q);
+    float m = smoothstep(-soft, soft, a.x) * smoothstep(-soft, soft, a.y);
+    float nu = mod(panes, 16.0), nv = floor(panes / 16.0);
+    if (nu > 1.5) {
+        float x = (q.x / h.x * 0.5 + 0.5) * nu;
+        float d = abs(x - floor(x + 0.5)) * 2.0 * h.x / nu;
+        m *= (x > 0.5 && x < nu - 0.5) ? smoothstep(1.2, 1.2 + soft, d) : 1.0;
+    }
+    if (nv > 1.5) {
+        float y = (q.y / h.y * 0.5 + 0.5) * nv;
+        float d = abs(y - floor(y + 0.5)) * 2.0 * h.y / nv;
+        m *= (y > 0.5 && y < nv - 0.5) ? smoothstep(1.2, 1.2 + soft, d) : 1.0;
+    }
+    return m;
+}
+// Visibility of the segment from surface point P back to its source point on the opening (screen-space depth march).
+float openVisibility(vec3 P, vec3 S, float jitter) {
+    float hits = 0.0;
+    for (int k = 0; k < 10; ++k) {
+        vec3 sp = P + (S - P) * ((float(k) + jitter) * 0.085 + 0.05);
+        vec4 clip = uViewProj * vec4(sp, 1.0);
+        if (clip.w <= 0.0) continue;
+        vec2 uv = (clip.xy / clip.w / vec2(uNdcXScale, uFlipY)) * 0.5 + 0.5;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) continue;
+        float sceneZ = linDepth(fetchDepth(ivec2(uv * vec2(uSize))));
+        float diff = clip.w - sceneZ;
+        hits += smoothstep(max(2.0, clip.w * 0.01), max(8.0, clip.w * 0.03), diff) * (1.0 - step(160.0, diff));
+    }
+    return 1.0 - min(1.0, hits * 0.3);
+}
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 scene = texelFetch(uScene, p, 0);
+    oColor = vec4(0.0);
+    oFactor = vec4(1.0);
+    float d = fetchDepth(p);
+    bool sky = d >= 0.99999;
+    vec2 uv = (vec2(p) + 0.5) / vec2(uSize);
+    vec3 P = giPosition(uv, sky ? 0.99999 : d);
+    vec3 rd = P - uEye;
+    float rl = length(rd);
+    rd /= max(rl, 1e-3);
+    float tEnd = min(rl, 1600.0);
+    float jitter = ign(gl_FragCoord.xy);
+    vec3 N = sky ? vec3(0.0, 1.0, 0.0) : giNormal(p, P);
+    vec3 pool = vec3(0.0), shaft = vec3(0.0);
+    for (int i = 0; i < uCount; ++i) {
+        vec3 C = uWin0[i].xyz, n = uWin1[i].xyz, U = uWin2[i].xyz, L = uWinL[i].xyz;
+        vec2 h = vec2(uWin0[i].w, uWin1[i].w);
+        vec3 V = cross(n, U);
+        float ln = dot(L, n);
+        if (ln < 0.12) continue;
+        float panes = uWin2[i].w;
+        // ---- pool on the surface
+        if (!sky && uPool > 0.0) {
+            vec3 a = P - C;
+            float s = dot(a, n) / ln;
+            if (s > 0.5 && s < 1400.0) {
+                vec3 S = P - L * s; // where the light leaves the opening
+                vec3 q3 = S - C;
+                vec2 q = vec2(dot(q3, U), dot(q3, V));
+                float soft = 2.5 + 0.035 * s;
+                float m = openMask(q, h, soft, panes);
+                if (m > 0.002) {
+                    float facing = clamp((dot(N, -L) + 0.15) / 1.15, 0.0, 1.0);
+                    float vis = facing > 0.0 ? openVisibility(P, S, jitter) : 0.0;
+                    pool += m * facing * vis * exp(-s / 1100.0);
+                }
+            }
+        }
+        // ---- shaft in the air: the ray against the beam prism in (u, v, s) coordinates
+        if (uShaft > 0.0) {
+            vec3 Lc = cross(V, L), Lv = cross(L, U), Ls = cross(U, V);
+            float det = dot(U, Lc);
+            if (abs(det) > 1e-4) {
+                vec3 a = uEye - C;
+                vec3 o = vec3(dot(Lc, a), dot(Lv, a), dot(Ls, a)) / det;       // u, v, s coordinates of the eye
+                vec3 dv = vec3(dot(Lc, rd), dot(Lv, rd), dot(Ls, rd)) / det;   // and of the ray direction
+                const float smax = 900.0;
+                vec3 lo = vec3(-h.x - 10.0, -h.y - 10.0, 0.0), hi = vec3(h.x + 10.0, h.y + 10.0, smax);
+                vec3 inv = 1.0 / (dv + vec3(1e-6) * sign(dv + vec3(1e-9)));
+                vec3 t0 = (lo - o) * inv, t1 = (hi - o) * inv;
+                vec3 tn = min(t0, t1), tf = max(t0, t1);
+                float tA = max(max(tn.x, tn.y), max(tn.z, 0.0)), tB = min(min(tf.x, tf.y), min(tf.z, tEnd));
+                if (tB > tA) {
+                    float len = tB - tA;
+                    float acc = 0.0;
+                    for (int k = 0; k < 6; ++k) {
+                        float t = tA + len * ((float(k) + jitter) / 6.0);
+                        vec3 c = o + dv * t;
+                        float soft = 4.0 + 0.04 * c.z;
+                        float m = openMask(c.xy, h, soft, panes);
+                        acc += m * exp(-c.z / 520.0) * smoothstep(0.0, 24.0, c.z);
+                    }
+                    shaft += acc * (len / 6.0) * hg(dot(L, -rd));
+                }
+            }
+        }
+    }
+    vec3 c = max(scene.rgb, vec3(0.0));
+    vec3 albedo = sqrt(c) * 0.9 + 0.03;
+    float Y = dot(c, giLuma);
+    float need = 1.0 - 0.65 * smoothstep(0.30, 0.9, Y);
+    vec3 E = uColor * pool * uPool;
+    E = 3.0 * E / (3.0 + E); // bounded per channel so a bright wall never clips
+    oColor = vec4(albedo * E * (2.4 * need) + uColor * shaft * (uShaft * 0.00035), 0.0);
+    oFactor = vec4(1.0 + E * 1.6 * need, 1.0);
+}
+)GLSL";
+
+// Emissive surfaces: draws of classified textures (night-lit glass, lamps and signs) wrote stencil 4 / 8 at the opaque
+// stage. The HDR emission is added there, from the painted colour, so the texture's own pattern survives.
+static const char* kEmissiveShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uScene;
+uniform float uGain;
+uniform vec3 uTint;
+uniform int uClass;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 c = max(texelFetch(uScene, p, 0).rgb, vec3(0.0));
+    float Y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    vec3 e;
+    if (uClass == 4) {
+        // Night glass: a warm interior light seen through the pane; the painted pattern (bars, curtains) modulates it.
+        float pattern = clamp(sqrt(Y) * 3.2, 0.0, 1.0);
+        e = uTint * (0.2 + 1.0 * pattern) * uGain;
+    } else {
+        // Lamps, signs, clock faces: lift the painted colour into HDR, keeping its hue.
+        e = (sqrt(c) * 0.8 + c) * uTint * uGain;
+    }
+    oColor = vec4(e, 0.0);
+}
+)GLSL";
+
+
+// Interior polish: the pane itself for the render-only windows (kind 2). A flat quad on the wall plane, a dark wood frame
+// around a sky-lit pane with mullions, depth-tested against the room so furniture and characters stay in front.
+static const char* kInteriorGlassVertex = R"GLSL(
+uniform mat4 uViewProj;
+uniform float uNdcXScale, uFlipY;
+uniform vec4 uWin0[12], uWin1[12], uWin2[12];
+out vec2 vLocal;
+flat out int vWin;
+void main() {
+    int i = gl_InstanceID;
+    vec3 C = uWin0[i].xyz, n = uWin1[i].xyz, U = uWin2[i].xyz;
+    vec2 h = vec2(uWin0[i].w, uWin1[i].w) + vec2(8.0);
+    vec3 V = cross(n, U);
+    vec2 corners[6] = vec2[6](vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
+    vec2 q = corners[gl_VertexID];
+    vLocal = q * h;
+    vWin = i;
+    vec3 P = C + n * 0.9 + U * (q.x * h.x) + V * (q.y * h.y);
+    gl_Position = uViewProj * vec4(P, 1.0);
+    gl_Position.x /= uNdcXScale;
+    gl_Position.y *= uFlipY;
+}
+)GLSL";
+static const char* kInteriorGlassFragment = R"GLSL(
+in vec2 vLocal;
+flat in int vWin;
+layout(location = 0) out vec4 oColor;
+uniform vec4 uWin0[12], uWin1[12], uWin2[12];
+uniform vec3 uGlass;     // linear radiance of the sky seen through the pane (zero level = night)
+uniform vec3 uFrame;     // linear albedo of the frame under the room's darkness
+float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(h21(i), h21(i + vec2(1, 0)), f.x), mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), f.x), f.y);
+}
+void main() {
+    vec2 h = vec2(uWin0[vWin].w, uWin1[vWin].w);
+    vec2 a = h - abs(vLocal);
+    float panes = uWin2[vWin].w;
+    float nu = mod(panes, 16.0), nv = floor(panes / 16.0);
+    float bar = 0.0;
+    if (nu > 1.5) {
+        float x = (vLocal.x / h.x * 0.5 + 0.5) * nu;
+        bar = max(bar, 1.0 - smoothstep(1.4, 2.4, abs(x - floor(x + 0.5)) * 2.0 * h.x / nu));
+        bar *= (x > 0.5 && x < nu - 0.5) ? 1.0 : 0.0;
+    }
+    if (nv > 1.5) {
+        float y = (vLocal.y / h.y * 0.5 + 0.5) * nv;
+        float b = (1.0 - smoothstep(1.4, 2.4, abs(y - floor(y + 0.5)) * 2.0 * h.y / nv)) * ((y > 0.5 && y < nv - 0.5) ? 1.0 : 0.0);
+        bar = max(bar, b);
+    }
+    float edge = min(a.x, a.y);              // distance inside the opening
+    bool glass = edge > 0.0 && bar < 0.5;
+    if (glass) {
+        // Sky behind frosted glass: horizon glow below, bluer zenith above, soft variation and darker toward the frame.
+        float t = clamp(vLocal.y / h.y * 0.5 + 0.5, 0.0, 1.0);
+        vec3 sky = mix(vec3(1.0, 0.93, 0.80), vec3(0.50, 0.68, 1.0), smoothstep(0.0, 1.0, t));
+        float frost = vnoise(vLocal * 0.22) * 0.65 + vnoise(vLocal * 0.9 + 7.0) * 0.35;
+        sky *= (0.78 + 0.34 * frost) * mix(0.62, 1.0, smoothstep(0.0, 16.0, edge));
+        oColor = vec4(uGlass * sky, 1.0);
+    } else {
+        // Frame and mullions: warm painted wood with grain along the bar, and a lit inner lip.
+        float grain = vnoise(vec2(vLocal.x * 0.05, vLocal.y * 0.9)) * 0.5 + vnoise(vec2(vLocal.x * 0.9, vLocal.y * 0.05)) * 0.5;
+        float lip = smoothstep(2.5, 0.0, abs(edge)) * 0.5;
+        oColor = vec4(uFrame * (0.55 + 0.9 * grain) * (0.8 + 0.6 * lip) + uGlass * 0.03 * lip, 1.0);
+    }
+}
+)GLSL";
+
 static const char* kAoShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
@@ -3993,6 +4229,16 @@ bool PostFxGL::BuildPrograms() {
     // Local lights reuse the colour (8) and depth (9) lanes bound to dummies above; the shadow cubes use their own.
     const char* localLight[] = { kVersion, kDepthLib, kGiGeometryLib, kLocalLightShader };
     mLocalLight.id = BuildProgram("local lights", localLight, 4, mLocalLight.uniforms);
+    // Interior polish reuses the same colour (8) and depth (9) lanes.
+    const char* interiorLight[] = { kVersion, kDepthLib, kGiGeometryLib, kInteriorLightShader };
+    mInteriorLight.id = BuildProgram("interior window light", interiorLight, 4, mInteriorLight.uniforms);
+    const char* emissive[] = { kVersion, kEmissiveShader };
+    mEmissive.id = BuildProgram("emissive surfaces", emissive, 2, mEmissive.uniforms);
+    {
+        const char* vs[] = { kVersion, kInteriorGlassVertex };
+        const char* fs[] = { kVersion, kInteriorGlassFragment };
+        mInteriorGlass.id = BuildProgramWithVertex("interior window glass", vs, 2, fs, 2, mInteriorGlass.uniforms);
+    }
     const char* ao[] = { kVersion, kDepthLib, kAoShader };
     const char* blur[] = { kVersion, kDepthLib, kBlurLib, kBlurShader };
     const char* apply[] = { kVersion, kDepthLib, kBlurLib, kApplyShader };
@@ -4243,7 +4489,8 @@ static const char* const kStageNames[NEWDAWN_PERF_STAGES] = {
     "opaque end / AO", "scene end / bloom+grade", "shadows", "sun shafts", "water", "water opaque copy",
     "physical sky", "volumetric clouds", "sky ambient cube", "volumetric fog", "textured sun flare",
     "ambient particles", "wet surfaces and rain shelter", "rain and snow", "screen-space GI", "VFX sprites",
-    "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "point-light shadows" };
+    "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "point-light shadows",
+    "interior window light", "emissive surfaces" };
 static float sStageMs[NEWDAWN_PERF_STAGES] = {};
 float gNewDawnGpuFrameMs = 0.0f; // written by GfxRenderingAPIOGL
 
@@ -4385,7 +4632,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     // Only swap colour; game depth, stencil, coverage and query scheduling stay intact.
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (CvInt("gNewDawn.Lighting.Local", 0) || CvInt("gNewDawn.TAA.Enabled", 0)) {
+    if (CvInt("gNewDawn.Lighting.Local", 0) || CvInt("gNewDawn.TAA.Enabled", 0) || CvInt("gNewDawn.Interior.Emissive", 0)) {
         // Fresh actor mask for this frame (TAA reads it too, and the grass pass marks its tufts in it); the game never
         // uses stencil.
         glStencilMask(0xFF);
@@ -5162,6 +5409,14 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                        params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
     const bool doLocal = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.localEnabled && mLocalLight.id &&
                          params.shadowUseExactProj && s.debugView == 0 && s.shadowDebug == 0;
+    const bool doInterior = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.interiorEnabled &&
+                            params.interiorWindowCount > 0 && mInteriorLight.id && params.shadowUseExactProj &&
+                            s.debugView == 0 && s.shadowDebug == 0;
+    const bool doProbe = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.interiorEnabled &&
+                         params.shadowUseExactProj && CvInt("gNewDawn.Interior.Probe", 0) != 0;
+    const bool doEmissive = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && mHdrActive && params.emissiveEnabled && (params.flags & 1u) &&
+                            mLocalMarking && mEmissive.id && params.shadowUseExactProj && s.debugView == 0 &&
+                            s.shadowDebug == 0;
     if (stage == NEWDAWN_POSTFX_STAGE_GROUND_END) {
         // Ground-only colour for the grass: room geometry is in, actors (Link, NPCs, props) are not, so tufts rooted behind
         // an actor never take its colours.
@@ -5220,8 +5475,11 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         EndTimer(kGrassTimerStage);
     }
     if (doShadow || doAo || doWater || doFog || doAtmos || doWeather || doGi || doVfx || doLocal || doCaustics ||
-        doUnderwater) {
+        doUnderwater || doInterior || doProbe) {
         PrepareDepth(fb);
+    }
+    if (doProbe) {
+        ProbeInterior(params, fb);
     }
     if (doUnderwater) {
         BeginTimer(kUnderwaterTimerStage);
@@ -5278,6 +5536,16 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
         BeginTimer(kLocalTimerStage);
         RunLocalLights(params, fb, frameIndex);
         EndTimer(kLocalTimerStage);
+    }
+    if (doInterior) {
+        BeginTimer(kInteriorTimerStage);
+        RunInteriorLight(params, fb);
+        EndTimer(kInteriorTimerStage);
+    }
+    if (doEmissive) {
+        BeginTimer(kEmissiveTimerStage);
+        RunEmissive(params, fb);
+        EndTimer(kEmissiveTimerStage);
     }
     if (doCaustics) {
         BeginTimer(kCausticsTimerStage);
@@ -6724,6 +6992,16 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
             add(fl.f + 12, 150.0f, col, 1.0f);
         }
     }
+    // Emissive fixtures (lamps, signs, lit windows) the interpreter recorded: a matching light each. Negative intensity
+    // marks night-only glass.
+    for (int i = 0; i < params.emissiveLightCount && i < NEWDAWN_EMISSIVE_LIGHTS; ++i) {
+        const float* l = params.emissiveLights[i];
+        const float intensity = l[7] < 0.0f ? -l[7] * params.emissiveNight : l[7] * (0.35f + 0.65f * params.emissiveNight);
+        if (!params.emissiveEnabled || intensity < 0.02f)
+            continue;
+        const float col[3] = { l[4], l[5], l[6] };
+        add(l, l[3], col, intensity * params.emissiveStrength);
+    }
     for (auto it = smoothed.begin(); it != smoothed.end();)
         it = (now - it->second[4] > 2.0) ? smoothed.erase(it) : std::next(it);
 }
@@ -6789,7 +7067,7 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
     glEnable(GL_STENCIL_TEST);
     glStencilMask(0);
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-    glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+    glStencilFunc(GL_EQUAL, 0, 0x0D); // not a character (1), not emissive glass (4) or a lamp or sign (8)
     glUniform1f(Loc("uDarken"), darken);
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
@@ -6816,6 +7094,203 @@ void PostFxGL::RunLocalLights(const NewDawnPostFxParams& params, const Framebuff
         }
     }
     CheckError("local lights");
+}
+
+// Shader-ready opening data: centre + half width, inward normal + half height, horizontal axis + pane counts, beam direction.
+void PackInteriorWindows(const NewDawnPostFxParams& params, float (*win0)[4], float (*win1)[4], float (*win2)[4],
+                         float (*beam)[4]) {
+    const int count = std::min<int>(params.interiorWindowCount, NEWDAWN_INTERIOR_WINDOWS);
+    for (int i = 0; i < NEWDAWN_INTERIOR_WINDOWS; ++i)
+        win0[i][0] = win0[i][1] = win0[i][2] = win0[i][3] = win1[i][0] = win1[i][1] = win1[i][2] = win1[i][3] =
+            win2[i][0] = win2[i][1] = win2[i][2] = win2[i][3] = beam[i][0] = beam[i][1] = beam[i][2] = beam[i][3] = 0.0f;
+    const float sinE = std::clamp(params.interiorSinElevation, 0.1f, 1.0f);
+    const float cosE = std::sqrt(1.0f - sinE * sinE);
+    for (int i = 0; i < count; ++i) {
+        const float* w = params.interiorWindows[i];
+        for (int a = 0; a < 3; ++a) {
+            win0[i][a] = w[a];
+            win1[i][a] = w[3 + a];
+            win2[i][a] = w[6 + a];
+        }
+        win0[i][3] = w[9];
+        win1[i][3] = w[10];
+        win2[i][3] = w[11] + 16.0f * w[12];
+        // The beam keeps the opening's horizontal heading and takes the sun's elevation; a skylight (normal pointing
+        // down) just drops straight in.
+        const float hx = w[3], hz = w[5];
+        const float hl = std::sqrt(hx * hx + hz * hz);
+        float L[3];
+        if (hl < 0.3f) {
+            L[0] = w[3] * 0.2f, L[1] = -1.0f, L[2] = w[5] * 0.2f;
+        } else {
+            L[0] = hx / hl * cosE, L[1] = -sinE, L[2] = hz / hl * cosE;
+        }
+        const float ll = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+        for (int a = 0; a < 3; ++a)
+            beam[i][a] = L[a] / ll;
+    }
+}
+
+// Developer aid for placing the per-scene window table: logs the world position under a 9 x 5 grid of screen points.
+void PostFxGL::ProbeInterior(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    static uint32_t frame = 0;
+    if (frame++ % 150 != 5)
+        return;
+    const int w = fb.width, h = fb.height;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, mDepth.fbo);
+    for (int gy = 0; gy < 5; ++gy) {
+        std::string row;
+        for (int gx = 0; gx < 9; ++gx) {
+            const int px = (gx * 2 + 1) * w / 18, py = (gy * 2 + 1) * h / 10;
+            float depth = 1.0f;
+            glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+            const float uvx = (px + 0.5f) / w, uvy = (py + 0.5f) / h;
+            const float in[4] = { (uvx * 2 - 1) * params.shadowNdcXScale, (uvy * 2 - 1) * params.shadowFlipY, depth * 2 - 1, 1.0f };
+            float out[4] = {};
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j)
+                    out[i] += params.shadowInvViewProj[j * 4 + i] * in[j];
+            char buf[64];
+            snprintf(buf, sizeof(buf), " (%.0f,%.0f,%.0f)", out[0] / out[3], out[1] / out[3], out[2] / out[3]);
+            row += buf;
+        }
+        SPDLOG_INFO("INTPROBE row {} (screen top first, y flipped {}){}", gy, params.shadowFlipY, row);
+    }
+}
+
+void PostFxGL::RunInteriorLight(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    constexpr int kMax = NEWDAWN_INTERIOR_WINDOWS;
+    const int count = std::min<int>(params.interiorWindowCount, kMax);
+    if (count <= 0 || !mUsable)
+        return;
+    float win0[kMax][4], win1[kMax][4], win2[kMax][4], beam[kMax][4];
+    PackInteriorWindows(params, win0, win1, win2, beam);
+    const int w = fb.width, h = fb.height;
+    EnsureTarget(mLocalSource, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mLocalSource.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mLocalSource.tex);
+    Bind(1, mDepth.tex);
+    Use(mInteriorLight);
+    glUniform2i(Loc("uSize"), w, h);
+    glUniform1f(Loc("uNear"), params.zNear);
+    glUniform1f(Loc("uFar"), params.zFar);
+    glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+    glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+    glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+    glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+    glUniform3fv(Loc("uEye"), 1, params.giCameraEye);
+    glUniform1i(Loc("uCount"), count);
+    glUniform4fv(Loc("uWin0"), kMax, &win0[0][0]);
+    glUniform4fv(Loc("uWin1"), kMax, &win1[0][0]);
+    glUniform4fv(Loc("uWin2"), kMax, &win2[0][0]);
+    glUniform4fv(Loc("uWinL"), kMax, &beam[0][0]);
+    const float strength = params.interiorStrength;
+    const float rgb[3] = { params.interiorColor[0] * strength, params.interiorColor[1] * strength,
+                           params.interiorColor[2] * strength };
+    glUniform3fv(Loc("uColor"), 1, rgb);
+    glUniform1f(Loc("uPool"), static_cast<float>(CvInt("gNewDawn.Interior.Pools", 1)));
+    glUniform1f(Loc("uShaft"), static_cast<float>(CvInt("gNewDawn.Interior.Shafts", 1)));
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_SRC1_COLOR);
+    glBlendEquation(GL_FUNC_ADD);
+    Draw(fb.fbo, w, h);
+    glDisable(GL_BLEND);
+    CheckError("interior window light");
+
+    // The panes of the render-only windows (kind 2), after the light so they are not lit twice.
+    if (mInteriorGlass.id && CvInt("gNewDawn.Interior.Panes", 1)) {
+        bool any = false;
+        for (int i = 0; i < count; ++i)
+            any |= params.interiorWindows[i][13] == 2.0f;
+        if (any) {
+            Use(mInteriorGlass);
+            glUniformMatrix4fv(Loc("uViewProj"), 1, GL_FALSE, params.shadowViewProj);
+            glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+            glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+            // Only the virtual windows are drawn: pack them to the front.
+            float v0[kMax][4] = {}, v1[kMax][4] = {}, v2[kMax][4] = {};
+            int drawn = 0;
+            for (int i = 0; i < count; ++i) {
+                if (params.interiorWindows[i][13] != 2.0f)
+                    continue;
+                memcpy(v0[drawn], win0[i], sizeof(v0[drawn]));
+                memcpy(v1[drawn], win1[i], sizeof(v1[drawn]));
+                memcpy(v2[drawn], win2[i], sizeof(v2[drawn]));
+                ++drawn;
+            }
+            glUniform4fv(Loc("uWin0"), kMax, &v0[0][0]);
+            glUniform4fv(Loc("uWin1"), kMax, &v1[0][0]);
+            glUniform4fv(Loc("uWin2"), kMax, &v2[0][0]);
+            // Sky brightness behind the glass: the light colour scaled up (a window is far brighter than the room it lights).
+            const float sky = 2.4f;
+            const float night[3] = { 0.010f, 0.016f, 0.034f };
+            const float glass[3] = { night[0] + params.interiorColor[0] * sky, night[1] + params.interiorColor[1] * sky,
+                                     night[2] + params.interiorColor[2] * sky };
+            glUniform3fv(Loc("uGlass"), 1, glass);
+            const float frame[3] = { 0.075f, 0.043f, 0.020f };
+            glUniform3fv(Loc("uFrame"), 1, frame);
+            glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+            glViewport(0, 0, w, h);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_FALSE);
+            glDisable(GL_CULL_FACE);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, drawn);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_DEPTH_TEST);
+            CheckError("interior window glass");
+        }
+    }
+}
+
+void PostFxGL::RunEmissive(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    if (!mUsable)
+        return;
+    const int w = fb.width, h = fb.height;
+    EnsureTarget(mLocalSource, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mLocalSource.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    Bind(0, mLocalSource.tex);
+    Use(mEmissive);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glBlendEquation(GL_FUNC_ADD);
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    const float night = std::clamp(params.emissiveNight, 0.0f, 1.0f);
+    const float strength = params.emissiveStrength;
+    // Night glass (stencil 4): a warm interior light behind the pane, only after dusk.
+    if (night > 0.01f) {
+        const float tint[3] = { 1.0f, 0.62f, 0.28f };
+        glUniform3fv(Loc("uTint"), 1, tint);
+        glUniform1f(Loc("uGain"), 1.1f * night * strength);
+        glUniform1i(Loc("uClass"), 4);
+        glStencilFunc(GL_EQUAL, 4, 0xFF);
+        Draw(fb.fbo, w, h);
+    }
+    // Lamps and signs (stencil 8): always lit, brighter at night.
+    {
+        const float tint[3] = { 1.0f, 0.92f, 0.78f };
+        glUniform3fv(Loc("uTint"), 1, tint);
+        glUniform1f(Loc("uGain"), (0.55f + 1.1f * night) * strength);
+        glUniform1i(Loc("uClass"), 8);
+        glStencilFunc(GL_EQUAL, 8, 0xFF);
+        Draw(fb.fbo, w, h);
+    }
+    glStencilMask(0xFF);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    CheckError("emissive");
 }
 
 // Point-light shadows. Picks the one or two lights that matter most around the player (bright, close, not a moving
