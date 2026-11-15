@@ -2312,6 +2312,8 @@ uniform vec3 uLightColor;
 uniform vec3 uSky;
 uniform bool uSkyReflectionsEnabled;
 uniform samplerCube uSkySpecular;
+uniform sampler2D uWaveBuf; // displaced surface from the wave trace pass (height, slope, 1 + foam); dummy when off
+uniform int uWaves;
 #ifdef WATER_REFLECTIONS
 uniform mat4 uViewProj;
 uniform sampler2D uOpaqueColor;
@@ -2497,6 +2499,14 @@ void main() {
         return;
     }
 
+    // Ocean swell: the hit is on the displaced surface, and its large-scale slope tilts every normal below.
+    vec4 wv = uWaves != 0 ? texelFetch(uWaveBuf, p, 0) : vec4(0.0);
+    bool wave = wv.a > 0.5;
+    vec2 big = wave ? wv.gb : vec2(0.0);
+    float surfY = uBoxY[bi] + (wave ? wv.r : 0.0);
+    if (wave) {
+        bestT = (surfY - uEye.y) / ray.y;
+    }
     vec3 H = uEye + ray * bestT;
     float dist = bestT * length(ray);
     vec3 V = normalize(uEye - H);
@@ -2505,13 +2515,14 @@ void main() {
     float depthY = sky ? 1.0e4 : (abs(P.y - uBoxY[bi]) < 1.5 ? 1.0e4 : max(uBoxY[bi] - P.y, 0.0));
     float shore = smoothstep(2.0, 40.0, depthY);
 
-    vec2 slope = waterSlope(H.xz, footprint);
+    float footprintS = footprint / max(V.y, 0.06); // see the surface shader: pixel footprint along the view direction
+    vec2 slope = waterSlope(H.xz, footprintS) + big;
     vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
     float ndv = max(dot(N, V), 1e-3);
     float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
     vec3 refl = uSky * fres;
     if (uSkyReflectionsEnabled) {
-        vec3 R = reflect(-V, normalize(vec3(-slope.x * 0.25, 1.0, -slope.y * 0.25)));
+        vec3 R = reflect(-V, normalize(vec3(-(slope.x - big.x) * 0.25 - big.x, 1.0, -(slope.y - big.y) * 0.25 - big.y)));
         refl = textureLod(uSkySpecular, R, 0.4 + clamp(footprint * 0.02, 0.0, 1.1)).rgb * fres;
     }
 
@@ -2531,14 +2542,14 @@ void main() {
     vec3 add = (refl * 0.6 + uLightColor * spec) * uStrength * shore;
 #ifdef WATER_REFLECTIONS
     // A filtered, gently distorted reflection normal; retain the original glint slope separately.
-    vec2 reflSlope = reflectionSlope(H.xz, footprint);
+    vec2 reflSlope = reflectionSlope(H.xz, footprintS) + big;
     vec3 reflectionNormal = normalize(vec3(-reflSlope.x, 1.0, -reflSlope.y));
     int hitStatus;
     float hitDist;
     // Wave steepness roughens the reflection further.
     float roughness = 0.012 + 0.12 * length(reflSlope);
     // Use the exact plane even when a water mesh's own depth was accepted within the mask's 1.5-unit tolerance.
-    vec3 reflectionH = uEye + ray * ((uBoxY[bi] - uEye.y) / ray.y);
+    vec3 reflectionH = uEye + ray * ((surfY - uEye.y) / ray.y);
     vec4 hit = traceReflection(reflectionH + vec3(0.0, 2.0, 0.0), reflect(-V, reflectionNormal), uBoxY[bi], roughness,
                                hitStatus, hitDist);
     if (uDebug == 2) {
@@ -2603,6 +2614,11 @@ uniform vec3 uFogColor;
 uniform vec3 uLightDir;
 uniform vec3 uLightColor;
 uniform vec3 uSky;
+uniform sampler2D uWaveBuf; // displaced surface from the wave trace pass (height, slope, 1 + foam); dummy when off
+uniform int uWaves;
+uniform float uWaveAmp;
+uniform float uSwash;       // ocean shoreline swash strength, 0 = off
+uniform int uDebug;         // 3: displaced height (red above / blue below the plane, grey = no wave), 4: slope
 
 float hash1(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
@@ -2622,7 +2638,8 @@ vec2 refractSlope(vec2 x, float footprint) {
     const float wl[6] = float[6](70.0, 43.0, 27.0, 17.0, 7.5, 3.4);
     const float amp[6] = float[6](0.07, 0.06, 0.05, 0.04, 0.025, 0.018);
     const float spd[6] = float[6](0.8, 1.0, 1.3, 1.7, 2.1, 2.7);
-    float warp = 2.5 * vnoise(x / 60.0);
+    // A second, slower warp keeps the six directions from lining up into a regular lattice.
+    float warp = 2.5 * vnoise(x / 60.0) + 6.0 * vnoise(x / 190.0 + 3.1);
     vec2 s = vec2(0.0);
     for (int i = 0; i < 6; i++) {
         float k = 6.2831853 / wl[i];
@@ -2637,33 +2654,123 @@ vec2 projectUv(vec3 w) {
     return vec2(c.x / (c.w * uNdcXScale), c.y / c.w * uFlipY) * 0.5 + 0.5;
 }
 
+// Foam colour: sky and sunlight, then the scene fog at the foam's depth.
+vec3 foamTint(vec3 H) {
+    vec3 col = min(0.9 * (uSky * 0.85 + uLightColor * (0.25 + 0.75 * max(uLightDir.y, 0.0))), vec3(2.0));
+    vec4 cf = uViewProj * vec4(H, 1.0);
+    float fogF = clamp(clamp((cf.z / cf.w), -1.0, 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
+    return mix(col, uFogColor, fogF);
+}
+
+// Shoreline swash (ocean): the wash climbing the opaque ground beside a plane. Distance to the waterline along the ground is
+// the height above the plane over the local slope (from the world-space normal), so a near-flat beach gets a wide band and a
+// steep bank a narrow one, and level decks (slope 0) or walls get none. A front runs up the slope and drains back (fast
+// uprush, slow backwash, staggered along the shore by noise); ground it has reached stays damp, and the front carries a lacy
+// foam rim with a thin foam sheet behind it.
+const float SWASH_REACH = 48.0;
+void swashOverlay(ivec2 p, float d, vec3 P, float lvl, float gslope) {
+    int best = -1;
+    float bestDy = 1.0e9;
+    for (int i = 0; i < uBoxCount; i++) {
+        float dy = P.y - uBoxY[i];
+        if (dy < 0.0 || dy > 14.0 || dy >= bestDy || uEye.y <= uBoxY[i]) {
+            continue;
+        }
+        if (P.x < uBoxRect[i].x || P.x > uBoxRect[i].z || P.z < uBoxRect[i].y || P.z > uBoxRect[i].w) {
+            continue;
+        }
+        best = i;
+        bestDy = dy;
+    }
+    if (best < 0) {
+        return;
+    }
+    float vd = texelFetch(uVisibleDepth, p, 0).r;
+    if (vd < d - 1.0e-6 || lvl <= 0.0) {
+        return; // an actor or effect is drawn in front of the ground, or this is a wall (cliff, pier post), not a beach
+    }
+    float dist = bestDy / clamp(gslope, 0.02, 0.6); // ground distance to the waterline, world units
+    if (uDebug == 5) {
+        // distance to the waterline: red < 10, green < 25, blue < 48, white < 77 (dim: flatness)
+        oColor = vec4((dist < 10.0 ? vec3(1.0, 0.0, 0.0) : (dist < 25.0 ? vec3(0.0, 1.0, 0.0) : (dist < 48.0 ? vec3(0.0, 0.0, 1.0) : vec3(0.8)))) * (0.4 + 0.6 * lvl), 1.0);
+        return;
+    }
+    if (dist > SWASH_REACH * 1.6 || gslope < 0.015) {
+        return; // too far from the water, or perfectly level (a deck or float, not a beach)
+    }
+    float fp = length(P - uEye) * uPixelAngle;
+    float edgeW = max(2.0, 2.2 * fp / max(abs(normalize(P - uEye).y), 0.15));
+    float nA = vnoise(P.xz / 160.0);
+    float nB = vnoise(P.xz / 38.0 + vec2(uTime * 0.05, 0.0));
+    float nC = vnoise(P.xz / 7.0 - vec2(0.0, uTime * 0.15));
+    float cyc = fract(uTime * 0.115 + nA * 1.7);
+    float front = SWASH_REACH * smoothstep(0.0, 0.3, cyc) * (1.0 - smoothstep(0.3, 1.0, cyc)) * (0.55 + 0.45 * nB);
+    float damp = SWASH_REACH * (0.22 + 0.2 * nA);
+    float wetLine = max(front, damp);
+    float wet = 1.0 - smoothstep(wetLine - edgeW, wetLine + edgeW * 0.5, dist);
+    float swashOn = smoothstep(4.0, 12.0, front);
+    float rim = exp(-pow((dist - front) / (edgeW * 1.4), 2.0)) * swashOn;
+    float sheet = (1.0 - smoothstep(0.0, max(front, 1.0), dist)) * swashOn;
+    float lace = smoothstep(0.32, 0.68, 0.6 * nB + 0.4 * nC);
+    float foam = clamp(rim * (0.55 + 0.45 * lace) + sheet * 0.3 * lace, 0.0, 1.0) * uSwash * lvl;
+    float dark = wet * 0.4 * uSwash * lvl;
+    float a = 1.0 - (1.0 - dark) * (1.0 - foam);
+    oColor = vec4(foamTint(P) * foam, a);
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     oColor = vec4(0.0);
     float d = fetchDepth(p); // opaque depth
     bool sky = d >= 0.99999;
     vec3 P = worldPos(p, sky ? 0.9999 : d);
+    // How level the ground is (1 beach / flat, 0 wall), from the world-space surface normal.
+    vec3 Ng = normalize(cross(dFdx(P), dFdy(P)));
+    float lvl = smoothstep(0.45, 0.8, abs(Ng.y));
+    float gny = max(abs(Ng.y), 0.2);
+    float gslope = sqrt(max(1.0 - gny * gny, 0.0)) / gny;
     vec3 ray = P - uEye;
     float bestT;
     int bi = waterPlane(P, sky, bestT);
     if (bi < 0) {
+        if (uSwash > 0.0 && !sky) {
+            swashOverlay(p, d, P, lvl, gslope);
+        }
         return;
     }
     // Opaque depth supplies the bed; scene-end depth still protects foreground XLU that writes depth.
     float planeY = uBoxY[bi];
     if (!sky && P.y >= planeY) {
+        if (uSwash > 0.0) {
+            swashOverlay(p, d, P, lvl, gslope); // ground just above the plane (a near-flat beach is within the depth tolerance)
+        }
         return;
     }
     float visibleDepth = texelFetch(uVisibleDepth, p, 0).r;
     if (visibleDepth < d && worldPos(p, visibleDepth).y > planeY + 1.5) {
         return;
     }
-    bestT = (planeY - uEye.y) / ray.y;
+    // Ocean swell: the surface point is the traced displaced hit, not the plane. Thickness, path length and foam follow it.
+    vec4 wv = uWaves != 0 ? texelFetch(uWaveBuf, p, 0) : vec4(0.0);
+    bool wave = wv.a > 0.5;
+    if (uDebug == 3 || uDebug == 4) {
+        float hh = wv.r / max(uWaveAmp, 1.0);
+        oColor = !wave ? vec4(0.2, 0.2, 0.2, 1.0) :
+                 (uDebug == 3 ? vec4(max(hh, 0.0) * 1.6, 0.25, max(-hh, 0.0) * 3.2, 1.0) : vec4(0.5 + wv.g * 3.0, 0.5 + wv.b * 3.0, wv.a - 1.0, 1.0));
+        return;
+    }
+    vec2 big = wave ? wv.gb : vec2(0.0);
+    float surfY = planeY + (wave ? wv.r : 0.0);
+    bestT = (surfY - uEye.y) / ray.y;
     vec3 H = uEye + ray * bestT;
     float dist = bestT * length(ray);
     vec3 V = normalize(uEye - H);
     float footprint = dist * uPixelAngle;
-    float depthY = sky ? 1.0e4 : max(planeY - P.y, 0.0);
+    // A pixel covers footprint / sin(elevation) along the view direction: patterns that are fine in that direction have to
+    // fade out, or a tiled or sinusoidal pattern collapses into horizontal streaks on the open sea.
+    float footprintS = footprint / max(V.y, 0.06);
+    float graze = smoothstep(0.15, 0.5, V.y);
+    float depthY = sky ? 1.0e4 : max(surfY - P.y, 0.0);
 
     vec3 C = texelFetch(uScene, p, 0).rgb;
     vec3 D = C;
@@ -2673,7 +2780,7 @@ void main() {
         vec3 Bp = texelFetch(uOpaqueColor, p, 0).rgb;
         vec3 B = Bp; // the bed as seen through the (wobbling) surface
         if (!sky && uRefr > 0.0) {
-            vec2 slope = refractSlope(H.xz, footprint) * 1.6;
+            vec2 slope = refractSlope(H.xz, footprintS) * 1.6 + big;
             vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
             vec3 Rw = refract(-V, N, 1.0 / 1.33);
             vec3 Rf = refract(-V, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
@@ -2724,8 +2831,18 @@ void main() {
             vec3 R = B * T + body * (1.0 - T);
             if (!sky) {
                 // Wave facets facing the light are brighter (a stand-in for the water's own ripple lighting).
-                vec2 ws = refractSlope(H.xz, footprint);
-                R *= 1.0 + clamp(dot(ws, normalize(uLightDir.xz + vec2(1e-3))) * 3.2, -0.3, 0.3);
+                vec2 ws = refractSlope(H.xz, footprintS);
+                float facet = clamp(dot(ws, normalize(uLightDir.xz + vec2(1e-3))) * 3.2, -0.3, 0.3);
+                if (wave) {
+                    // Swell faces towards the light are brighter, faces away darker; a thin crest in front of the sun glows
+                    // with the water's own scatter colour.
+                    vec3 Nw = normalize(vec3(-big.x, 1.0, -big.y));
+                    facet += clamp((dot(Nw, uLightDir) - uLightDir.y) * 3.0, -0.6, 0.6) +
+                             clamp(wv.r / max(uWaveAmp, 1.0), -0.5, 1.0) * 0.2;
+                    float crestN = clamp(wv.r / max(uWaveAmp * 0.617, 1.0), 0.0, 1.0);
+                    R += uScatter * uLightColor * (1.3 * crestN * crestN * (0.3 + 0.7 * sss));
+                }
+                R *= 1.0 + facet;
             }
             // Keep the game's animated texture as detail: its high-pass luminance (ripples, caustic lines, splashes).
             float lc = dot(C, vec3(0.2126, 0.7152, 0.0722));
@@ -2743,8 +2860,9 @@ void main() {
             float la = dot(average, vec3(0.2126, 0.7152, 0.0722));
             float hp = lc - la;
             float fade = 1.0 - smoothstep(4.0, 12.0, footprint);
-            // Preserve bright, chromatic fine XLU details (splashes/particles) as well as the painted ripple pattern.
-            R = R * (1.0 + clamp(hp / max(la, 0.05) * 1.5, -0.35, 0.35) * fade) + max(C - average * 1.3, vec3(0.0)) * fade;
+            // Preserve bright, chromatic fine XLU details (splashes/particles). The painted ripple texture is only kept
+            // where it is not stretched (looking down); at a low angle it is the source of the horizontal streaks.
+            R = R * (1.0 + clamp(hp / max(la, 0.05) * 1.5, -0.35, 0.35) * fade * graze) + max(C - average * 1.3, vec3(0.0)) * fade;
             // Fog the entire replacement, after wave/detail modulation, including the transmitted bed.
             R = mix(R, uFogColor, fogH);
             D = mix(D + (B - Bp) * 0.6, R, uRestyle);
@@ -2778,10 +2896,22 @@ void main() {
         float foam = clamp(contact * (0.25 + 0.75 * lace) + wash * lace * 0.75, 0.0, 1.0);
         foam *= 1.0 - smoothstep(3.0, 9.0, footprint);
         f = foam * uFoam * 0.65;
-        foamCol = min(0.9 * (uSky * 0.85 + uLightColor * (0.25 + 0.75 * max(uLightDir.y, 0.0))), vec3(2.0));
-        vec4 cf = uViewProj * vec4(H, 1.0);
-        float fogF = clamp(clamp((cf.z / cf.w), -1.0, 1.0) * uFogMul + uFogOff, 0.0, 255.0) / 255.0;
-        foamCol = mix(foamCol, uFogColor, fogF);
+        foamCol = foamTint(H);
+    }
+    if (wave && uFoam > 0.0) {
+        // Crest whitecaps and the wake foam of the ripple field (both are in the trace pass's alpha). Foam is only opaque where
+        // two fine noises agree, so it reads as thin, broken streaks and lace, never as a solid sheet.
+        float cf = clamp(wv.a - 1.0, 0.0, 1.0);
+        if (cf > 0.0) {
+            float n1 = vnoise(H.xz / 2.6 + vec2(0.3, -0.2) * uTime);
+            float n2 = vnoise(H.xz / 7.5 - vec2(0.15, 0.1) * uTime + 4.0);
+            float broken = smoothstep(0.3, 0.85, cf * (0.3 + 1.0 * (0.6 * n1 + 0.4 * n2)));
+            float fw = broken * (1.0 - smoothstep(5.0, 16.0, footprintS)) * uFoam * 0.65;
+            if (fw > f) {
+                f = fw;
+                foamCol = foamTint(H);
+            }
+        }
     }
     f *= uSurfaceVisibility;
     D = mix(C, D, uSurfaceVisibility);
@@ -2837,6 +2967,290 @@ void main() {
         }
     }
     oColor = color / max(weight, 1e-6);
+}
+)GLSL";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Water simulation (docs/WATER_SIM.md). Render only: the WaterBox plane is the mean sea level and stays the game's
+// authority; swimming, buoyancy and collision never see the displaced surface.
+//  1. Depth map: eighth-resolution blurred water depth (plane minus the opaque bed; land counts as zero). It tapers the
+//     swell so waves die away over shallows, beaches, piers and rocks without a hard edge.
+//  2. Wave trace: per water pixel, a ray march of a height field (three sharpened-sine, trochoid-like swells travelling
+//     with the shared wind, plus the GPU ripple height field) between plane +/- the amplitude bound. It stores the real
+//     displaced hit as (height above plane, slope x, slope z, 1 + foam) so the surface, glint and SSR passes shade the
+//     displaced surface with a consistent normal. A = 0 means "no wave": those passes keep the flat-plane behaviour.
+//  3. Ripples: a wave equation (height + velocity + foam) on a 256^2 window around the player, fed by read-only sources.
+// ---------------------------------------------------------------------------------------------------------------------
+static const char* kWaterDepthMapShader = R"GLSL(
+out vec4 oColor;
+void main() {
+    ivec2 q = ivec2(gl_FragCoord.xy) * 8;
+    float sum = 0.0;
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            ivec2 p = min(q + ivec2(i, j) * 2 + 1, uSize - 1); // 16 taps spread over the 8x8 block
+            float d = fetchDepth(p);
+            bool sky = d >= 0.99999;
+            vec3 P = worldPos(p, sky ? 0.9999 : d);
+            float t;
+            int bi = waterPlane(P, sky, t);
+            if (bi >= 0) {
+                sum += sky ? 400.0 : clamp(uBoxY[bi] - P.y, 0.0, 400.0);
+            }
+        }
+    }
+    oColor = vec4(sum * (1.0 / 16.0), 0.0, 0.0, 1.0);
+}
+)GLSL";
+
+static const char* kWaterWaveLib = R"GLSL(
+uniform float uTime;
+uniform vec2 uWaveDirs[6]; // direction each swell travels: the wind, fanned out by fixed angles
+uniform float uWaveAmp;    // swell amplitude (world units)
+uniform vec4 uRippleWin;   // window min X, min Z, 1 / size, active
+uniform sampler2D uRipple; // R height, G velocity, B foam
+
+// Six swell trains. The first three carry the displacement the march sees; the finer three only shape the normal.
+const float WV_LEN[6] = float[6](470.0, 270.0, 160.0, 105.0, 68.0, 44.0);
+const float WV_FRAC[6] = float[6](1.0, 0.55, 0.3, 0.16, 0.09, 0.05);
+const float WV_PH[6] = float[6](0.0, 1.9, 4.1, 0.7, 2.6, 5.3);
+const float WV_SHARP = 1.4;
+const float WV_MEAN = 0.3831; // mean of exp(1.4 (sin - 1)): the WaterBox plane stays the mean sea level
+const float WV_ENV_MAX = 1.6; // upper bound of waveEnvelope
+
+float wvHash(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+float wvNoise(vec2 x) {
+    vec2 i = floor(x);
+    vec2 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(wvHash(i), wvHash(i + vec2(1.0, 0.0)), f.x), mix(wvHash(i + vec2(0.0, 1.0)), wvHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// Every train has its own slowly drifting envelope (a product of two long sines, 0.2 .. 1.6): trains come and go, so the
+// crests break up into irregular patches instead of one set of parallel lines.
+float waveEnvelope(int i, vec2 x) {
+    float fi = float(i);
+    float a = dot(x, vec2(0.0043 + 0.0011 * fi, -0.0021 - 0.0007 * fi)) + 1.7 * fi + 0.021 * uTime * (1.0 + 0.3 * fi);
+    float b = dot(x, vec2(-0.0019 - 0.0005 * fi, 0.0039 + 0.0009 * fi)) + 3.1 * fi - 0.017 * uTime;
+    return 0.2 + 0.7 * (1.0 + sin(a) * sin(b));
+}
+
+// detail = false: the three displacing trains only (used by the march); true: all six (normals, foam).
+float oceanHeight(vec2 x, float amp, vec3 fadeA, vec3 fadeB, bool detail) {
+    // A slow phase warp bends the crest lines so the swell never reads as a perfect set of straight stripes.
+    float warp = 1.7 * sin(0.0011 * x.x - 0.0017 * x.y + 0.05 * uTime) + 1.1 * sin(0.0023 * x.x + 0.0009 * x.y - 0.03 * uTime) +
+                 3.5 * (wvNoise(x * (1.0 / 520.0) + 11.7) - 0.5);
+    float h = 0.0;
+    for (int i = 0; i < 6; i++) {
+        if (i >= 3 && !detail) {
+            break;
+        }
+        float fade = i < 3 ? fadeA[i] : fadeB[i - 3];
+        if (fade <= 0.0) {
+            continue;
+        }
+        float k = 6.2831853 / WV_LEN[i];
+        // Deep-water dispersion: phase speed grows with the square root of the wavelength.
+        float th = k * (dot(uWaveDirs[i], x) - 3.455 * sqrt(WV_LEN[i]) * uTime) + WV_PH[i] + warp * (0.5 + 0.35 * float(i));
+        h += amp * WV_FRAC[i] * fade * waveEnvelope(i, x) * (exp(WV_SHARP * (sin(th) - 1.0)) - WV_MEAN);
+    }
+    return h;
+}
+
+// Crest height of the same sum (the foam's reference): 0.617 of every train's local amplitude.
+float oceanCrest(vec2 x, float amp, vec3 fadeA, vec3 fadeB) {
+    float c = 0.0;
+    for (int i = 0; i < 6; i++) {
+        c += amp * WV_FRAC[i] * (i < 3 ? fadeA[i] : fadeB[i - 3]) * waveEnvelope(i, x);
+    }
+    return 0.617 * c;
+}
+
+vec3 rippleAt(vec2 x) {
+    return texture(uRipple, (x - uRippleWin.xy) * uRippleWin.z).rgb;
+}
+
+float surfaceHeight(vec2 x, float amp, vec3 fadeA, vec3 fadeB, bool detail, float simW) {
+    float h = oceanHeight(x, amp, fadeA, fadeB, detail);
+    if (simW > 0.0) {
+        h += simW * rippleAt(x).r;
+    }
+    return h;
+}
+
+
+)GLSL";
+
+static const char* kWaterWaveShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uWaveDepth;
+uniform float uPixelAngle;
+uniform float uWaveGust;
+
+void main() {
+    oColor = vec4(0.0);
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    float d = fetchDepth(p);
+    bool sky = d >= 0.99999;
+    vec3 P = worldPos(p, sky ? 0.9999 : d);
+    vec3 ray = P - uEye;
+    float bestT;
+    int bi = waterPlane(P, sky, bestT);
+    if (bi < 0) {
+        return;
+    }
+    float planeY = uBoxY[bi];
+    if (!sky && P.y >= planeY) {
+        return;
+    }
+    float rayLen = length(ray);
+    vec3 dir = ray / rayLen;
+    float tPlane = (planeY - uEye.y) / dir.y;
+    vec3 H0 = uEye + dir * tPlane;
+    float footprint = tPlane * uPixelAngle;
+    // Taper: the swell needs deep water under it, and a camera well above it.
+    float bed = texture(uWaveDepth, (vec2(p) + 0.5) / vec2(uSize)).r;
+    float taper = smoothstep(10.0, 70.0, bed);
+    float camFade = smoothstep(uWaveAmp * 1.5, uWaveAmp * 5.0 + 1.0, uEye.y - planeY);
+    float amp = uWaveAmp * taper * camFade;
+    // A train fades out once a pixel covers a good fraction of its wavelength along the view direction (footprint stretched by
+    // 1 / sin(elevation)): distant water converges to a smooth, glossy surface instead of banding, and a far crest can neither
+    // alias nor be missed by the march.
+    float footprintS = footprint / max(-dir.y, 0.06);
+    vec3 fadeA = 1.0 - smoothstep(0.03, 0.3, vec3(footprintS) / vec3(WV_LEN[0], WV_LEN[1], WV_LEN[2]));
+    vec3 fadeB = 1.0 - smoothstep(0.03, 0.3, vec3(footprintS) / vec3(WV_LEN[3], WV_LEN[4], WV_LEN[5]));
+    float simW = 0.0;
+    if (uRippleWin.w > 0.5) {
+        vec2 win = (H0.xz - uRippleWin.xy) * uRippleWin.z;
+        if (min(min(win.x, win.y), min(1.0 - win.x, 1.0 - win.y)) > -0.25) {
+            simW = smoothstep(2.0, 16.0, bed); // no displacement on the beach; the normal still ripples
+        }
+    }
+    float sumF = WV_FRAC[0] * fadeA.x + WV_FRAC[1] * fadeA.y + WV_FRAC[2] * fadeA.z;
+    float simBound = simW > 0.0 ? 4.0 : 0.0;
+    float hi = amp * WV_ENV_MAX * 0.617 * sumF + simBound;
+    float lo = amp * WV_ENV_MAX * 0.32 * sumF + simBound;
+    if (hi + lo < 0.05) {
+        return;
+    }
+    float tIn = max((planeY + hi - uEye.y) / dir.y, 0.0);
+    float tOut = min((planeY - lo - uEye.y) / dir.y, rayLen);
+    if (tIn >= tOut) {
+        return;
+    }
+    const int N = 14;
+    float dt = (tOut - tIn) / float(N);
+    float ta = tIn;
+    vec3 pa = uEye + dir * ta;
+    float fa = pa.y - planeY - surfaceHeight(pa.xz, amp, fadeA, fadeB, false, simW);
+    if (fa <= 0.0) {
+        return; // the camera is inside the swell
+    }
+    float tHit = -1.0;
+    for (int i = 1; i <= N; i++) {
+        float tb = tIn + dt * float(i);
+        vec3 pb = uEye + dir * tb;
+        float fb = pb.y - planeY - surfaceHeight(pb.xz, amp, fadeA, fadeB, false, simW);
+        if (fb <= 0.0) {
+            float a = ta, b = tb, fA = fa, fB = fb;
+            for (int j = 0; j < 4; j++) {
+                float m = a + (b - a) * fA / (fA - fB);
+                vec3 pm = uEye + dir * m;
+                float fm = pm.y - planeY - surfaceHeight(pm.xz, amp, fadeA, fadeB, false, simW);
+                if (fm > 0.0) {
+                    a = m;
+                    fA = fm;
+                } else {
+                    b = m;
+                    fB = fm;
+                }
+            }
+            tHit = 0.5 * (a + b);
+            break;
+        }
+        ta = tb;
+        fa = fb;
+    }
+    if (tHit < 0.0) {
+        return; // the bed is nearer than the surface: leave the flat plane
+    }
+    vec3 H = uEye + dir * tHit;
+    float e = 3.0 + footprint * 0.6;
+    float h0 = surfaceHeight(H.xz, amp, fadeA, fadeB, true, simW);
+    float hx = surfaceHeight(H.xz + vec2(e, 0.0), amp, fadeA, fadeB, true, simW);
+    float hz = surfaceHeight(H.xz + vec2(0.0, e), amp, fadeA, fadeB, true, simW);
+    vec2 slope = vec2(hx - h0, hz - h0) / e;
+    float hOff = H.y - planeY;
+    // Whitecaps ride the crest tops of the strongest trains, broken up by noise and gated into patches; stronger wind, more
+    // caps. They only exist where the pixel still resolves them (no stretched white smears at a grazing angle).
+    float crestH = oceanCrest(H.xz, amp, fadeA, fadeB);
+    float hn = crestH > 0.01 ? oceanHeight(H.xz, amp, fadeA, fadeB, true) / crestH : 0.0;
+    float breakup = 0.6 * wvNoise(H.xz / 11.0 + uWaveDirs[0] * uTime * 4.0) + 0.4 * wvNoise(H.xz / 3.7 - uWaveDirs[1] * uTime * 6.0);
+    float patch = wvNoise(H.xz / 85.0 + uWaveDirs[0] * uTime * 2.0 + 17.0);
+    float capFade = 1.0 - smoothstep(6.0, 18.0, footprintS);
+    float cap = smoothstep(0.68, 1.0, hn + (breakup - 0.5) * 0.5 + (patch - 0.5) * 1.1) * (0.25 + 0.75 * uWaveGust) * taper * capFade;
+    float wake = uRippleWin.w > 0.5 ? rippleAt(H.xz).b : 0.0;
+    float foam = clamp(max(cap, wake), 0.0, 1.0);
+    if (any(isnan(vec4(hOff, slope, foam))) || any(isinf(vec4(hOff, slope, foam)))) {
+        return;
+    }
+    oColor = vec4(hOff, slope, 1.0 + foam);
+}
+)GLSL";
+
+// One step of the ripple wave equation, semi-implicit Euler (v first, then h with the new v). State: R height, G velocity,
+// B foam. The window scrolls with the player in whole texels (uShift), the border is absorbing (no reflections).
+static const char* kWaterRippleShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform sampler2D uState;
+uniform ivec2 uShift;
+uniform float uDt;
+uniform float uC2;
+uniform float uDamp;
+uniform vec3 uWin; // new window min X, min Z, world units per texel
+uniform int uSrcCount;
+uniform vec4 uSrc[16]; // x, z, radius, strength
+
+vec4 st(ivec2 p) {
+    ivec2 s = textureSize(uState, 0);
+    p += uShift;
+    if (p.x < 0 || p.y < 0 || p.x >= s.x || p.y >= s.y) {
+        return vec4(0.0);
+    }
+    return texelFetch(uState, p, 0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 s = textureSize(uState, 0);
+    vec4 c = st(p);
+    float lap = st(p + ivec2(-1, 0)).r + st(p + ivec2(1, 0)).r + st(p + ivec2(0, -1)).r + st(p + ivec2(0, 1)).r - 4.0 * c.r;
+    float v = c.g + (uC2 * lap - uDamp * c.g) * uDt;
+    // Wake foam is thin and short lived: it is raised where the surface is being agitated hard (the ring crests) plus a narrow
+    // line right under a moving source, and it fades in about a second.
+    float foam = c.b * exp(-uDt / 1.1);
+    foam += smoothstep(18.0, 70.0, abs(c.g)) * 1.6 * uDt;
+    vec2 world = uWin.xy + (vec2(p) + 0.5) * uWin.z;
+    for (int i = 0; i < 16; i++) {
+        if (i >= uSrcCount) {
+            break;
+        }
+        vec2 dl = world - uSrc[i].xy;
+        float g = exp(-dot(dl, dl) / (uSrc[i].z * uSrc[i].z));
+        v += uSrc[i].w * g * uDt;
+        float gn = exp(-dot(dl, dl) / (0.2 * uSrc[i].z * uSrc[i].z));
+        foam += gn * clamp(abs(uSrc[i].w) / 450.0, 0.0, 1.0) * 1.6 * uDt;
+    }
+    float h = c.r + v * uDt;
+    int edge = min(min(p.x, p.y), min(s.x - 1 - p.x, s.y - 1 - p.y));
+    float a = smoothstep(0.0, 14.0, float(edge));
+    oColor = vec4(clamp(h, -4.0, 4.0) * a, clamp(v, -400.0, 400.0) * a, min(foam, 0.8) * a, 0.0);
 }
 )GLSL";
 
@@ -3194,7 +3608,10 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uCausticTex", PostFxGL::kCausticUnit },
                           { "uMilkyWay", PostFxGL::kMilkyWayUnit },
                           { "uClouds", 8 },
-                          { "uUwShafts", 10 } }) {
+                          { "uUwShafts", 10 },
+                          { "uWaveBuf", PostFxGL::kWaveBufUnit },
+                          { "uWaveDepth", PostFxGL::kWaveDepthUnit },
+                          { "uRipple", PostFxGL::kRippleUnit } }) {
         if (auto location = uniforms.find(sampler.first); location != uniforms.end())
             glUniform1i(location->second, sampler.second);
     }
@@ -3315,7 +3732,7 @@ void PostFxGL::Init() {
     // Missing units would make the passes silently wrong
     GLint units = 0;
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
-    if (units <= kCausticUnit) {
+    if (units <= kRippleUnit) {
         SPDLOG_WARN("NewDawnPostFx: disabled, only {} texture units available", units);
         return;
     }
@@ -3541,6 +3958,30 @@ void main() { oColor = vec4(1.0); }
         mUnderwaterShaft.id = BuildProgram("underwater shafts", underwaterShaft, 6, mUnderwaterShaft.uniforms);
         mUnderwaterShaftCsm.id =
             BuildProgram("underwater shafts (cascades)", underwaterShaftCsm, 7, mUnderwaterShaftCsm.uniforms);
+    }
+    {
+        // Water simulation (optional: a failure only leaves the flat-plane water). The three lanes get a complete
+        // zero dummy before any program can observe them; passes bind the real targets while they run.
+        GLint previousActiveWave;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveWave);
+        glGenTextures(1, &mWaveDummy);
+        const float zero4[4] = {};
+        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit }) {
+            glActiveTexture(GL_TEXTURE0 + unit);
+            glBindTexture(GL_TEXTURE_2D, mWaveDummy);
+            if (unit == kWaveBufUnit) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_FLOAT, zero4);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            }
+        }
+        glActiveTexture(previousActiveWave);
+        const char* waterDepthMap[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterDepthMapShader };
+        const char* waterWaves[] = { kVersion, kDepthLib, kWaterPlaneLib, kWaterWaveLib, kWaterWaveShader };
+        const char* waterRipple[] = { kVersion, kWaterRippleShader };
+        mWaterDepthMap.id = BuildProgram("water depth map", waterDepthMap, 4, mWaterDepthMap.uniforms);
+        mWaterWaves.id = BuildProgram("water waves", waterWaves, 5, mWaterWaves.uniforms);
+        mWaterRipple.id = BuildProgram("water ripples", waterRipple, 2, mWaterRipple.uniforms);
     }
     if (mWaterSurface.id) {
         // Reuse the four dedicated postfx 2D lanes (8..11). Every sampler is distinct at creation, and each
@@ -4657,10 +5098,17 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     // Fully submerged cameras use the underwater pass (scene end) instead of the surface
     if (doWater && !(params.waterUnderwater > 0.0f && params.waterUnderwaterState >= 1.0f && mUnderwater.id)) {
         BeginTimer(kWaterTimerStage);
+        RunWaterWaves(params, fb);
         RunWaterSurface(params, fb);
         if (params.waterStrength > 0.0f || params.waterReflections != 0) {
             RunWater(params, fb);
         }
+        // The lanes go back to their complete dummy: no program ever observes a stale or unit-0 texture there.
+        for (int unit : { kWaveBufUnit, kWaveDepthUnit, kRippleUnit }) {
+            glActiveTexture(GL_TEXTURE0 + unit);
+            glBindTexture(GL_TEXTURE_2D, mWaveDummy);
+        }
+        mWaveBufFrame = UINT32_MAX;
         EndTimer(kWaterTimerStage);
     }
     if (doShadow) {
@@ -5084,6 +5532,155 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     CheckError("shadow apply");
 }
 
+// Steps the ripple height field. State persists across frames; the window follows the player in whole texels.
+void PostFxGL::StepWaterRipples(const NewDawnPostFxParams& params) {
+    constexpr int kSize = 256;
+    constexpr float kTexel = 4.0f, kStep = 1.0f / 60.0f;
+    const bool fresh = mRipple[0].tex == 0 || mRipple[1].tex == 0;
+    EnsureTarget(mRipple[0], kSize, kSize, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    EnsureTarget(mRipple[1], kSize, kSize, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    const float now = params.waterTime;
+    // A new scene, a rewound clock or a long gap (loading, pause menu) restarts the field from rest.
+    if (fresh || mRippleScene != params.giSceneId || now < mRippleLastTime - 0.2f || now - mRippleLastTime > 1.0f) {
+        mRippleValid = false;
+        mRippleAccum = 0.0f;
+        mRippleScene = params.giSceneId;
+        mRippleLastTime = now;
+    }
+    const float dt = std::clamp(now - mRippleLastTime, 0.0f, 0.1f);
+    mRippleLastTime = now;
+    mRippleAccum += dt;
+    int steps = std::min((int)(mRippleAccum / kStep), 4);
+    mRippleAccum = std::min(mRippleAccum - steps * kStep, kStep);
+    if (!mRippleValid) {
+        for (auto& t : mRipple) {
+            glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        mRippleRead = 0;
+        steps = std::max(steps, 1); // establish the window around the player right away
+    }
+    if (steps == 0) {
+        return;
+    }
+    const float half = kSize * kTexel * 0.5f;
+    const float newMin[2] = { std::floor((params.waterRippleFocus[0] - half) / kTexel) * kTexel,
+                              std::floor((params.waterRippleFocus[1] - half) / kTexel) * kTexel };
+    int shift[2] = {};
+    if (mRippleValid) {
+        for (int i = 0; i < 2; i++) {
+            shift[i] = (int)std::lround((newMin[i] - mRippleMin[i]) / kTexel);
+        }
+    }
+    float src[NEWDAWN_MAX_WATER_RIPPLES * 4] = {};
+    const int count = std::clamp(params.waterRippleCount, 0, NEWDAWN_MAX_WATER_RIPPLES);
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 4; j++) {
+            src[i * 4 + j] = params.waterRippleSrc[i][j];
+        }
+        src[i * 4 + 3] *= params.waterRipples;
+    }
+    glDisable(GL_BLEND);
+    Use(mWaterRipple);
+    glUniform1i(Loc("uState"), kFirstUnit);
+    glUniform1f(Loc("uDt"), kStep);
+    glUniform1f(Loc("uC2"), (110.0f / kTexel) * (110.0f / kTexel));
+    glUniform1f(Loc("uDamp"), 0.9f);
+    glUniform3f(Loc("uWin"), newMin[0], newMin[1], kTexel);
+    glUniform1i(Loc("uSrcCount"), count);
+    glUniform4fv(Loc("uSrc"), count, src);
+    for (int i = 0; i < steps; i++) {
+        const int write = 1 - mRippleRead;
+        Bind(0, mRipple[mRippleRead].tex);
+        glUniform2i(Loc("uShift"), i == 0 ? shift[0] : 0, i == 0 ? shift[1] : 0);
+        Draw(mRipple[write]);
+        mRippleRead = write;
+    }
+    mRippleMin[0] = newMin[0];
+    mRippleMin[1] = newMin[1];
+    mRippleValid = true;
+    CheckError("water ripples");
+}
+
+// Blurred depth map, then the wave trace into mWaveBuf (consumed by RunWaterSurface and RunWater through uWaves).
+void PostFxGL::RunWaterWaves(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
+    mWaveBufFrame = UINT32_MAX;
+    const int w = fb.width, h = fb.height;
+    const bool ripples = params.waterRipples > 0.0f;
+    if (!ripples) {
+        mRippleValid = false; // starts from rest when switched back on
+    }
+    if (!mHdrActive || params.waterRestyle <= 0.0f || (params.waterWaves <= 0.0f && !ripples) || !mWaterDepthMap.id ||
+        !mWaterWaves.id || !mWaterRipple.id || params.waterDebug == 1 || mWaterOpaqueFrame != mSettingsFrame ||
+        mWaterOpaqueColor.w != w || mWaterOpaqueColor.h != h) {
+        return;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    if (ripples) {
+        StepWaterRipples(params);
+    }
+    const bool rippleLive = ripples && mRippleValid;
+    if (params.waterWaves <= 0.0f && !rippleLive) {
+        return;
+    }
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    float rect[NEWDAWN_MAX_WATER_BOXES * 4] = {};
+    float surfaceY[NEWDAWN_MAX_WATER_BOXES] = {};
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 4; j++) {
+            rect[i * 4 + j] = params.waterBoxes[i][j];
+        }
+        surfaceY[i] = params.waterBoxes[i][4];
+    }
+    EnsureTarget(mWaveDepth, (w + 7) / 8, (h + 7) / 8, GL_R16F, GL_RED, GL_FLOAT, false, true);
+    EnsureTarget(mWaveBuf, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
+    const auto setPlane = [&]() {
+        glUniform1i(Loc("uDepth"), kFirstUnit + 2);
+        glUniform2i(Loc("uSize"), w, h);
+        glUniform1f(Loc("uNear"), params.zNear);
+        glUniform1f(Loc("uFar"), params.zFar);
+        glUniform1f(Loc("uNdcXScale"), params.shadowNdcXScale);
+        glUniform1f(Loc("uFlipY"), params.shadowFlipY);
+        glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, params.shadowInvViewProj);
+        glUniform3fv(Loc("uEye"), 1, params.waterCameraEye);
+        glUniform1i(Loc("uBoxCount"), count);
+        glUniform4fv(Loc("uBoxRect"), count, rect);
+        glUniform1fv(Loc("uBoxY"), count, surfaceY);
+    };
+    Bind(2, mWaterOpaqueDepth.tex); // the bed: opaque depth, exactly what the surface pass reads
+    Use(mWaterDepthMap);
+    setPlane();
+    Draw(mWaveDepth);
+
+    glActiveTexture(GL_TEXTURE0 + kWaveDepthUnit);
+    glBindTexture(GL_TEXTURE_2D, mWaveDepth.tex);
+    glActiveTexture(GL_TEXTURE0 + kRippleUnit);
+    glBindTexture(GL_TEXTURE_2D, rippleLive ? mRipple[mRippleRead].tex : mWaveDummy);
+    Use(mWaterWaves);
+    setPlane();
+    float dirs[12];
+    // Each swell train is the wind rotated by a fixed angle; the angles are wide and uneven so crests never run parallel.
+    const float angles[6] = { 0.0f, 0.55f, -0.85f, 1.15f, -1.4f, 0.28f };
+    const float wl = std::sqrt(params.waterWaveDir[0] * params.waterWaveDir[0] + params.waterWaveDir[1] * params.waterWaveDir[1]);
+    const float bx = wl > 1e-4f ? params.waterWaveDir[0] / wl : 1.0f, bz = wl > 1e-4f ? params.waterWaveDir[1] / wl : 0.0f;
+    for (int i = 0; i < 6; i++) {
+        dirs[i * 2 + 0] = bx * std::cos(angles[i]) - bz * std::sin(angles[i]);
+        dirs[i * 2 + 1] = bx * std::sin(angles[i]) + bz * std::cos(angles[i]);
+    }
+    glUniform2fv(Loc("uWaveDirs"), 6, dirs);
+    glUniform1f(Loc("uTime"), params.waterTime);
+    glUniform1f(Loc("uWaveAmp"), kWaveBaseAmp * params.waterWaves);
+    glUniform1f(Loc("uWaveGust"), params.waterWaveGust);
+    glUniform1f(Loc("uPixelAngle"), 2.0f * std::tan(params.fovyDegrees * 3.14159265f / 360.0f) / (float)h);
+    glUniform4f(Loc("uRippleWin"), mRippleMin[0], mRippleMin[1], 1.0f / (256.0f * 4.0f), rippleLive ? 1.0f : 0.0f);
+    Draw(mWaveBuf);
+    mWaveBufFrame = mSettingsFrame;
+    CheckError("water waves");
+}
+
 void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     const int w = fb.width, h = fb.height;
     const float foam = params.waterFoam;
@@ -5161,6 +5758,16 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
     glUniform3fv(Loc("uFogColor"), 1, fogColor);
+    const bool waves = mWaveBufFrame == mSettingsFrame;
+    if (waves) {
+        glActiveTexture(GL_TEXTURE0 + kWaveBufUnit);
+        glBindTexture(GL_TEXTURE_2D, mWaveBuf.tex);
+    }
+    glUniform1i(Loc("uWaves"), waves);
+    glUniform1i(Loc("uDebug"), params.waterDebug);
+    glUniform1f(Loc("uWaveAmp"), kWaveBaseAmp * params.waterWaves);
+    // Swash is an ocean feature: it follows the swell setting, and the foam toggle/strength.
+    glUniform1f(Loc("uSwash"), params.waterWaves > 0.0f && restyle > 0.0f ? std::min(foam, 1.0f) : 0.0f);
     glEnable(GL_BLEND);
     glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -5402,6 +6009,12 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     glUniform3fv(Loc("uSky"), 1, sky);
     glUniform1i(Loc("uSkyReflectionsEnabled"), SkyReflectionsActive());
     glUniform1i(Loc("uSkySpecular"), kSkyReflectionUnit);
+    const bool waves = mWaveBufFrame == mSettingsFrame;
+    if (waves) {
+        glActiveTexture(GL_TEXTURE0 + kWaveBufUnit);
+        glBindTexture(GL_TEXTURE_2D, mWaveBuf.tex);
+    }
+    glUniform1i(Loc("uWaves"), waves);
     if (filter) {
         glDisable(GL_BLEND);
         Draw(mWaterReflectionRaw);

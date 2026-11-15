@@ -134,6 +134,11 @@ class PostFxGL {
     static constexpr int kFlareSpritesUnit = 16;
     static constexpr int kFlareCloudUnit = 17;
     static constexpr int kCausticUnit = 28; // atmos 16..19 and 24, vfx 25..27 are taken
+    // Water simulation (dedicated lanes, a complete dummy bound at program creation; grass owns 29 and 30).
+    static constexpr int kWaveBufUnit = 31;   // per-pixel displaced surface (height, slope, foam)
+    static constexpr int kWaveDepthUnit = 32; // eighth-resolution blurred water depth (the wave taper)
+    static constexpr int kRippleUnit = 33;    // GPU ripple height field around the player
+    static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
     static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
@@ -221,6 +226,8 @@ class PostFxGL {
                     uint32_t vertexCount, int debug);
     void RunWater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunWaterSurface(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void RunWaterWaves(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    void StepWaterRipples(const NewDawnPostFxParams& params);
     void RunCaustics(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     void RunUnderwater(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
     bool EnsureCausticAssets();
@@ -330,6 +337,14 @@ class PostFxGL {
     Target mScene;
     Target mWaterOpaqueColor, mWaterOpaqueDepth; // captured before XLU, only when reflections are enabled
     Target mWaterReflectionRaw; // half-resolution premultiplied colour and reflection coverage
+    // Water simulation: ocean swell trace + GPU ripple height field (docs/WATER_SIM.md).
+    Program mWaterDepthMap, mWaterWaves, mWaterRipple;
+    Target mWaveDepth, mWaveBuf, mRipple[2];
+    GLuint mWaveDummy = 0;
+    int mRippleRead = 0, mRippleScene = -1;
+    bool mRippleValid = false;
+    float mRippleMin[2] = {}, mRippleAccum = 0.0f, mRippleLastTime = 0.0f;
+    uint32_t mWaveBufFrame = UINT32_MAX; // settings frame whose wave buffer is valid
     uint32_t mWaterOpaqueFrame = UINT32_MAX;
     Target mShadowMap;
     // Cascaded sun shadows, rebuilt by RunShadows each frame (count 1 = the legacy single map, nothing else is used).
