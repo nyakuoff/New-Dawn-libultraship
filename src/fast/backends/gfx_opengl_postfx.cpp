@@ -1319,6 +1319,12 @@ layout(location = 0) out vec4 oColor;
 uniform vec4 uWin0[12], uWin1[12], uWin2[12];
 uniform vec3 uGlass;     // linear radiance of the sky seen through the pane (zero level = night)
 uniform vec3 uFrame;     // linear albedo of the frame under the room's darkness
+float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(h21(i), h21(i + vec2(1, 0)), f.x), mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), f.x), f.y);
+}
 void main() {
     vec2 h = vec2(uWin0[vWin].w, uWin1[vWin].w);
     vec2 a = h - abs(vLocal);
@@ -1338,14 +1344,17 @@ void main() {
     float edge = min(a.x, a.y);              // distance inside the opening
     bool glass = edge > 0.0 && bar < 0.5;
     if (glass) {
-        // Sky: lighter toward the horizon (bottom of the pane), a little bluer overhead.
+        // Sky behind frosted glass: horizon glow below, bluer zenith above, soft variation and darker toward the frame.
         float t = clamp(vLocal.y / h.y * 0.5 + 0.5, 0.0, 1.0);
-        vec3 sky = mix(vec3(1.0, 0.97, 0.9), vec3(0.62, 0.78, 1.0), t);
-        oColor = vec4(uGlass * sky * (1.0 - 0.12 * smoothstep(0.0, 6.0, 6.0 - edge)), 1.0);
+        vec3 sky = mix(vec3(1.0, 0.93, 0.80), vec3(0.50, 0.68, 1.0), smoothstep(0.0, 1.0, t));
+        float frost = vnoise(vLocal * 0.22) * 0.65 + vnoise(vLocal * 0.9 + 7.0) * 0.35;
+        sky *= (0.78 + 0.34 * frost) * mix(0.62, 1.0, smoothstep(0.0, 16.0, edge));
+        oColor = vec4(uGlass * sky, 1.0);
     } else {
-        // Frame and mullions: dark painted wood with a lit inner lip.
+        // Frame and mullions: warm painted wood with grain along the bar, and a lit inner lip.
+        float grain = vnoise(vec2(vLocal.x * 0.05, vLocal.y * 0.9)) * 0.5 + vnoise(vec2(vLocal.x * 0.9, vLocal.y * 0.05)) * 0.5;
         float lip = smoothstep(2.5, 0.0, abs(edge)) * 0.5;
-        oColor = vec4(uFrame * (0.7 + 0.6 * lip) + uGlass * 0.04 * lip, 1.0);
+        oColor = vec4(uFrame * (0.55 + 0.9 * grain) * (0.8 + 0.6 * lip) + uGlass * 0.03 * lip, 1.0);
     }
 }
 )GLSL";
@@ -7055,12 +7064,12 @@ void PostFxGL::RunInteriorLight(const NewDawnPostFxParams& params, const Framebu
             glUniform4fv(Loc("uWin1"), kMax, &v1[0][0]);
             glUniform4fv(Loc("uWin2"), kMax, &v2[0][0]);
             // Sky brightness behind the glass: the light colour scaled up (a window is far brighter than the room it lights).
-            const float sky = 3.2f;
+            const float sky = 2.4f;
             const float night[3] = { 0.010f, 0.016f, 0.034f };
             const float glass[3] = { night[0] + params.interiorColor[0] * sky, night[1] + params.interiorColor[1] * sky,
                                      night[2] + params.interiorColor[2] * sky };
             glUniform3fv(Loc("uGlass"), 1, glass);
-            const float frame[3] = { 0.030f, 0.020f, 0.014f };
+            const float frame[3] = { 0.075f, 0.043f, 0.020f };
             glUniform3fv(Loc("uFrame"), 1, frame);
             glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
             glViewport(0, 0, w, h);
