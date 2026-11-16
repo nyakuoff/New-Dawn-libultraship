@@ -3953,11 +3953,22 @@ void main() {
     // Wavy refraction: slow broad swell plus finer ripple, about 3 px.
     vec2 w = vec2(sin(uv.y * 17.0 + uTime * 1.3) + 0.6 * sin(uv.y * 43.0 - uTime * 2.1 + uv.x * 9.0),
                   sin(uv.x * 21.0 + uTime * 1.1) + 0.6 * sin(uv.x * 51.0 + uTime * 1.9 - uv.y * 7.0));
-    vec2 suv = clamp(uv + w * 0.0016 * uUnder * vec2(1.0, sz.x / sz.y), 0.5 / sz, 1.0 - 0.5 / sz);
+    // The shimmer belongs to the water between the eye and distant geometry: it fades out within 200-700 units of the eye, so
+    // Link and actors close to the camera are not wobbled, and a displaced sample that lands on a much nearer or farther
+    // surface than this pixel's own (an actor's edge against the backdrop) is not taken.
+    float s0, a0, b0;
+    rayDir(p, s0, a0, b0);
+    float shimmer = smoothstep(200.0, 700.0, s0);
+    vec2 suv = clamp(uv + w * 0.0016 * uUnder * shimmer * vec2(1.0, sz.x / sz.y), 0.5 / sz, 1.0 - 0.5 / sz);
     ivec2 q = ivec2(suv * sz);
-    vec3 C = texture(uScene, suv).rgb;
     float s, t0, t1;
     vec3 dir = rayDir(q, s, t0, t1);
+    if (abs(s - s0) > 0.08 * s0 + 12.0) {
+        suv = uv;
+        q = p;
+        dir = rayDir(q, s, t0, t1);
+    }
+    vec3 C = texture(uScene, suv).rgb;
     vec3 Lt = normalize(uLightDir);
     vec3 sigma = sigmaCoefficient();
     vec3 lit = uSky * 0.55 + uLightColor * (0.25 + 0.75 * max(Lt.y, 0.0)) * 0.45;
