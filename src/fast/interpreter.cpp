@@ -4409,7 +4409,7 @@ void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
     float jitterX = 0.0f, jitterY = 0.0f, jitterPxX = 0.0f, jitterPxY = 0.0f;
     if (taa) {
         // 16-sample Halton(2,3), centred on the pixel: offsets within (-0.5, 0.5) pixels.
-        const uint32_t i = (frame % 16) + 1;
+        const uint32_t i = (NewDawnTimeFrozen() ? 0u : frame % 16) + 1; // frozen: one fixed jitter phase
         jitterPxX = Halton(i, 2) - 0.5f;
         jitterPxY = Halton(i, 3) - 0.5f;
         jitterX = jitterPxX * 2.0f / w * ndcXScale;
@@ -7820,7 +7820,9 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
             // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
             gfx->FillShadowCameraParams(effective);
-            effective.waterTime += (gfx->mInterpolationT - 1.0f) * (1.0f / 20.0f);
+            if (!NewDawnTimeFrozen().load(std::memory_order_relaxed)) { // frozen fixture: no per-display-frame phase
+                effective.waterTime += (gfx->mInterpolationT - 1.0f) * (1.0f / 20.0f);
+            }
             if (effective.shadowUseExactProj == 0) {
                 effective.waterEnabled = 0;
             }
@@ -8850,6 +8852,20 @@ void Interpreter::StartFrame() {
     }
 
     auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    // Test fixtures (docs/VALIDATION.md): a stopped render clock makes a frozen game state render identical pixels.
+    {
+        const bool frozenTime = cvars->GetInteger("gNewDawn.Debug.FreezeTime", 0) != 0;
+        NewDawnTimeFrozen().store(frozenTime, std::memory_order_relaxed);
+        auto& tick = NewDawnFreezeTick();
+        if (frozenTime && NewDawnFreezeLanded().load(std::memory_order_relaxed)) {
+            if (tick.load(std::memory_order_relaxed) == 0) {
+                NewDawnFreezeEpoch().fetch_add(1, std::memory_order_relaxed);
+            }
+            tick.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            tick.store(0, std::memory_order_relaxed);
+        }
+    }
     {
         // New Dawn smooth characters (docs/SMOOTH_CHARACTERS.md). The cached analysis depends on what counts as a
         // character and on the crease angle, so a change of either starts it again.

@@ -4937,8 +4937,7 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     SetNightUniforms(params);
     // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
     // frame rate and time-speed enhancements. 1024 km is a common period of all noise octaves/maps.
-    static const auto epoch = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const double seconds = NewDawnClockSeconds();
     // Density samples world + offset, so negative travel advects clouds along the positive foliage/particle wind.
     const double drift = CvInt("gNewDawn.Atmos.Wind", 0) ? -NewDawnWindTravel(NewDawnWindSeconds()) : seconds;
     glUniform2f(Loc("uWind"), static_cast<float>(std::fmod(drift * 0.018 * look.windMul, 1024.0)),
@@ -5135,8 +5134,7 @@ void PostFxGL::RunNightStars(const NewDawnPostFxParams& params, const Framebuffe
     // HDR units: the display exposure is about 0.05, so a mag 6 star peaks near 0.5, Vega near 50.
     glUniform1f(Loc("uFlux"), vis * std::clamp(CvFloat("gNewDawn.Sky.StarBrightness", 1.0f), 0.0f, 8.0f) * 300.0f);
     glUniform1f(Loc("uPix"), std::max((float)fb.height, 1.0f) / 1080.0f);
-    static const auto epoch = std::chrono::steady_clock::now();
-    glUniform1f(Loc("uTime"), (float)std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
+    glUniform1f(Loc("uTime"), (float)std::fmod(NewDawnClockSeconds(), 3600.0));
     const bool clouds = mCloudsDrawnFrame == mSkyFrame && mClouds.tex != 0;
     glUniform1f(Loc("uCloudsOn"), clouds ? mFlareCloudOpacity : 0.0f);
     glUniform2f(Loc("uRes"), (float)fb.width, (float)fb.height);
@@ -7357,6 +7355,11 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
         angle += forward[i] * mGiForward[i];
     }
     valid = valid && movement < 60.0f * 60.0f && angle > 0.85f;
+    const uint32_t freezeEpoch = NewDawnFreezeEpoch().load(std::memory_order_relaxed);
+    if (mGiFreezeEpoch != freezeEpoch) { // frozen-frame fixture: restart from an empty history
+        mGiFreezeEpoch = freezeEpoch;
+        valid = false;
+    }
     EnsureTarget(mGiSource, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
     EnsureTarget(mGiRaw, hw, hh, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, false);
     for (auto& history : mGiHistory) {
@@ -7398,7 +7401,9 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
                                         ? 2.0f * 1500.0f / 4096.0f * 4.0f
                                         : 2.0f * params.shadowRadius / (float)std::max(params.shadowMapSize, 1) * 4.0f);
     glUniform1i(Loc("uSunShadow"), sunShadow ? 1 : 0);
-    glUniform1i(Loc("uFrame"), (int)(frameIndex & 63u));
+    // frozen-frame fixture: the noise phase counts frames since the freeze landed, not since the process started
+    const uint32_t freezeTick = NewDawnFreezeTick().load(std::memory_order_relaxed);
+    glUniform1i(Loc("uFrame"), (int)((freezeTick != 0 ? std::min(freezeTick, kFreezeSettleFrames) : frameIndex) & 63u));
     Draw(mGiRaw);
     glBindSampler(kFirstUnit + 2, 0);
     Bind(2, mGiRaw.tex);
@@ -7421,7 +7426,9 @@ void PostFxGL::RunGlobalIllumination(const NewDawnPostFxParams& params, const Fr
     glBlendEquation(GL_FUNC_ADD);
     Draw(fb.fbo, w, h);
     glDisable(GL_BLEND);
-    mGiRead = write;
+    if (!NewDawnFreezeHold()) { // held history: the same input then gives the same output on every later frame
+        mGiRead = write;
+    }
     mGiFrame = frameIndex;
     mGiScene = params.giSceneId;
     mGiNdcXScale = params.shadowNdcXScale;
@@ -7446,9 +7453,7 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
     std::fill(fairy, fairy + kMax, false);
     std::fill(mLocalFlame, mLocalFlame + kMax, false);
     count = 0;
-    static const auto epoch = std::chrono::steady_clock::now();
-    const float seconds =
-        static_cast<float>(std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count(), 3600.0));
+    const float seconds = static_cast<float>(std::fmod(NewDawnClockSeconds(), 3600.0));
     // Render-only flicker: a slow drift plus two faster, weaker terms (all under ~5 Hz), keyed on the light's quantised
     // position and the wall clock. Warm (fire) lights flicker up to ~18%, neutral lamps barely. No game data changes.
     // The game re-rolls some lights every tick (a torch sets its intensity to 128 + rand * 127 at 20 Hz): white noise of
@@ -7456,10 +7461,12 @@ void PostFxGL::PrepareLocalLights(const NewDawnPostFxParams& params, uint32_t fr
     // colour and radius over ~0.6 s of wall-clock time, keyed on its position, before the designed flicker below.
     static std::unordered_map<uint64_t, std::array<float, 5>> smoothed; // r, g, b, radius, last seen
     static double lastNow = 0.0;
-    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const double now = NewDawnClockSeconds();
     const bool smoothLights = CvInt("gNewDawn.Lighting.LocalSmooth", 1) != 0; // 0: the unfiltered game values (A/B)
-    const float blend =
-        smoothLights ? 1.0f - std::exp(-static_cast<float>(std::clamp(now - lastNow, 0.0, 0.5)) / 0.6f) : 1.0f;
+    // A frozen clock (gNewDawn.Debug.FreezeTime) takes the game's values as they are: no history to settle.
+    const float blend = smoothLights && !NewDawnTimeFrozen()
+                            ? 1.0f - std::exp(-static_cast<float>(std::clamp(now - lastNow, 0.0, 0.5)) / 0.6f)
+                            : 1.0f;
     lastNow = now;
     // Flames (gNewDawn.Lighting.FlameLight): the VFX flames recorded last frame, with their world height. A light that sits
     // on a flame (the game's own torch light, or the one tied to a flame the game gives none) is a flame light: it gets
@@ -8435,8 +8442,11 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
                         std::sqrt(dx * dx + dy * dy + dz * dz), dot);
         }
     }
+    const uint32_t freezeEpoch = NewDawnFreezeEpoch().load(std::memory_order_relaxed);
+    const bool freezeRestart = mTaaFreezeEpoch != freezeEpoch; // frozen-frame fixture: restart from an empty history
+    mTaaFreezeEpoch = freezeEpoch;
     const bool reset =
-        !mTaaValid || !haveCamera || mTaaCam.frame != mTaaLastFrame + 1 || mTaaPrevW != w || mTaaPrevH != h || cut;
+        freezeRestart || !mTaaValid || !haveCamera || mTaaCam.frame != mTaaLastFrame + 1 || mTaaPrevW != w || mTaaPrevH != h || cut;
     mTaaDidReset = reset;
     if (reset && mStats) {
         SPDLOG_INFO("NewDawnPostFx: TAA history reset ({}), frame {}",
@@ -8514,7 +8524,9 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
     Draw(mTaaHist[write]);
     CheckError("TAA resolve");
 
-    mTaaRead = write;
+    if (!NewDawnFreezeHold()) {
+        mTaaRead = write;
+    }
     mTaaValid = true;
     mTaaLastFrame = mTaaCam.frame;
     mTaaPrevW = w;

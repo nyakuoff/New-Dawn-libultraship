@@ -281,6 +281,7 @@ class PostFxGL {
     uint32_t mWgiTriCount = 0;
     struct WorldGi {
         bool attempted = false, ready = false;
+        uint32_t freezeEpoch = 0; // gNewDawn.Debug.FreezeFrame: the landing the grids were last restarted for
         Program voxelize, inject, trace, blend, apply;
         GLuint voxAlbedo = 0, voxNormal = 0, voxCoarse = 0, voxRadiance = 0; // 3D
         GLuint probeIrr = 0, probeDist = 0, rays = 0;                         // 2D
@@ -416,6 +417,7 @@ class PostFxGL {
     Target mGiSource, mGiRaw, mGiHistory[2];
     bool mGiValid = false;
     int mGiRead = 0, mGiScene = -1;
+    uint32_t mGiFreezeEpoch = 0, mTaaFreezeEpoch = 0; // see newdawn_wind.h (frozen-frame fixture)
     uint32_t mGiFrame = UINT32_MAX;
     float mGiViewProj[16] = {}, mGiEye[3] = {}, mGiForward[3] = {};
     float mGiNdcXScale = 1.0f, mGiFlipY = 1.0f;
