@@ -1691,6 +1691,11 @@ uniform float uBloomStrength;
 uniform int uUseGrade;
 uniform float uContrast;
 uniform float uSaturation;
+// Characters (stencil 1 of the world pass) do not get the display grade's boosts: its contrast curve, saturation and the art
+// direction's foliage-green boost drive the darkest channel of a saturated green or red to 0 (acid green, yellow skin). Its
+// reductions (a contrast or saturation below 1) and its colour tint stay.
+uniform sampler2D uCharMask;
+uniform float uCharRelief;
 #ifdef HDR_SCENE
 const int uHdr = 1;
 #else
@@ -1715,6 +1720,7 @@ float ign(vec2 p) {
 
 void main() {
     vec3 c = texelFetch(uScene, ivec2(gl_FragCoord.xy), 0).rgb;
+    float cw = uCharRelief > 0.0 ? texelFetch(uCharMask, ivec2(gl_FragCoord.xy), 0).r * uCharRelief : 0.0;
     if (uUseBloom != 0) {
         vec3 b = texture(uBloom, vUv).rgb * uBloomStrength;
         if (uHdr != 0) c += b; // scene-referred radiance, before the display transform
@@ -1748,9 +1754,9 @@ void main() {
         }
         // Contrast as a blend towards a smoothstep S-curve (fixes black and white, mid slope equals uContrast).
         vec3 s = c * c * (3.0 - 2.0 * c);
-        c = c + (uContrast - 1.0) * 2.0 * (s - c);
+        c = c + (mix(uContrast, min(uContrast, 1.0), cw) - 1.0) * 2.0 * (s - c);
         float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-        c = mix(vec3(l), c, uSaturation);
+        c = mix(vec3(l), c, mix(uSaturation, min(uSaturation, 1.0), cw));
     }
     if (uArtOn != 0) {
         const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
@@ -1759,7 +1765,7 @@ void main() {
         if (uArtGreen.x >= 0.0) c.r = mix(c.r, c.g, gw * uArtGreen.x);
         else c.b = mix(c.b, c.g, -gw * uArtGreen.x);
         float gl = dot(c, lw);
-        c = mix(vec3(gl), c, 1.0 + gw * (uArtGreen.y - 1.0));
+        c = mix(vec3(gl), c, 1.0 + gw * (mix(uArtGreen.y, min(uArtGreen.y, 1.0), cw) - 1.0));
         // Slope / offset / power, then an S-curve, split tone and global saturation (all in display space).
         // Deep shadows stay black and neutral: the lift and the gamma fade in above them (a fixed lift or a gamma below 1
         // would otherwise turn true black into a tinted grey).
@@ -1768,11 +1774,11 @@ void main() {
         // Keep the contrast curve monotonic when slope/saturation put a channel above display white.
         vec3 cc = clamp(c, 0.0, 1.0);
         vec3 sc = cc * cc * (3.0 - 2.0 * cc);
-        c += 2.0 * uArtContrast * (sc - cc);
+        c += 2.0 * mix(uArtContrast, min(uArtContrast, 0.0), cw) * (sc - cc);
         float al = dot(c, lw);
         c += uArtShadow * ((1.0 - smoothstep(0.0, 0.5, al)) * smoothstep(0.0, 0.2, al)) + uArtHigh * smoothstep(0.45, 1.0, al);
         al = dot(c, lw);
-        c = mix(vec3(al), c, uArtSat);
+        c = mix(vec3(al), c, mix(uArtSat, min(uArtSat, 1.0), cw));
     }
     // Dither before the 8 bit quantisation. +-half a step leaves unchanged pixels (and pure black) exactly as they were.
     #ifndef NO_DITHER
@@ -8634,9 +8640,53 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa
         CheckError("bloom upsample");
     }
 
+    // Character grade relief (docs/CHARACTER_LIGHTING.md): the stencil-marked characters of this frame's world pass as a mask
+    // for the display grade. TAA has already built it when it ran; otherwise it is built here the same way.
+    const float charRelief = std::clamp(CvFloat("gNewDawn.Characters.GradeRelief", 0.8f), 0.0f, 1.0f);
+    bool haveCharMask = false;
+    if (charRelief > 0.0f && mHdrActive && mLocalMarking && mTaaMaskFill.id) {
+        if (sceneSrc != &mScene && mTaaMask.tex) {
+            haveCharMask = true;
+        } else {
+            EnsureTarget(mTaaDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
+            EnsureTarget(mTaaMask, w, h, GL_RG8, GL_RG, GL_UNSIGNED_BYTE, false, false);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mTaaDepth.fbo);
+            glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, mTaaMask.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, mTaaDepth.tex, 0);
+            glViewport(0, 0, w, h);
+            glClearColor(0, 0, 0, 0);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glEnable(GL_STENCIL_TEST);
+            glStencilMask(0);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+            Use(mTaaMaskFill);
+            glColorMask(GL_TRUE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glStencilFunc(GL_EQUAL, 1, 0xFF);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDisable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            glStencilFunc(GL_ALWAYS, 0, 0xFF);
+            CheckError("character grade mask");
+            haveCharMask = true;
+        }
+    }
+
+    if (mStats) {
+        static int logged = 0;
+        if (logged++ % 300 == 0) {
+            SPDLOG_INFO("NewDawnPostFx: character grade relief {:.2f}, mask {} (hdr {}, marking {}, fill program {}, taa {})", charRelief,
+                        haveCharMask, mHdrActive, mLocalMarking, mTaaMaskFill.id != 0, sceneSrc != &mScene);
+        }
+    }
     Bind(0, sceneSrc->tex);
     Bind(1, useBloom ? mBloom[0].tex : sceneSrc->tex);
+    Bind(2, haveCharMask ? mTaaMask.tex : sceneSrc->tex);
     Use(mHdrActive ? mCompositeHdr : (CvInt("gNewDawn.PostFx.Dither.Enabled", 1) ? mComposite : mCompositeNoDither));
+    glUniform1i(Loc("uCharMask"), kFirstUnit + 2);
+    glUniform1f(Loc("uCharRelief"), haveCharMask ? charRelief : 0.0f);
     glUniform1i(Loc("uScene"), kFirstUnit + 0);
     glUniform1i(Loc("uBloom"), kFirstUnit + 1);
     glUniform1i(Loc("uUseBloom"), useBloom ? 1 : 0);
