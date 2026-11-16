@@ -883,8 +883,11 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
         prg->attribSizes[cnt] = 3;
         ++cnt;
-    } else if (cc_features.opt_material_maps) { // unlit material: the world position alone
+    } else if (cc_features.opt_material_maps) { // unlit material: the world position, then a smooth normal
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aNormal");
         prg->attribSizes[cnt] = 3;
         ++cnt;
     }
