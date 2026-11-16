@@ -327,6 +327,10 @@ class ResourceManager {
      */
     bool IsAltAssetsEnabled();
 
+    /** @brief New Dawn: whether the generated "mm3d/" overlay archive entries take precedence over everything. */
+    bool IsOverlayEnabled();
+    void SetOverlayEnabled(bool isEnabled);
+
     /**
      * @brief Enables or disables alt-asset (mod) loading.
      * @param isEnabled true to enable, false to disable.
@@ -426,6 +430,7 @@ class ResourceManager {
     std::shared_ptr<BS::thread_pool> mThreadPool;
     std::mutex mMutex;
     bool mAltAssetsEnabled = false;
+    bool mOverlayEnabled = false;
     // Private information for which owner and archive are default.
     uintptr_t mDefaultCacheOwner = 0;
     std::shared_ptr<Archive> mDefaultCacheArchive = nullptr;

@@ -509,7 +509,8 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char*
         return rm->LoadResourceProcess(path);
     }
     std::string_view pathView(path);
-    if (!rm->IsAltAssetsEnabled() || pathView.starts_with(Ship::IResource::gAltAssetPrefix)) {
+    if (!rm->IsAltAssetsEnabled() || pathView.starts_with(Ship::IResource::gAltAssetPrefix) ||
+        pathView.starts_with(Ship::IResource::gOverlayAssetPrefix)) {
         return rm->LoadResourceProcess(path);
     }
     // Match LoadResourceProcess: the texture address may carry the "__OTR__" signature prefix.
