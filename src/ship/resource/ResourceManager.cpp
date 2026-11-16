@@ -108,7 +108,20 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
 
     // Cache the starts_with check to avoid repeated string comparisons
     const bool isAltPath = identifier.Path.starts_with(IResource::gAltAssetPrefix);
-    const bool shouldCheckAlt = !loadExact && mAltAssetsEnabled && !isAltPath;
+    const bool isOverlayPath = identifier.Path.starts_with(IResource::gOverlayAssetPrefix);
+
+    // New Dawn: the generated overlay archive (3DS character models) sits above alt assets and is its own switch.
+    if (!loadExact && mOverlayEnabled && !isOverlayPath && !isAltPath) {
+        std::string overlayPath = IResource::gOverlayAssetPrefix;
+        overlayPath += identifier.Path;
+        auto overlayResource =
+            LoadResourceProcess({ std::move(overlayPath), identifier.Owner, identifier.Parent }, loadExact, initData);
+        if (overlayResource != nullptr) {
+            return overlayResource;
+        }
+    }
+
+    const bool shouldCheckAlt = !loadExact && mAltAssetsEnabled && !isAltPath && !isOverlayPath;
 
     // Attempt to load the alternate version of the asset, if we fail then we continue trying to load the standard
     // asset.
@@ -133,7 +146,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
 
     // Check for resource load errors which can indicate an alternate asset.
     // If we are attempting to load an alternate asset, we can return null
-    if (!loadExact && mAltAssetsEnabled && isAltPath) {
+    if (!loadExact && ((mAltAssetsEnabled && isAltPath) || (mOverlayEnabled && isOverlayPath))) {
         if (std::holds_alternative<ResourceLoadError>(cacheLine)) {
             try {
                 // If we have attempted to cache an alternate asset, but failed, we return nullptr and rely on the
@@ -254,7 +267,16 @@ std::shared_ptr<IResource> ResourceManager::LoadResource(uint64_t crc, bool load
 
 std::variant<ResourceManager::ResourceLoadError, std::shared_ptr<IResource>>
 ResourceManager::CheckCache(const ResourceIdentifier& identifier, bool loadExact) {
-    if (!loadExact && mAltAssetsEnabled && !identifier.Path.starts_with(IResource::gAltAssetPrefix)) {
+    if (!loadExact && mOverlayEnabled && !identifier.Path.starts_with(IResource::gOverlayAssetPrefix) &&
+        !identifier.Path.starts_with(IResource::gAltAssetPrefix)) {
+        const auto overlayPath = IResource::gOverlayAssetPrefix + identifier.Path;
+        auto overlayCacheResult = CheckCache({ overlayPath, identifier.Owner, identifier.Parent }, loadExact);
+        if (std::holds_alternative<std::shared_ptr<IResource>>(overlayCacheResult)) {
+            return overlayCacheResult;
+        }
+    }
+    if (!loadExact && mAltAssetsEnabled && !identifier.Path.starts_with(IResource::gAltAssetPrefix) &&
+        !identifier.Path.starts_with(IResource::gOverlayAssetPrefix)) {
         const auto altPath = IResource::gAltAssetPrefix + identifier.Path;
         auto altCacheResult = CheckCache({ altPath, identifier.Owner, identifier.Parent }, loadExact);
 
@@ -464,6 +486,14 @@ bool ResourceManager::OtrSignatureCheck(const char* fileName) {
 
 bool ResourceManager::IsAltAssetsEnabled() {
     return mAltAssetsEnabled;
+}
+
+bool ResourceManager::IsOverlayEnabled() {
+    return mOverlayEnabled;
+}
+
+void ResourceManager::SetOverlayEnabled(bool isEnabled) {
+    mOverlayEnabled = isEnabled;
 }
 
 void ResourceManager::SetAltAssetsEnabled(bool isEnabled) {
