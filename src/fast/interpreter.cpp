@@ -710,7 +710,8 @@ bool Interpreter::BindMaterialMaps(int tile, int albedoSlot, int normalSlot) {
         return false;
     }
     const auto& path = albedo->GetInitData()->Path;
-    if (!path.starts_with("alt/scenes/"))
+    // Scene textures, the shared scene textures (ground, ocean, swamp) and, since the remastered textures, props (objects/).
+    if (!path.starts_with("alt/scenes/") && !path.starts_with("alt/misc/scene_texture") && !path.starts_with("alt/objects/"))
         return false;
     auto found = mMaterials.find(albedo.get());
     if (found == mMaterials.end()) {
