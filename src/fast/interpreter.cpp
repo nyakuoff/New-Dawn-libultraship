@@ -4403,8 +4403,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // every caster, lit or not.
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
+        // New Dawn: unlit room geometry gets material maps too; its fragments need the world position for a face normal.
+        const bool unlitMaterialVertex = mUnlitMaterialsEnabled && (mRsp->geometry_mode & G_LIGHTING) == 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
-            mGrass || mInterior || mGiRecord || mFlow || mSmooth) {
+            mGrass || mInterior || mGiRecord || mFlow || mSmooth || unlitMaterialVertex) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -4550,7 +4552,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[2] = vn->n[2];
         }
         if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord || mVfx || mFlow ||
-            mSmooth) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
+            mSmooth || unlitMaterialVertex) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -5049,8 +5051,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
+    // Lit geometry (per-pixel lighting) or, with gNewDawn.Materials.Unlit, unlit vertex-coloured geometry whose combiner multiplies a texture by
+    // the vertex colour (the baked light): the maps then add relief shading to the texture before that colour is applied.
+    const bool unlitMaterial = mUnlitMaterialsEnabled && !per_pixel_lighting && (mRsp->geometry_mode & G_LIGHTING) == 0 && !comb->materialBlend;
     const bool materialCandidate =
-        mMaterialsEnabled && per_pixel_lighting && !is_rect && !use_alpha && !texture_edge && !zmode_decal &&
+        mMaterialsEnabled && (per_pixel_lighting || unlitMaterial) && !is_rect && !use_alpha && !texture_edge && !zmode_decal &&
         !use_grayscale && !use_prim_depth && (mRsp->geometry_mode & G_TEXTURE_GEN) == 0 && mRendersToFb && !mFbActive &&
         comb->usedTextures[0] && !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[1].masked &&
         !mRdp->loaded_texture[0].blended && !mRdp->loaded_texture[1].blended && mShaderStack.empty();
@@ -5309,6 +5314,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     }
+    if (materialReady && !per_pixel_lighting) {
+        // Unlit material: the shader orients its face normal toward the camera. The camera position travels in the per-pixel state
+        // (uploaded to the backend when its serial changes); an unlit program takes only that field from it.
+        float eye[4];
+        eye[3] = SolveCameraPosition(eye) ? 1.0f : 0.0f;
+        if (memcmp(eye, mPerPixelLightState.cameraPosition, sizeof(eye)) != 0) {
+            Flush();
+            memcpy(mPerPixelLightState.cameraPosition, eye, sizeof(eye));
+            mPerPixelLightState.serial = ++mPerPixelLightSerial;
+        }
+    }
     if (materialReady) {
         key.options |= SHADER_OPT(MATERIAL_MAPS);
         if (materialTile == 1)
@@ -5443,6 +5459,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 memcpy(&mBufVbo[mBufVboLen], smoothOffsets[i], 6 * sizeof(float));
                 mBufVboLen += 6;
             }
+        } else if (materialReady) { // unlit material: the world position only (see default.shader.glsl, o_unlit_material)
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[0];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[1];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[2];
         }
 
         for (int t = 0; t < 2; t++) {
@@ -8679,6 +8699,9 @@ void Interpreter::StartFrame() {
         mPerPixelLightingEnabled && mRapi->SupportsMaterialMaps() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Enabled", 0) != 0 &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.Strength", 1.0f) > 0.0f;
+    mUnlitMaterialsEnabled =
+        mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Unlit", 1) != 0 &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.UnlitStrength", 0.6f) > 0.0f;
     PumpMaterialLoads();
     mAlphaToCoverageEnabled =
         mRapi->SupportsAlphaToCoverage() &&

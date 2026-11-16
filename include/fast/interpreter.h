@@ -694,6 +694,7 @@ class Interpreter {
     uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
     bool mTextureCacheDebug = false;
     bool mMaterialsEnabled = false;
+    bool mUnlitMaterialsEnabled = false; // New Dawn: material maps on unlit, vertex-coloured geometry (interiors, dungeons)
     bool mCharacterLighting = false;
     uint32_t mMatrixLoadsSinceLights = 0;
     float mCharacterStrength = 1.0f;

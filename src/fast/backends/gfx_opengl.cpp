@@ -185,6 +185,12 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
                         "gNewDawn.Materials.Debug.View", 0));
         const auto& materialAlbedo = textures[mCurrentTextureIds[mCurrentShaderProgram->materialTile]];
         glUniform2f(mCurrentShaderProgram->material_mirror_location, materialAlbedo.mirrorS, materialAlbedo.mirrorT);
+        if (mCurrentShaderProgram->unlit_location >= 0) { // x: normal strength, y: relief shading, z: cavity darkening
+            glUniform4fv(mCurrentShaderProgram->material_eye_location, 1, mPerPixelLightState.cameraPosition);
+            const auto cv = Ship::Context::GetRawInstance()->GetConsoleVariables();
+            const float u = std::clamp(cv->GetFloat("gNewDawn.Materials.UnlitStrength", 0.6f), 0.0f, 2.0f);
+            glUniform3f(mCurrentShaderProgram->unlit_location, 1.0f, u, 0.5f * u);
+        }
         glUniform1f(mCurrentShaderProgram->material_strength_location,
                     std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
                                    "gNewDawn.Materials.Strength", 1.0f),
@@ -508,7 +514,9 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_prim_depth", cc_features.opt_prim_depth },
         { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
-        { "o_material_maps", cc_features.opt_material_maps },
+        // Material maps on lit geometry; the same maps on unlit, vertex-coloured geometry take the self-contained o_unlit_material path.
+        { "o_material_maps", cc_features.opt_material_maps && cc_features.opt_per_pixel_lighting },
+        { "o_unlit_material", cc_features.opt_material_maps && !cc_features.opt_per_pixel_lighting },
         { "material_tile", cc_features.opt_material_tile1 ? 1 : 0 },
         { "material_blend", cc_features.opt_material_blend && cc_features.c[0][0][2] >= SHADER_INPUT_1 &&
                                 cc_features.c[0][0][2] <= SHADER_INPUT_7 },
@@ -616,7 +624,8 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_per_pixel_lighting", cc_features.opt_per_pixel_lighting },
         { "o_smooth", cc_features.opt_smooth },
-        { "o_material_maps", cc_features.opt_material_maps },
+        { "o_material_maps", cc_features.opt_material_maps && cc_features.opt_per_pixel_lighting },
+        { "o_unlit_material", cc_features.opt_material_maps && !cc_features.opt_per_pixel_lighting },
         { "material_tile", cc_features.opt_material_tile1 ? 1 : 0 },
         { "material_blend", cc_features.opt_material_blend && cc_features.c[0][0][2] >= SHADER_INPUT_1 &&
                                 cc_features.c[0][0][2] <= SHADER_INPUT_7 },
@@ -836,6 +845,14 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     }
 #endif
     glLinkProgram(shader_program);
+    if (cc_features.opt_material_maps && !cc_features.opt_per_pixel_lighting) { // New Dawn unlit materials: report a failed link
+        glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+        if (!success) {
+            char log[2048] = {};
+            glGetProgramInfoLog(shader_program, sizeof(log) - 1, nullptr, log);
+            SPDLOG_ERROR("Unlit material program failed to link: {}", log);
+        }
+    }
     if (cc_features.opt_smooth) {
         glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
         if (!success) {
@@ -858,6 +875,10 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         prg->attribSizes[cnt] = 3;
         ++cnt;
 
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
+    } else if (cc_features.opt_material_maps) { // unlit material: the world position alone
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aViewPos");
         prg->attribSizes[cnt] = 3;
         ++cnt;
@@ -950,6 +971,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_view_matrix_location = glGetUniformLocation(shader_program, "uViewMatrix");
     prg->per_pixel_shade_mask_location = glGetUniformLocation(shader_program, "uShadeMask");
     prg->material_mirror_location = glGetUniformLocation(shader_program, "uMaterialMirror");
+    prg->unlit_location = glGetUniformLocation(shader_program, "uNdUnlit");
     prg->stochastic_location = glGetUniformLocation(shader_program, "uNdStoch");
     prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
     prg->material_debug_location = glGetUniformLocation(shader_program, "uMaterialDebug");
