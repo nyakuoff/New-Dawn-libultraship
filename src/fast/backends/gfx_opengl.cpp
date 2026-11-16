@@ -172,6 +172,11 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
 
         GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+
+        if (mCurrentShaderProgram->stochastic_location >= 0) {
+            GLint stochastic[2] = { textures[mCurrentTextureIds[0]].stochastic, textures[mCurrentTextureIds[1]].stochastic };
+            glUniform1iv(mCurrentShaderProgram->stochastic_location, 2, stochastic);
+        }
     }
 
     if (mCurrentShaderProgram->material_strength_location >= 0) {
@@ -945,6 +950,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_view_matrix_location = glGetUniformLocation(shader_program, "uViewMatrix");
     prg->per_pixel_shade_mask_location = glGetUniformLocation(shader_program, "uShadeMask");
     prg->material_mirror_location = glGetUniformLocation(shader_program, "uMaterialMirror");
+    prg->stochastic_location = glGetUniformLocation(shader_program, "uNdStoch");
     prg->material_strength_location = glGetUniformLocation(shader_program, "uMaterialStrength");
     prg->material_debug_location = glGetUniformLocation(shader_program, "uMaterialDebug");
     prg->material_parallax_location = glGetUniformLocation(shader_program, "uMaterialParallax");
@@ -1117,6 +1123,8 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     }
 
     TextureInfo& texture = textures[mCurrentTextureIds[tile]];
+    texture.stochastic = (cms & 0x100) != 0; // New Dawn: extra bit from the interpreter, not a wrap mode
+    cms &= ~0x100u;
     texture.mirrorS = (cms & G_TX_MIRROR) != 0;
     texture.mirrorT = (cmt & G_TX_MIRROR) != 0;
     const bool mipmapsEnabled = mMipmapsEnabled;

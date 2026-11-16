@@ -6,6 +6,8 @@
 
 #define TEX_FLAG_LOAD_AS_RAW (1 << 0)
 #define TEX_FLAG_LOAD_AS_IMG (1 << 1)
+// New Dawn: an isotropic remastered material (grass, dirt, rock, plaster); sampled stochastically so it does not visibly repeat.
+#define TEX_FLAG_NEWDAWN_STOCH (1 << 8)
 
 namespace Fast {
 enum class TextureType {

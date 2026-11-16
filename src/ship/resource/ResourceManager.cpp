@@ -121,18 +121,21 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         }
     }
 
-    const bool shouldCheckAlt = !loadExact && mAltAssetsEnabled && !isAltPath && !isOverlayPath;
+    const bool shouldCheckAlt = !loadExact && IsAltLookupActive() && !isAltPath && !isOverlayPath;
 
     // Attempt to load the alternate version of the asset, if we fail then we continue trying to load the standard
     // asset.
     if (shouldCheckAlt) {
         std::string altPath = IResource::gAltAssetPrefix;
         altPath += identifier.Path;
-        auto altResource =
-            LoadResourceProcess({ std::move(altPath), identifier.Owner, identifier.Parent }, loadExact, initData);
+        // New Dawn: with only the remastered-textures switch on, community alt assets must not apply.
+        if (AltLookupAllowed(altPath)) {
+            auto altResource =
+                LoadResourceProcess({ std::move(altPath), identifier.Owner, identifier.Parent }, loadExact, initData);
 
-        if (altResource != nullptr) {
-            return altResource;
+            if (altResource != nullptr) {
+                return altResource;
+            }
         }
     }
 
@@ -146,7 +149,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
 
     // Check for resource load errors which can indicate an alternate asset.
     // If we are attempting to load an alternate asset, we can return null
-    if (!loadExact && ((mAltAssetsEnabled && isAltPath) || (mOverlayEnabled && isOverlayPath))) {
+    if (!loadExact && ((IsAltLookupActive() && isAltPath) || (mOverlayEnabled && isOverlayPath))) {
         if (std::holds_alternative<ResourceLoadError>(cacheLine)) {
             try {
                 // If we have attempted to cache an alternate asset, but failed, we return nullptr and rely on the
@@ -275,8 +278,9 @@ ResourceManager::CheckCache(const ResourceIdentifier& identifier, bool loadExact
             return overlayCacheResult;
         }
     }
-    if (!loadExact && mAltAssetsEnabled && !identifier.Path.starts_with(IResource::gAltAssetPrefix) &&
-        !identifier.Path.starts_with(IResource::gOverlayAssetPrefix)) {
+    if (!loadExact && IsAltLookupActive() && !identifier.Path.starts_with(IResource::gAltAssetPrefix) &&
+        !identifier.Path.starts_with(IResource::gOverlayAssetPrefix) &&
+        AltLookupAllowed(IResource::gAltAssetPrefix + identifier.Path)) {
         const auto altPath = IResource::gAltAssetPrefix + identifier.Path;
         auto altCacheResult = CheckCache({ altPath, identifier.Owner, identifier.Parent }, loadExact);
 
@@ -498,6 +502,33 @@ void ResourceManager::SetOverlayEnabled(bool isEnabled) {
 
 void ResourceManager::SetAltAssetsEnabled(bool isEnabled) {
     mAltAssetsEnabled = isEnabled;
+}
+
+bool ResourceManager::IsRemasterEnabled() {
+    return mRemasterEnabled;
+}
+
+void ResourceManager::SetRemasterEnabled(bool isEnabled) {
+    mRemasterEnabled = isEnabled;
+}
+
+void ResourceManager::SetRemasterArchive(const std::string& archivePath) {
+    mRemasterArchivePath = archivePath;
+}
+
+bool ResourceManager::IsAltLookupActive() {
+    return mAltAssetsEnabled || mRemasterEnabled;
+}
+
+bool ResourceManager::AltLookupAllowed(const std::string& altPath) {
+    if (mAltAssetsEnabled) {
+        return true;
+    }
+    if (!mRemasterEnabled || mRemasterArchivePath.empty()) {
+        return false;
+    }
+    auto archive = mArchiveManager->GetArchiveFromFile(altPath);
+    return archive != nullptr && archive->GetPath() == mRemasterArchivePath;
 }
 
 size_t ResourceManager::GetResourceSize(std::shared_ptr<IResource> resource) {

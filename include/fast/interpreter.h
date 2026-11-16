@@ -699,6 +699,7 @@ class Interpreter {
     float mCharacterStrength = 1.0f;
     struct MaterialMaps {
         std::shared_ptr<Fast::Texture> albedo, normal, roughness;
+        bool detail = false; // New Dawn: role = detail in the generator data; a base layer's maps light the surface first
     };
     // Pointer identity follows the winning albedo resource, including mod reloads. Empty pairs cache misses.
     std::unordered_map<const Fast::Texture*, MaterialMaps> mMaterials;
@@ -711,6 +712,9 @@ class Interpreter {
     std::unordered_set<std::string> mMissingAltTextures;
     // gNewDawn.Textures.AsyncAltLoad, sampled once per frame by PumpAltTextureLoads.
     bool mAsyncAltLoadEnabled = true;
+    // New Dawn: gNewDawn.Textures.LogDraws=1 logs each distinct pair of textures drawn together (layer-role analysis).
+    bool mLogDraws = false;
+    std::unordered_set<std::string> mLoggedDraws;
     bool mResolvedResourceCacheEnabled = false;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();

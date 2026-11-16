@@ -338,6 +338,18 @@ class ResourceManager {
     void SetAltAssetsEnabled(bool isEnabled);
 
     /**
+     * @brief New Dawn: "remastered textures". The generated archive (newdawn-textures.o2r) holds alt/ textures. With
+     * the player's alt-asset (mod) switch off, only entries that live in that archive are used; community packs stay off.
+     */
+    bool IsRemasterEnabled();
+    void SetRemasterEnabled(bool isEnabled);
+    void SetRemasterArchive(const std::string& archivePath);
+    /** @return true when alt lookup is on for any reason (mods or remastered textures). */
+    bool IsAltLookupActive();
+    /** @return whether an alt/ path may be loaded: always with alt assets on, else only from the remaster archive. */
+    bool AltLookupAllowed(const std::string& altPath);
+
+    /**
      * @brief Loads raw file bytes from the archive, bypassing resource deserialization.
      * @param identifier Exact resource identifier.
      * @return Loaded File with raw buffer, or nullptr on failure.
@@ -431,6 +443,8 @@ class ResourceManager {
     std::mutex mMutex;
     bool mAltAssetsEnabled = false;
     bool mOverlayEnabled = false;
+    bool mRemasterEnabled = false;
+    std::string mRemasterArchivePath;
     // Private information for which owner and archive are default.
     uintptr_t mDefaultCacheOwner = 0;
     std::shared_ptr<Archive> mDefaultCacheArchive = nullptr;

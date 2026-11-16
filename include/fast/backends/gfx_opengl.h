@@ -47,6 +47,7 @@ struct ShaderProgram {
     GLint texture_width_location;
     GLint texture_height_location;
     GLint texture_filtering_location;
+    GLint stochastic_location = -1;
     // New Dawn per-pixel lighting uniforms (-1 when the program does not use them).
     GLint per_pixel_light_count_location;
     GLint per_pixel_ambient_location;
@@ -88,6 +89,7 @@ struct TextureInfo {
     bool mipmapped;
     uint8_t bytesPerPixel = 4;
     bool mirrorS = false, mirrorT = false;
+    bool stochastic = false; // New Dawn: sample stochastically (TEX_FLAG_NEWDAWN_STOCH), see default.shader.glsl
     bool mipEligible; // uploaded through the interpreter, not by UI code
 };
 
