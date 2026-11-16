@@ -355,12 +355,42 @@
         }
     @end
 
+    // New Dawn remastered textures: isotropic materials (grass, dirt, rock, plaster) carry TEX_FLAG_NEWDAWN_STOCH and are
+    // sampled stochastically so large surfaces do not visibly repeat: three taps on a skewed triangle grid (Mikkelsen's
+    // hex tiling), each shifted by a hash of its grid vertex, blended by sharpened barycentric weights. Albedo and
+    // material maps share this, so a pixel reads the same patch in all of them.
+    uniform int uNdStoch[2];
+    vec2 ndHash2(vec2 p) {
+        p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+        return fract(sin(p) * 43758.5453);
+    }
+    vec4 ndStochTex(sampler2D tex, vec2 uv, vec2 dx, vec2 dy) {
+        vec2 p = uv * 2.1;
+        vec2 sk = vec2(p.x, -0.57735027 * p.x + 1.15470054 * p.y);
+        vec2 base = floor(sk);
+        vec2 f = fract(sk);
+        float z = 1.0 - f.x - f.y;
+        float s = step(0.0, -z);
+        float s2 = 2.0 * s - 1.0;
+        vec3 w = vec3(-z * s2, s - f.y * s2, s - f.x * s2);
+        w = w * w * w;
+        w /= w.x + w.y + w.z;
+        vec4 c = textureGrad(tex, uv + ndHash2(base + vec2(s, s)), dx, dy) * w.x;
+        c += textureGrad(tex, uv + ndHash2(base + vec2(s, 1.0 - s)), dx, dy) * w.y;
+        c += textureGrad(tex, uv + ndHash2(base + vec2(1.0 - s, s)), dx, dy) * w.z;
+        return c;
+    }
+
     @if(o_material_maps)
         uniform sampler2D uMaterialNormal;
         uniform sampler2D uMaterialRoughness;
         uniform float uMaterialStrength;
         uniform int uMaterialDebug; // 1: specular only, 2: roughness, 3: N.V sign, 4: diffuse only
         uniform vec2 uMaterialMirror;
+        vec4 ndMatTex(sampler2D tex, vec2 uv, vec2 dx, vec2 dy) {
+            if (uNdStoch[@{material_tile}] != 0) return ndStochTex(tex, uv, dx, dy);
+            return textureGrad(tex, uv, dx, dy);
+        }
         // Cotangents use unclamped UV derivatives. The -T direction matches the generator's
         // +Y-up normals (texture rows increase down). Keeping the signed determinant handles
         // mirrored islands; repeat/mirror sampling and tile clamp match the albedo sampler.
@@ -388,7 +418,7 @@
             t = (t - n * dot(n, t)) * handedness;
             b = (b - n * dot(n, b)) * handedness;
             float t2 = dot(t, t), b2 = dot(b, b);
-            vec2 xy = textureGrad(uMaterialNormal, uv, dx, dy).rg * 2.0 - 1.0;
+            vec2 xy = ndMatTex(uMaterialNormal, uv, dx, dy).rg * 2.0 - 1.0;
             // Remove the half-quantum offset of the RG8 flat normal (128,128).
             xy = (xy - vec2(1.0 / 255.0)) * uMaterialStrength * weight;
             xy *= mix(vec2(1.0), 1.0 - 2.0 * mod(floor(uv), 2.0), uMaterialMirror);
@@ -448,23 +478,23 @@
             steps = max(mix(steps, 12.0, smoothstep(180.0, 520.0, dist)), 12.0);
             float layer = 1.0 / steps;
             float depth = 0.0, prevDepth = 0.0;
-            float surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * 0.5, dx, dy).g;
+            float surface = 1.0 - ndMatTex(uMaterialRoughness, uv + q * 0.5, dx, dy).g;
             for (int i = 0; i < 64; ++i) {
                 if (float(i) >= steps || depth >= surface) break;
                 prevDepth = depth;
                 depth += layer;
-                surface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - depth), dx, dy).g;
+                surface = 1.0 - ndMatTex(uMaterialRoughness, uv + q * (0.5 - depth), dx, dy).g;
             }
             // Relief refinement: a linear (classic POM) estimate inside the last layer, then bisection around it,
             // so the hit is not quantised to the layer grid.
-            float before = (1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - prevDepth), dx, dy).g) - prevDepth;
+            float before = (1.0 - ndMatTex(uMaterialRoughness, uv + q * (0.5 - prevDepth), dx, dy).g) - prevDepth;
             float after = surface - depth;
             float lerpDepth = mix(depth, prevDepth, clamp(after / min(after - before, -0.000001), 0.0, 1.0));
             float lo = max(prevDepth, lerpDepth - 0.25 * layer), hi = min(depth, lerpDepth + 0.25 * layer);
             if (hi < lo) { lo = prevDepth; hi = depth; }
             for (int i = 0; i < 5; ++i) {
                 float mid = 0.5 * (lo + hi);
-                float midSurface = 1.0 - textureGrad(uMaterialRoughness, uv + q * (0.5 - mid), dx, dy).g;
+                float midSurface = 1.0 - ndMatTex(uMaterialRoughness, uv + q * (0.5 - mid), dx, dy).g;
                 if (mid >= midSurface) hi = mid; else lo = mid;
             }
             return uv + q * (0.5 - 0.5 * (lo + hi));
@@ -589,6 +619,7 @@
     }
 
     vec4 hookTexture2D(in int id, sampler2D tex, in vec2 uv, in vec2 texSize, in vec2 ddx, in vec2 ddy) {
+        if (uNdStoch[id] != 0) return ndStochTex(tex, uv, ddx, ddy);
     @if(o_three_point_filtering)
         if(texture_filtering[id] == @{FILTER_THREE_POINT}) {
             return filter3point(tex, uv, texSize, ddx, ddy);
@@ -670,7 +701,7 @@
         @if(o_material_maps)
             float materialVariance;
             vec3 materialN = materialNormal(vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}, materialWeight, materialVariance);
-            float materialRoughness = textureGrad(uMaterialRoughness, vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}).r;
+            float materialRoughness = ndMatTex(uMaterialRoughness, vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}).r;
             materialRoughness = clamp(sqrt(materialRoughness * materialRoughness + min(materialVariance, 0.5)), 0.3, 1.0);
             bool materialDiffuse = ((uShadeMask & @{material_diffuse_mask}) != 0) && materialWeight > 0.0;
         @end

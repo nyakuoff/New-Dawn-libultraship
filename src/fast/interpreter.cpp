@@ -509,7 +509,7 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char*
         return rm->LoadResourceProcess(path);
     }
     std::string_view pathView(path);
-    if (!rm->IsAltAssetsEnabled() || pathView.starts_with(Ship::IResource::gAltAssetPrefix) ||
+    if (!rm->IsAltLookupActive() || pathView.starts_with(Ship::IResource::gAltAssetPrefix) ||
         pathView.starts_with(Ship::IResource::gOverlayAssetPrefix)) {
         return rm->LoadResourceProcess(path);
     }
@@ -526,6 +526,9 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char*
     }
 
     std::string altPath = Ship::IResource::gAltAssetPrefix + std::string(pathView);
+    if (!rm->AltLookupAllowed(altPath)) { // remastered textures only: the path is not one of ours
+        return rm->LoadResourceProcess(path);
+    }
 
     auto ready = mReadyAltTextures.find(altPath);
     if (ready != mReadyAltTextures.end()) {
@@ -563,6 +566,8 @@ void Interpreter::PumpAltTextureLoads() {
     // Escape hatch: the previous synchronous path, with no background reads and no fallback frames.
     mAsyncAltLoadEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AsyncAltLoad", 1) != 0;
+    mLogDraws = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.LogDraws", 0) != 0;
+    mStochasticEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.Stochastic", 1) != 0;
     if (!mAsyncAltLoadEnabled) {
         mPendingAltTextures.clear();
         mReadyAltTextures.clear();
@@ -665,6 +670,7 @@ bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
                             return result;
                         result.normal = n;
                         result.roughness = r;
+                        result.detail = entry.value("role", "base") == "detail";
                         SPDLOG_INFO("NewDawn material ready: {}", path);
                         break;
                     }
@@ -5161,13 +5167,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
 
             bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+            // New Dawn: an isotropic remastered material asks the backend for stochastic sampling through one extra bit
+            // of the wrap mode (only where the tile repeats: clamped tiles would sample outside their edge).
+            const auto albedoRes = mRdp->loaded_texture[i].raw_tex_metadata.resource;
+            const bool stochastic = mStochasticEnabled && albedoRes && (albedoRes->Flags & TEX_FLAG_NEWDAWN_STOCH) && !(cms & G_TX_CLAMP) &&
+                                    !(cmt & G_TX_CLAMP) && !((tm >> (2 * i)) & 3);
+            if (stochastic) {
+                cms |= 0x100;
+            }
             if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
                 cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
                 Flush();
 
                 // Set the same sampler params on the blended texture. Needed for opengl.
                 if (mRdp->loaded_texture[i].blended) {
-                    mRapi->SetSamplerParameters(SHADER_FIRST_REPLACEMENT_TEXTURE + i, linear_filter, cms, cmt);
+                    mRapi->SetSamplerParameters(SHADER_FIRST_REPLACEMENT_TEXTURE + i, linear_filter, cms & ~0x100u, cmt);
                 }
 
                 mRapi->SetSamplerParameters(i, linear_filter, cms, cmt);
@@ -5249,6 +5263,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         return;
     }
 
+    if (mLogDraws && comb->usedTextures[0]) { // one line per distinct combination of textures and combiner
+        auto ra = mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].raw_tex_metadata.resource;
+        auto rb = comb->usedTextures[1]
+                      ? mRdp->loaded_texture[mRdp->texture_tile[effective_tile[1]].tmem_index].raw_tex_metadata.resource
+                      : nullptr;
+        const std::string pa = ra ? ra->GetInitData()->Path : "-", pb = comb->usedTextures[1] ? (rb ? rb->GetInitData()->Path : "-") : "";
+        char cm[64];
+        snprintf(cm, sizeof(cm), "|%08x%08x%s", (unsigned)mRdp->combine_mode, (unsigned)(mRdp->combine_mode >> 32), use_2cyc ? "|2cyc" : "");
+        if (mLoggedDraws.insert(pa + "|" + pb + cm).second) {
+            SPDLOG_INFO("TEXDRAW {} | {}{}", pa, pb, cm);
+        }
+    }
     bool materialReady = false;
     int materialTile = 0;
     bool materialBlend = false;
@@ -5259,10 +5285,27 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             materialBlend = comb->materialBlend && a != b;
             // For a real two-albedo blend use that tile's UV and blend weight. LOD aliases
             // share the primary map; unrelated tiles never borrow one another's coordinates.
-            materialReady = BindMaterialMaps(effective_tile[0], 0);
-            if (!materialReady && comb->usedTextures[1] && a != b) {
+            // New Dawn: when tile 0 is a detail layer and tile 1 a base layer (roles from the texture generator), the base
+            // layer's maps light the surface; otherwise tile 0 first, then tile 1 if tile 0 has none.
+            auto isDetail = [&](const std::shared_ptr<Fast::Texture>& t) {
+                auto m = t ? mMaterials.find(t.get()) : mMaterials.end();
+                return m != mMaterials.end() && m->second.detail;
+            };
+            auto hasMaps = [&](const std::shared_ptr<Fast::Texture>& t) {
+                auto m = t ? mMaterials.find(t.get()) : mMaterials.end();
+                return m != mMaterials.end() && m->second.normal && m->second.roughness;
+            };
+            if (comb->usedTextures[1] && a != b && isDetail(a) && hasMaps(b) && !isDetail(b)) {
                 materialTile = 1;
                 materialReady = BindMaterialMaps(effective_tile[1], 1);
+            }
+            if (!materialReady) {
+                materialTile = 0;
+                materialReady = BindMaterialMaps(effective_tile[0], 0);
+                if (!materialReady && comb->usedTextures[1] && a != b) {
+                    materialTile = 1;
+                    materialReady = BindMaterialMaps(effective_tile[1], 1);
+                }
             }
         }
     }
