@@ -536,6 +536,7 @@ class Interpreter {
     // Snapshot the current lights into mPerPixelLightState for the next per-pixel lighting batch.
     void UpdatePerPixelLightingState(uint32_t shadeMask);
     void UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]);
+    void LogCharacterLight(const GfxPerPixelLightingState& state);
 
     // New Dawn smooth characters (docs/SMOOTH_CHARACTERS.md). Actor triangles become curved PN patches in the
     // tessellation stages. What a patch needs from its neighbours (welded normals, creases) does not depend on the
@@ -708,6 +709,13 @@ class Interpreter {
     bool mCharacterLighting = false;
     uint32_t mMatrixLoadsSinceLights = 0;
     float mCharacterStrength = 1.0f;
+    // New Dawn character light fidelity (docs/CHARACTER_LIGHTING.md): neutralise the chroma of the light that reaches actors, a
+    // per-channel highlight shoulder on them, a debug view of the applied light and a log of the light state.
+    float mCharacterLightNeutral = 0.5f;
+    float mCharacterLightShoulder = 0.5f;
+    float mCharacterLightWrap = 0.35f;
+    int mCharacterLightDebug = 0;
+    int mCharacterLightLog = 0;
     struct MaterialMaps {
         std::shared_ptr<Fast::Texture> albedo, normal, roughness;
         bool detail = false; // New Dawn: role = detail in the generator data; a base layer's maps light the surface first

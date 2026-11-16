@@ -271,6 +271,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1i(prg->per_pixel_shade_mask_location, state.shadeMask);
         glUniform1f(prg->per_pixel_quality_location, state.pointLightQuality);
         glUniform4fv(prg->per_pixel_character_location, 1, state.characterLight);
+        if (prg->per_pixel_character_grade_location >= 0) {
+            glUniform4fv(prg->per_pixel_character_grade_location, 1, state.characterGrade);
+        }
         glUniform4fv(prg->material_eye_location, 1, state.cameraPosition);
     }
 }
@@ -985,6 +988,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->material_eye_location = glGetUniformLocation(shader_program, "uMaterialEye");
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
     prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
+    prg->per_pixel_character_grade_location = glGetUniformLocation(shader_program, "uCharGrade");
     prg->smooth = cc_features.opt_smooth;
     prg->smooth_vp_location = glGetUniformLocation(shader_program, "uSmoothVP");
     prg->smooth_params_location = glGetUniformLocation(shader_program, "uSmooth");
