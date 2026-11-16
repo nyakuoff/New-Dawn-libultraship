@@ -1468,6 +1468,7 @@ uniform float uFlipY;  // -1 when the framebuffer is stored vertically flipped
 uniform float uRadius;
 uniform float uMaxPx;
 uniform vec3 uKernel[16];
+uniform int uStep; // 1: one AO texel per pixel; 2: half resolution (every sample position is a full-resolution pixel)
 
 const float kBayer[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
 
@@ -1479,19 +1480,23 @@ vec3 viewPos(ivec2 p, float d) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 q = ivec2(gl_FragCoord.xy);
+    ivec2 p = q * uStep; // full-resolution pixel this texel stands for
     float d0 = fetchDepth(p);
+    // The linear depth of the sample rides in green so the blur can weight by it without fetching the depth buffer.
+    float ld = linDepth(d0);
     if (d0 >= 0.99999) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
     vec3 P = viewPos(p, d0);
 
     // Normal from the neighbours on the side with the smaller depth step, which keeps silhouettes clean.
-    vec3 Pl = viewPos(p + ivec2(-1, 0), fetchDepth(p + ivec2(-1, 0)));
-    vec3 Pr = viewPos(p + ivec2(1, 0), fetchDepth(p + ivec2(1, 0)));
-    vec3 Pd = viewPos(p + ivec2(0, -1), fetchDepth(p + ivec2(0, -1)));
-    vec3 Pu = viewPos(p + ivec2(0, 1), fetchDepth(p + ivec2(0, 1)));
+    ivec2 sx = ivec2(uStep, 0), sy = ivec2(0, uStep);
+    vec3 Pl = viewPos(p - sx, fetchDepth(p - sx));
+    vec3 Pr = viewPos(p + sx, fetchDepth(p + sx));
+    vec3 Pd = viewPos(p - sy, fetchDepth(p - sy));
+    vec3 Pu = viewPos(p + sy, fetchDepth(p + sy));
     bool useR = (p.x == 0) || (p.x < uSize.x - 1 && abs(Pr.z - P.z) < abs(P.z - Pl.z));
     bool useU = (p.y == 0) || (p.y < uSize.y - 1 && abs(Pu.z - P.z) < abs(P.z - Pd.z));
     vec3 dx = useR ? (Pr - P) : (P - Pl);
@@ -1499,7 +1504,7 @@ void main() {
     vec3 n = cross(dx, dy);
     float nl = length(n);
     if (nl < 1e-8) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
     vec3 N = n / nl;
@@ -1516,12 +1521,15 @@ void main() {
     }
     float fade = smoothstep(1.5, 4.0, pxR); // far away the kernel shrinks below a pixel: fade out instead of popping
     if (fade <= 0.0) {
-        oColor = vec4(1.0);
+        oColor = vec4(1.0, ld, 0.0, 1.0);
         return;
     }
 
-    // Rotate the kernel around the normal by a per-pixel angle from a 4x4 pattern; the blur averages it away.
-    float ang = (kBayer[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0 * 6.2831853;
+    // Rotate the kernel around the normal by a per-texel angle from a 4x4 pattern (2x2 at half resolution, so the
+    // pattern spans the same four full-resolution pixels); the blur averages it away.
+    const float kBayer2[4] = float[4](0.0, 2.0, 3.0, 1.0);
+    float ang = uStep == 1 ? (kBayer[(q.y & 3) * 4 + (q.x & 3)] + 0.5) / 16.0 * 6.2831853
+                           : (kBayer2[(q.y & 1) * 2 + (q.x & 1)] + 0.5) / 4.0 * 6.2831853;
     vec3 rv = vec3(cos(ang), sin(ang), 0.0);
     vec3 T = rv - N * dot(rv, N);
     float tl = length(T);
@@ -1547,16 +1555,17 @@ void main() {
         occ += ((-S.z) - sd > bias) ? range : 0.0;
     }
     float ao = 1.0 - occ / 16.0;
-    oColor = vec4(vec3(mix(1.0, ao, fade)), 1.0);
+    oColor = vec4(mix(1.0, ao, fade), ld, 0.0, 1.0);
 }
 )GLSL";
 
 // Depth-aware blur of the AO buffer. Edge-stopping is relative to the AO radius (and a little to the distance, so
 // slanted floors still blur), which keeps the result from bleeding across silhouettes.
 static const char* kBlurLib = R"GLSL(
-uniform sampler2D uAo;
+uniform sampler2D uAo;  // red: occlusion, green: linear depth of the sample
 uniform ivec2 uDir;
 uniform float uRadius;
+uniform int uAoShift;   // log2 of the full-resolution pixels per AO texel side (1 for the half-resolution raw buffer, else 0)
 
 float blurAo(ivec2 p) {
     float dc = linDepth(fetchDepth(p));
@@ -1565,12 +1574,15 @@ float blurAo(ivec2 p) {
     float wsum = 0.0;
     for (int i = -4; i <= 4; i++) {
         ivec2 q = clamp(p + uDir * i, ivec2(0), uSize - 1);
-        float dz = (linDepth(fetchDepth(q)) - dc) / sigma;
+        vec2 t = texelFetch(uAo, q >> uAoShift, 0).rg;
+        float dz = (t.g - dc) / sigma;
         float w = exp(-dz * dz);
-        sum += texelFetch(uAo, q, 0).r * w;
+        sum += t.r * w;
         wsum += w;
     }
-    return sum / wsum;
+    // A half-resolution texel can belong to another surface than the pixel (a silhouette): when no tap matches the
+    // pixel's depth, take the nearest texel's occlusion instead of dividing zero by zero.
+    return wsum > 1e-4 ? sum / wsum : texelFetch(uAo, p >> uAoShift, 0).r;
 }
 )GLSL";
 
@@ -1579,7 +1591,7 @@ in vec2 vUv;
 out vec4 oColor;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    oColor = vec4(vec3(blurAo(p)), 1.0);
+    oColor = vec4(blurAo(p), linDepth(fetchDepth(p)), 0.0, 1.0);
 }
 )GLSL";
 
@@ -5501,6 +5513,56 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
     mHdrActive = false;
 }
 
+// True when at least one water box's surface (its rectangle plus a 300 unit margin for waves and shore foam, and from
+// just below the plane to 300 above it for wave crests) touches the camera's view pyramid. A bed, caustics or a
+// refracted shore are only ever seen through the surface's own screen footprint, so the surface is what to test.
+// The scene's nearest 16 boxes are always submitted, so a field with a pond far behind the camera used to run the water
+// passes and the opaque colour/depth copy for nothing. Only the four side planes are tested (conservative).
+static bool WaterBoxInView(const NewDawnPostFxParams& params) {
+    if (!params.shadowUseExactProj || params.waterUnderwaterState > 0.0f) { // submerged: the bed is seen from below the surface
+        return params.waterBoxCount > 0;
+    }
+    const float* M = params.shadowViewProj;
+    const float invScale = params.shadowNdcXScale > 1e-6f ? 1.0f / params.shadowNdcXScale : 1.0f;
+    float planes[4][4];
+    // clip = M * (x, y, z, 1) with M[4 * column + row]; row r of the matrix is (M[r], M[4 + r], M[8 + r], M[12 + r]).
+    auto row = [&](int r, float s, float* out) {
+        for (int c = 0; c < 4; c++) {
+            out[c] = M[4 * c + r] * s;
+        }
+    };
+    float r0[4], r1[4], r3[4];
+    row(0, invScale, r0);
+    row(1, 1.0f, r1);
+    row(3, 1.0f, r3);
+    for (int c = 0; c < 4; c++) {
+        planes[0][c] = r3[c] + r0[c];
+        planes[1][c] = r3[c] - r0[c];
+        planes[2][c] = r3[c] + r1[c];
+        planes[3][c] = r3[c] - r1[c];
+    }
+    const int count = std::clamp(params.waterBoxCount, 0, NEWDAWN_MAX_WATER_BOXES);
+    for (int i = 0; i < count; i++) {
+        const float* b = params.waterBoxes[i];
+        const float lo[3] = { b[0] - 300.0f, b[4] - 60.0f, b[1] - 300.0f };
+        const float hi[3] = { b[2] + 300.0f, b[4] + 300.0f, b[3] + 300.0f };
+        bool outside = false;
+        for (const auto& p : planes) {
+            const float x = p[0] >= 0.0f ? hi[0] : lo[0];
+            const float y = p[1] >= 0.0f ? hi[1] : lo[1];
+            const float z = p[2] >= 0.0f ? hi[2] : lo[2];
+            if (p[0] * x + p[1] * y + p[2] * z + p[3] < 0.0f) {
+                outside = true;
+                break;
+            }
+        }
+        if (!outside) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex,
                    const float* shadowPositions, uint32_t shadowVertexCount) {
     if (!mUsable || fb.width < 8 || fb.height < 8) {
@@ -5530,12 +5592,14 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
                       params.giEnabled && params.giStrength > 0.0f && params.shadowUseExactProj &&
                       mGiGather.id && mGiFilter.id && mGiApply.id && s.debugView == 0 && s.shadowDebug == 0;
     if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGi) mGiValid = false;
+    // No water box in view: skip the water passes and the opaque copy (gNewDawn.Perf.WaterCull=0 turns this off).
+    const bool waterInView = params.waterBoxCount > 0 && (CvInt("gNewDawn.Perf.WaterCull", 1) == 0 || WaterBoxInView(params));
     const bool captureWater = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END &&
                               (params.waterReflections != 0 || params.waterFoam > 0.0f ||
                                params.waterRefraction > 0.0f || params.waterRestyle > 0.0f) &&
-                              params.waterBoxCount > 0 && params.shadowUseExactProj != 0;
+                              waterInView && params.shadowUseExactProj != 0;
     // The water surface runs before the soft-sprite effects (NEWDAWN_POSTFX_STAGE_WATER_XLU) so splashes and ripples draw above it
-    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && params.waterBoxCount > 0 &&
+    const bool doWater = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 && waterInView &&
                          params.shadowUseExactProj != 0;
     // Waterfalls do not need a water plane: a fall can have no WaterBox near it (docs/WATER_SIM.md).
     const bool doFalls = stage == NEWDAWN_POSTFX_STAGE_WATER_XLU && params.waterEnabled != 0 &&
@@ -5578,7 +5642,7 @@ void PostFxGL::Run(int stage, const NewDawnPostFxParams& params, const Framebuff
     if (stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && !doGrass)
         mGrassGroundReady = false;
     const bool doCaustics = stage == NEWDAWN_POSTFX_STAGE_OPAQUE_END && params.waterCaustics > 0.0f &&
-                            params.waterBoxCount > 0 && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
+                            waterInView && params.shadowUseExactProj && mCaustics.id && s.debugView == 0 &&
                             s.shadowDebug == 0;
     const bool doUnderwater = stage == NEWDAWN_POSTFX_STAGE_SCENE_END && params.waterUnderwater > 0.0f &&
                               params.waterUnderwaterState > 0.0f && params.shadowUseExactProj && mUnderwater.id &&
@@ -8161,8 +8225,11 @@ void PostFxGL::RunPointShadows(const NewDawnPostFxParams& params) {
 
 void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const FramebufferOGL& fb, const Settings& s) {
     const int w = fb.width, h = fb.height;
-    EnsureTarget(mAoRaw, w, h, GL_R16F, GL_RED, GL_FLOAT, false, false);
-    EnsureTarget(mAoBlur, w, h, GL_R16F, GL_RED, GL_FLOAT, false, false);
+    // Raw occlusion at half resolution (gNewDawn.PostFx.AO.HalfRes, default 1): the kernel is wide and the two depth-aware
+    // blurs below average it over far more than a pixel anyway. Red holds the occlusion, green the sample's linear depth.
+    const int aoStep = CvInt("gNewDawn.PostFx.AO.HalfRes", 1) != 0 ? 2 : 1;
+    EnsureTarget(mAoRaw, (w + aoStep - 1) / aoStep, (h + aoStep - 1) / aoStep, GL_RG16F, GL_RG, GL_FLOAT, false, false);
+    EnsureTarget(mAoBlur, w, h, GL_RG16F, GL_RG, GL_FLOAT, false, false);
     if (!mUsable) {
         return;
     }
@@ -8192,6 +8259,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform1f(Loc("uMaxPx"), maxPx);
     glUniform3fv(Loc("uKernel"), 16, mKernel);
+    glUniform1i(Loc("uStep"), aoStep);
     Draw(mAoRaw);
     CheckError("AO pass");
 
@@ -8205,6 +8273,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uFar"), params.zFar);
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform2i(Loc("uDir"), 1, 0);
+    glUniform1i(Loc("uAoShift"), aoStep - 1);
     Draw(mAoBlur);
     CheckError("AO blur pass");
 
@@ -8218,6 +8287,7 @@ void PostFxGL::RunAmbientOcclusion(const NewDawnPostFxParams& params, const Fram
     glUniform1f(Loc("uFar"), params.zFar);
     glUniform1f(Loc("uRadius"), s.aoRadius);
     glUniform2i(Loc("uDir"), 0, 1);
+    glUniform1i(Loc("uAoShift"), 0);
     glUniform1f(Loc("uStrength"), s.aoStrength);
     glUniform1f(Loc("uFogMul"), fogMul);
     glUniform1f(Loc("uFogOff"), fogOff);
