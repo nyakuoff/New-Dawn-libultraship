@@ -3,6 +3,7 @@
 #include "fast/backends/gfx_opengl_postfx.h"
 #include "fast/newdawn_perf.h"
 #include "fast/newdawn_wind.h"
+#include "fast/newdawn_look.h"
 
 #include <algorithm>
 #include <array>
@@ -48,21 +49,26 @@ static float CvFloat(const char* name, float def) {
     return Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(name, def);
 }
 
+// A look-profile quantity (fast/newdawn_look.h): the player's cvar, or this frame's look scaled by that cvar.
+static float LookCv(int id, float def) {
+    return NewDawnLookValue(NewDawnLookNow(), id, CvFloat(NewDawnLookFieldInfo(id).cvar, def));
+}
+
 static PostFxGL::Settings ReadSettings() {
     PostFxGL::Settings s;
     s.postFxOn = CvInt("gNewDawn.PostFx.Enabled", 1) != 0;
     s.shadowsOn = CvInt("gNewDawn.Shadows.Enabled", 0) != 0;
     s.shadowDebug = CvInt("gNewDawn.Shadows.Debug", 0);
-    s.shadowFloor = std::clamp(CvFloat("gNewDawn.Shadows.Floor", 0.55f), 0.0f, 1.0f);
+    s.shadowFloor = std::clamp(LookCv(NEWDAWN_LOOK_SHADOW_FLOOR, 0.55f), 0.0f, 1.0f);
     s.aoOn = CvInt("gNewDawn.PostFx.AO.Enabled", 1) != 0;
     s.aoStrength = std::clamp(CvFloat("gNewDawn.PostFx.AO.Strength", Defaults::kAoStrength), 0.0f, 4.0f);
     s.aoRadius = std::clamp(CvFloat("gNewDawn.PostFx.AO.Radius", Defaults::kAoRadius), 1.0f, 500.0f);
     s.bloomOn = CvInt("gNewDawn.PostFx.Bloom.Enabled", 1) != 0;
-    s.bloomStrength = std::clamp(CvFloat("gNewDawn.PostFx.Bloom.Strength", Defaults::kBloomStrength), 0.0f, 2.0f);
-    s.bloomThreshold = std::clamp(CvFloat("gNewDawn.PostFx.Bloom.Threshold", Defaults::kBloomThreshold), 0.0f, 16.0f);
+    s.bloomStrength = std::clamp(LookCv(NEWDAWN_LOOK_BLOOM_STRENGTH, Defaults::kBloomStrength), 0.0f, 2.0f);
+    s.bloomThreshold = std::clamp(LookCv(NEWDAWN_LOOK_BLOOM_THRESHOLD, Defaults::kBloomThreshold), 0.0f, 16.0f);
     s.gradeOn = CvInt("gNewDawn.PostFx.Grade.Enabled", 1) != 0;
-    s.contrast = std::clamp(CvFloat("gNewDawn.PostFx.Grade.Contrast", Defaults::kContrast), 0.5f, 1.5f);
-    s.saturation = std::clamp(CvFloat("gNewDawn.PostFx.Grade.Saturation", Defaults::kSaturation), 0.0f, 2.0f);
+    s.contrast = std::clamp(LookCv(NEWDAWN_LOOK_CONTRAST, Defaults::kContrast), 0.5f, 1.5f);
+    s.saturation = std::clamp(LookCv(NEWDAWN_LOOK_SATURATION, Defaults::kSaturation), 0.0f, 2.0f);
     s.debugView = CvInt("gNewDawn.PostFx.Debug.View", 0);
     s.stats = CvInt("gNewDawn.PostFx.Debug.Stats", 0) != 0;
     return s;
@@ -4842,7 +4848,7 @@ static void ComputeSkyLook(const NewDawnPostFxParams& params, const float fog[3]
     const float m = std::clamp(params.skyMood, 0.0f, 1.0f);
     l = {};
     l.overcast = params.skyOvercast;
-    l.coverage = std::lerp(std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast);
+    l.coverage = std::lerp(std::clamp(LookCv(NEWDAWN_LOOK_SKY_COVERAGE, 0.55f), 0.0f, 1.0f), 0.8f, params.skyOvercast);
     l.hazeGrey = 0.65f;
     l.layerBase = 1.6f;
     l.layerThick = 1.8f;
@@ -4927,8 +4933,7 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniform3fv(Loc("uSunDir"), 1, params.skySunDir);
     float fog[3];
     for (int i = 0; i < 3; ++i) {
-        fog[i] =
-            DecodeColor(params.skyFogColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
+        fog[i] = DecodeColor(params.skyFogColor[i]) * std::clamp(LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f), 0.0f, 4.0f);
     }
     glUniform3fv(Loc("uFog"), 1, fog);
     SkyLook look;
@@ -4949,7 +4954,7 @@ void PostFxGL::SetSkyUniforms(const NewDawnPostFxParams& params) {
     glUniform3fv(Loc("uPaletteColor"), 1, palette);
     glUniform1f(Loc("uWeather"), params.skyWeather);
     glUniform1f(Loc("uOvercast"), look.overcast);
-    glUniform1f(Loc("uIntensity"), std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f));
+    glUniform1f(Loc("uIntensity"), std::clamp(LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f), 0.0f, 4.0f));
     glUniform1f(Loc("uCoverage"), look.coverage);
     SetNightUniforms(params);
     // 18/9 m/s drift, gusting with the shared wind when enabled, independent of the game clock, pause,
@@ -5210,7 +5215,7 @@ void PostFxGL::RunPhysicalSky(const NewDawnPostFxParams& params, const Framebuff
 void PostFxGL::RunClouds(const NewDawnPostFxParams& params, const FramebufferOGL& fb) {
     const float strength = std::clamp(CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), 0.0f, 1.0f) *
                            std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
-    const float coverage = std::clamp(CvFloat("gNewDawn.Sky.Coverage", 0.55f), 0.0f, 1.0f);
+    const float coverage = std::clamp(LookCv(NEWDAWN_LOOK_SKY_COVERAGE, 0.55f), 0.0f, 1.0f);
     if (!CvInt("gNewDawn.Sky.Clouds", 0) || strength <= 0.0f || coverage <= 0.0f || !mCloudMarch.id ||
         !mCloudApply.id) {
         return;
@@ -5320,10 +5325,10 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
         !mSkyConvolve.id) {
         return;
     }
-    const float settings[] = { CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f),
-                               CvFloat("gNewDawn.HDR.FogIntensity", 1.0f),
+    const float settings[] = { LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f),
+                               LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f),
                                CvFloat("gNewDawn.Sky.Strength", 1.0f),
-                               CvFloat("gNewDawn.Sky.Coverage", 0.55f),
+                               LookCv(NEWDAWN_LOOK_SKY_COVERAGE, 0.55f),
                                CvFloat("gNewDawn.Sky.CloudStrength", 1.0f),
                                (float)CvInt("gNewDawn.Sky.Clouds", 0),
                                (float)reflections };
@@ -5380,7 +5385,7 @@ void PostFxGL::RunSkyAmbient(const NewDawnPostFxParams& params) {
         return;
     }
     const bool clouds = CvInt("gNewDawn.Sky.Clouds", 0) && mCloudNoise &&
-                        CvFloat("gNewDawn.Sky.Coverage", 0.55f) > 0.0f &&
+                        LookCv(NEWDAWN_LOOK_SKY_COVERAGE, 0.55f) > 0.0f &&
                         CvFloat("gNewDawn.Sky.CloudStrength", 1.0f) > 0.0f;
     const float cloudStrength = std::clamp(CvFloat("gNewDawn.Sky.CloudStrength", 1.0f), 0.0f, 1.0f) *
                                 std::clamp(CvFloat("gNewDawn.Sky.Strength", 1.0f), 0.0f, 1.0f);
@@ -6166,9 +6171,9 @@ void PostFxGL::RunShadows(const NewDawnPostFxParams& params, const FramebufferOG
     float ambient[3], direct[3];
     for (int i = 0; i < 3; ++i) {
         ambient[i] = params.shadowAmbient[i] *
-                     (mHdrActive ? std::clamp(CvFloat("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f) : 1.0f);
+                     (mHdrActive ? std::clamp(LookCv(NEWDAWN_LOOK_FILL_LEVEL, 0.4f), 0.0f, 4.0f) : 1.0f);
         direct[i] = params.shadowDirColor[i] *
-                    (mHdrActive ? std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) : 1.0f);
+                    (mHdrActive ? std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f) : 1.0f);
     }
     glUniform3fv(Loc("uAmbient"), 1, ambient);
     glUniform1i(Loc("uSkyAmbientEnabled"), SkyAmbientActive());
@@ -6552,11 +6557,14 @@ void PostFxGL::RunWaterfalls(const NewDawnPostFxParams& params, const Framebuffe
     const int w = fb.width, h = fb.height;
     float light[3], sky[3], fogColor[3];
     for (int i = 0; i < 3; ++i) {
-        light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+        light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) *
+                                    std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f)
                               : params.waterLightColor[i];
-        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+        sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                  std::clamp(LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f), 0.0f, 4.0f)
                             : params.waterSkyColor[i];
-        fogColor[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f)
+        fogColor[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
+                                       std::clamp(LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f), 0.0f, 4.0f)
                                  : params.waterSkyColor[i];
     }
     float fogMul, fogOff;
@@ -6715,10 +6723,10 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
     float light[3], sky[3];
     for (int i = 0; i < 3; ++i) {
         light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) *
-                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                                    std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f)
                               : params.waterLightColor[i];
         sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
-                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                                  std::clamp(LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f), 0.0f, 4.0f)
                             : params.waterSkyColor[i];
     }
     glUniform3fv(Loc("uLightColor"), 1, light);
@@ -6728,7 +6736,7 @@ void PostFxGL::RunWaterSurface(const NewDawnPostFxParams& params, const Framebuf
     float fogColor[3];
     for (int i = 0; i < 3; ++i) {
         fogColor[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
-                                       std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f)
+                                       std::clamp(LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f), 0.0f, 4.0f)
                                  : params.waterSkyColor[i];
     }
     glUniform1f(Loc("uFogMul"), fogMul);
@@ -6879,10 +6887,10 @@ void PostFxGL::RunUnderwater(const NewDawnPostFxParams& params, const Framebuffe
     float light[3], sky[3];
     for (int i = 0; i < 3; ++i) {
         light[i] = mHdrActive ? DecodeColor(params.waterCausticColor[i]) *
-                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                                    std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f)
                               : params.waterCausticColor[i];
         sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
-                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                                  std::clamp(LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f), 0.0f, 4.0f)
                             : params.waterSkyColor[i];
     }
     const auto setCommon = [&]() {
@@ -6981,10 +6989,10 @@ void PostFxGL::RunWater(const NewDawnPostFxParams& params, const FramebufferOGL&
     float light[3], sky[3];
     for (int i = 0; i < 3; ++i) {
         light[i] = mHdrActive ? DecodeColor(params.waterLightColor[i]) *
-                                    std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f)
+                                    std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f)
                               : params.waterLightColor[i];
         sky[i] = mHdrActive ? DecodeColor(params.waterSkyColor[i]) *
-                                  std::clamp(CvFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f)
+                                  std::clamp(LookCv(NEWDAWN_LOOK_SKY_LEVEL, 1.0f), 0.0f, 4.0f)
                             : params.waterSkyColor[i];
     }
     glUniform3fv(Loc("uLightColor"), 1, light);
@@ -7214,11 +7222,10 @@ void PostFxGL::RunVolumetricFog(const NewDawnPostFxParams& params, const Framebu
     const float sunFade = params.fogVolumetric == 1 && !params.shadowIsMoon ? std::clamp((sunHeight + 0.02f) / 0.22f, 0.0f, 1.0f) : 0.0f;
     float fog[3], sun[3], ambient[3];
     for (int i = 0; i < 3; ++i) {
-        fog[i] = DecodeColor(params.fogColor[i]) *
-                 std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f);
+        fog[i] = DecodeColor(params.fogColor[i]) * std::clamp(LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f), 0.0f, 4.0f);
         ambient[i] = DecodeColor(params.fogAmbient[i]);
         sun[i] = DecodeColor(params.shadowDirColor[i]) * sunFade *
-                 std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f);
+                 std::clamp(LookCv(NEWDAWN_LOOK_KEY_LEVEL, 1.8f), 0.0f, 16.0f);
     }
     Bind(1, mDepth.tex);
     Bind(3, params.fogVolumetric == 2 ? mDepth.tex : mShadowMap.tex);
@@ -7334,7 +7341,7 @@ void PostFxGL::RunSunShafts(const NewDawnPostFxParams& params, const Framebuffer
     float color[3];
     for (int i = 0; i < 3; i++) {
         color[i] = mHdrActive ? 0.6f * DecodeColor(params.shaftFogColor[i]) *
-                                        std::clamp(CvFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f) +
+                                        std::clamp(LookCv(NEWDAWN_LOOK_FOG_LEVEL, 1.0f), 0.0f, 4.0f) +
                                     0.4f * DecodeColor(params.shadowDirColor[i])
                               : 0.6f * params.shaftFogColor[i] + 0.4f * params.shadowDirColor[i];
     }
@@ -8704,7 +8711,7 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa
     glUniform1f(Loc("uBloomStrength"), s.bloomStrength);
     glUniform1i(Loc("uHdr"), mHdrActive);
     glUniform1i(Loc("uDither"), CvInt("gNewDawn.PostFx.Dither.Enabled", 1) != 0);
-    glUniform1f(Loc("uExposure"), std::clamp(CvFloat("gNewDawn.HDR.Exposure", -0.2f), -8.0f, 8.0f));
+    glUniform1f(Loc("uExposure"), std::clamp(LookCv(NEWDAWN_LOOK_EXPOSURE, -0.2f), -8.0f, 8.0f));
     glUniform1i(Loc("uUseGrade"), s.gradeOn ? 1 : 0);
     glUniform1f(Loc("uContrast"), s.contrast);
     glUniform1f(Loc("uSaturation"), s.saturation);

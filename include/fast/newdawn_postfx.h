@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "newdawn_look.h"
 
 /*
  * Parameters for the New Dawn scene post-processing marker (gSPNewDawnPostFx).
@@ -259,4 +260,7 @@ typedef struct NewDawnPostFxParams {
        water with spray. Strengths 0..2, 0 = off; the flow comes from the native texture scroll the interpreter records. */
     float waterRivers;
     float waterFalls;
+    /* Look profiles (newdawn_look.h): the resolved look of this game frame; lookOn 0 = profiles off. */
+    int32_t lookOn;
+    float look[NEWDAWN_LOOK_COUNT];
 } NewDawnPostFxParams;

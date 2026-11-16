@@ -1,4 +1,5 @@
 #include "ship/window/Window.h"
+#include "fast/newdawn_look.h"
 #ifdef ENABLE_OPENGL
 
 #include <stdint.h>
@@ -226,16 +227,25 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     if (HdrWorldActive()) {
         auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sky_location,
-                    mHdrSky ? std::clamp(cvars->GetFloat("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f) : 1.0f);
+                    mHdrSky ? std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_SKY_LEVEL,
+                                                          cvars->GetFloat("gNewDawn.HDR.SkyIntensity", 1.0f)),
+                                         0.0f, 4.0f)
+                            : 1.0f);
         glUniform1f(mCurrentShaderProgram->hdr_fog_location,
-                    std::clamp(cvars->GetFloat("gNewDawn.HDR.FogIntensity", 1.0f), 0.0f, 4.0f));
+                    std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FOG_LEVEL,
+                                                cvars->GetFloat("gNewDawn.HDR.FogIntensity", 1.0f)),
+                               0.0f, 4.0f));
     }
     if (HdrWorldActive() && mCurrentShaderProgram->per_pixel_light_count_location >= 0) {
         auto hdrCvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
         glUniform1f(mCurrentShaderProgram->hdr_sun_location,
-                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f));
+                    std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL,
+                                                hdrCvars->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f)),
+                               0.0f, 16.0f));
         glUniform1f(mCurrentShaderProgram->hdr_ambient_location,
-                    std::clamp(hdrCvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f));
+                    std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FILL_LEVEL,
+                                                hdrCvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f)),
+                               0.0f, 4.0f));
     }
 
     // Uniforms are per-program state, so they are re-applied whenever the light state or the

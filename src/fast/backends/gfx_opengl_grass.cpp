@@ -8,6 +8,7 @@
 // their colour from the finished ground colour behind their root (so per-pixel lighting, fog, time of day and dusk tint
 // all match the ground) and sway with the shared wind. Drawn at the opaque-end marker, before the depth copy.
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_look.h"
 #include "fast/newdawn_wind.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
@@ -513,7 +514,11 @@ void PostFxGL::RunGrass(const NewDawnPostFxParams& p, const FramebufferOGL& fb) 
     glUniform3fv(Loc("uSunDir"), 1, p.grassSunDir);
     float sun[3];
     for (int i = 0; i < 3; ++i)
-        sun[i] = Decode(p.grassSunColor[i]) * std::clamp(CvFloat("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) * 0.5f;
+        sun[i] = Decode(p.grassSunColor[i]) *
+                 std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL,
+                                             CvFloat("gNewDawn.HDR.SunIntensity", 1.8f)),
+                            0.0f, 16.0f) *
+                 0.5f;
     glUniform3fv(Loc("uSunColor"), 1, sun);
     glUniform1f(Loc("uCell"), kCell);
     glUniform1f(Loc("uDistance"), distance);
