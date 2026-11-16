@@ -448,6 +448,11 @@ void Interpreter::GenerateCC(ColorCombiner* comb, const ColorCombinerKey& key) {
             shadeMask |= 1u << j;
     }
     comb->materialShadeMask &= shadeMask;
+    {
+        const auto& a = features.c[0][0];
+        comb->materialTwoLayer = features.opt_2cyc && features.do_multiply[0][0] &&
+                                 ((a[0] == SHADER_TEXEL0 && a[2] == SHADER_TEXEL1) || (a[0] == SHADER_TEXEL1 && a[2] == SHADER_TEXEL0));
+    }
 }
 
 ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& key) {
@@ -605,7 +610,7 @@ void Interpreter::PumpMaterialLoads() {
     }
 }
 
-bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
+bool Interpreter::BindMaterialMaps(int tile, int albedoSlot, int normalSlot) {
     const auto& loaded = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
     auto albedo = loaded.raw_tex_metadata.resource;
     // Full-image companions cannot describe a cropped/subloaded tile or a framebuffer mirror.
@@ -687,8 +692,8 @@ bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
         return false;
     const uint8_t cms = base->second.cms, cmt = base->second.cmt;
     // These slots go idle immediately when a draw is ineligible; they still participate in LRU accounting.
-    for (int slot = MATERIAL_NORMAL_TEXTURE; slot <= MATERIAL_ROUGHNESS_TEXTURE; ++slot) {
-        const auto& texture = slot == MATERIAL_NORMAL_TEXTURE ? maps.normal : maps.roughness;
+    for (int slot = normalSlot; slot <= normalSlot + 1; ++slot) { // normal, then roughness/relief
+        const auto& texture = slot == normalSlot ? maps.normal : maps.roughness;
         TextureCacheKey key{ texture->ImageData, {}, 0, 0, 0, texture->ImageDataSize };
         if (!mRenderingState.mTextures[slot] || mRenderingState.mTextures[slot]->first != key) {
             Flush();
@@ -5314,6 +5319,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     }
+    // New Dawn: a multiplied two-texture draw (base times detail) whose layers both have maps is lit with both pairs.
+    bool materialReady2 = false;
+    if (materialReady && per_pixel_lighting && comb->materialTwoLayer && !materialBlend && comb->usedTextures[0] && comb->usedTextures[1] &&
+        mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].raw_tex_metadata.resource !=
+            mRdp->loaded_texture[mRdp->texture_tile[effective_tile[1]].tmem_index].raw_tex_metadata.resource &&
+        mTwoLayerMaterialsEnabled) {
+        const int other = 1 - materialTile;
+        materialReady2 = BindMaterialMaps(effective_tile[other], other, MATERIAL_NORMAL2_TEXTURE);
+    }
     if (materialReady && !per_pixel_lighting) {
         // Unlit material: the shader orients its face normal toward the camera. The camera position travels in the per-pixel state
         // (uploaded to the backend when its serial changes); an unlit program takes only that field from it.
@@ -5331,6 +5345,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             key.options |= SHADER_OPT(MATERIAL_MAPS_TILE1);
         if (materialBlend)
             key.options |= SHADER_OPT(MATERIAL_MAPS_BLEND);
+        if (materialReady2)
+            key.options |= SHADER_OPT(MATERIAL_MAPS2);
         // Variants have the same input/UV layout as their base. Do not move mPrevCombiner
         // away from that base: bouncing between the two would flush every material triangle.
         auto variant = mColorCombinerPool.find(key);
@@ -8699,6 +8715,8 @@ void Interpreter::StartFrame() {
         mPerPixelLightingEnabled && mRapi->SupportsMaterialMaps() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Enabled", 0) != 0 &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.Strength", 1.0f) > 0.0f;
+    mTwoLayerMaterialsEnabled =
+        mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.TwoLayer", 1) != 0;
     mUnlitMaterialsEnabled =
         mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Unlit", 1) != 0 &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.UnlitStrength", 0.6f) > 0.0f;
@@ -9171,6 +9189,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_material_maps = (shader_id1 & SHADER_OPT(MATERIAL_MAPS)) != 0;
     cc_features->opt_material_tile1 = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_TILE1)) != 0;
     cc_features->opt_material_blend = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_BLEND)) != 0;
+    cc_features->opt_material_maps2 = (shader_id1 & SHADER_OPT(MATERIAL_MAPS2)) != 0;
     cc_features->opt_smooth = (shader_id1 & SHADER_OPT(SMOOTH)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);

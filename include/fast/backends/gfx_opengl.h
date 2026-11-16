@@ -66,6 +66,7 @@ struct ShaderProgram {
     GLint material_parallax_location;
     GLint material_eye_location;
     GLint material_mirror_location;
+    GLint material_mirror2_location = -1; // uMaterialMirror2 (second map pair)
     GLint unlit_location = -1; // New Dawn: uNdUnlit, relief shading of unlit materials
     // New Dawn foliage light (-1 when the program is not a cut-out one).
     GLint fol_frame_location, fol_draw_location, fol_inv_location, fol_view_location;

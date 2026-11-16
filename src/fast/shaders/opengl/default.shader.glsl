@@ -483,6 +483,33 @@
         }
 
 
+    @if(o_material_maps2)
+        uniform sampler2D uMaterialNormal2;
+        uniform sampler2D uMaterialRoughness2;
+        uniform vec2 uMaterialMirror2;
+        vec4 ndMatTex2(sampler2D tex, vec2 uv, vec2 dx, vec2 dy) {
+            if (uNdStoch[1 - @{material_tile}] != 0) return ndStochTex(tex, uv, dx, dy);
+            return textureGrad(tex, uv, dx, dy);
+        }
+        // The second layer's normal in the same world frame as the first; faceN is the unperturbed surface normal.
+        vec3 materialNormal2(vec2 uv, vec2 dx, vec2 dy, float weight, out float variance, out vec3 faceN) {
+            vec3 n, t, b;
+            float det, handedness;
+            materialFrame(dx, dy, n, t, b, det, handedness);
+            faceN = n;
+            t = (t - n * dot(n, t)) * handedness;
+            b = (b - n * dot(n, b)) * handedness;
+            float t2 = dot(t, t), b2 = dot(b, b);
+            vec2 xy = ndMatTex2(uMaterialNormal2, uv, dx, dy).rg * 2.0 - 1.0;
+            xy = (xy - vec2(1.0 / 255.0)) * uMaterialStrength * weight;
+            xy *= mix(vec2(1.0), 1.0 - 2.0 * mod(floor(uv), 2.0), uMaterialMirror2);
+            vec3 mapped = normalize(vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.001))));
+            variance = max(dot(dFdx(mapped), dFdx(mapped)), dot(dFdy(mapped), dFdy(mapped)));
+            if (abs(det) < 1e-12 || min(t2, b2) < 1e-16) return n;
+            return normalize(t * inversesqrt(t2) * mapped.x - b * inversesqrt(b2) * mapped.y + n * mapped.z);
+        }
+    @end
+
         // Parallax occlusion mapping: steep ray march through the companion height (roughness map G,
         // 0.5 = the real surface, class gain baked by the generator) with a linear relief refinement.
         // The ray is unfolded in UV space, so wrap, mirror and clamp samplers behave like the albedo.
@@ -761,7 +788,17 @@
         @if(o_material_maps)
             float materialVariance;
             vec3 materialN = materialNormal(vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}, materialWeight, materialVariance);
+            @if(o_material_maps2)
+                float materialVariance2;
+                vec3 materialFaceN;
+                vec3 materialN2 = materialNormal2(vTexCoordAdj@{1 - material_tile}, ddx@{1 - material_tile}, ddy@{1 - material_tile}, materialWeight, materialVariance2, materialFaceN);
+                materialN = normalize(materialN + materialN2 - materialFaceN);
+                materialVariance = max(materialVariance, materialVariance2);
+            @end
             float materialRoughness = ndMatTex(uMaterialRoughness, vTexCoordAdj@{material_tile}, ddx@{material_tile}, ddy@{material_tile}).r;
+            @if(o_material_maps2)
+                materialRoughness = 0.5 * (materialRoughness + ndMatTex2(uMaterialRoughness2, vTexCoordAdj@{1 - material_tile}, ddx@{1 - material_tile}, ddy@{1 - material_tile}).r);
+            @end
             materialRoughness = clamp(sqrt(materialRoughness * materialRoughness + min(materialVariance, 0.5)), 0.3, 1.0);
             bool materialDiffuse = ((uShadeMask & @{material_diffuse_mask}) != 0) && materialWeight > 0.0;
         @end
