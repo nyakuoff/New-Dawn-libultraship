@@ -3203,6 +3203,7 @@ bool Interpreter::SolveCameraPosition(float out[3]) {
 void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]) {
     state.characterLight[0] = state.characterLight[1] = state.characterLight[2] = state.characterLight[3] = 0.0f;
     state.characterGrade[0] = state.characterGrade[1] = state.characterGrade[2] = state.characterGrade[3] = 0.0f;
+    state.characterMat[1] = state.characterMat[2] = state.characterMat[3] = 0.0f; // [0], the texture's class, is set per draw
     if (!mCharacterLighting || !mRapi->HdrWorldActive()) {
         return;
     }
@@ -3232,9 +3233,101 @@ void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, 
     state.characterGrade[1] = mCharacterLightShoulder;
     state.characterGrade[2] = (float)mCharacterLightDebug;
     state.characterGrade[3] = mCharacterLightWrap;
+    state.characterMat[1] = mCharacterMaterials;
+    state.characterMat[2] = mCharacterRelief;
+    state.characterMat[3] = (float)mCharacterMatTerms;
     if (mCharacterLightLog != 0 && mCharacterStrength > 0.0f) {
         LogCharacterLight(state);
     }
+}
+
+// Material class of a character texture: written into the flags by the 3DS converter, else guessed from the N64 texture's
+// name (gLinkHumanSkinTLUT, gAnju1EyeOpenTex, gGoronBeltTex...). 0 keeps the draw on the original shading.
+static uint8_t ClassFromName(const std::string& path) {
+    std::string name = path;
+    const size_t slash = name.rfind('/');
+    if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+    }
+    // Words of a camel-case name: "gKokiriSwordHandleGripTex" -> kokiri sword handle grip tex.
+    std::vector<std::string> words;
+    std::string cur;
+    for (size_t i = 0; i < name.size(); ++i) {
+        const unsigned char c = (unsigned char)name[i];
+        const bool upper = std::isupper(c) != 0, alnum = std::isalnum(c) != 0;
+        if (!alnum || (upper && !cur.empty() && std::islower((unsigned char)cur.back())) ||
+            (std::isdigit(c) != 0) != (!cur.empty() && std::isdigit((unsigned char)cur.back()) != 0)) {
+            if (!cur.empty()) {
+                words.push_back(cur);
+            }
+            cur.clear();
+        }
+        if (alnum) {
+            cur.push_back((char)std::tolower(c));
+        }
+    }
+    if (!cur.empty()) {
+        words.push_back(cur);
+    }
+    auto has = [&](std::initializer_list<const char*> list) {
+        for (const std::string& w : words) {
+            for (const char* l : list) {
+                if (w == l) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (has({ "tlut", "palette", "shadow", "flame", "fire", "light", "glow", "smoke", "icon", "button", "magic", "spark", "skybox", "heart",
+              "clock", "map", "text", "font", "numbers", "number", "digit" })) {
+        return 0;
+    }
+    if (has({ "eye", "eyes", "mouth", "pupil", "eyebrow", "brow", "lash", "iris" })) {
+        return 4;
+    }
+    if (has({ "hair", "beard", "mane", "mustache", "moustache", "fur" })) {
+        return 3;
+    }
+    if (has({ "leather", "belt", "boot", "boots", "strap", "sheath", "holster", "quiver", "pouch", "satchel", "bag", "grip", "glove", "gloves" })) {
+        return 7;
+    }
+    if (has({ "blade", "sword", "metal", "armor", "armour", "helmet", "clasp", "buckle", "chain", "spear", "gauntlet", "gauntlets", "silver",
+              "gold", "steel", "iron", "pommel", "hookshot" })) {
+        return 5;
+    }
+    if (has({ "skin", "face", "ear", "ears", "nose", "finger", "fingers", "palm", "hand", "hands", "arm", "arms", "leg", "legs", "neck",
+              "forehead", "cheek", "lip", "lips", "head" })) {
+        return 1;
+    }
+    if (has({ "cloth", "clothes", "tunic", "shirt", "shorts", "dress", "cape", "robe", "skirt", "pants", "trouser", "trousers", "sleeve", "sleeves",
+              "scarf", "fabric", "coat", "jacket", "vest", "uniform", "sash", "ribbon", "hat", "cap", "kerchief", "turban", "apron",
+              "blouse", "collar", "poncho", "cloak" })) {
+        return 6;
+    }
+    // The player's own forms: what is not named is the costume atlas (tunic, belt, boots, skin), split by colour in the shader.
+    if (path.find("object_link_") != std::string::npos && name.find("object_link_") == 0) {
+        return 2;
+    }
+    return 0;
+}
+
+uint8_t Interpreter::CharacterTextureClass(const std::shared_ptr<Fast::Texture>& tex) {
+    auto it = mCharClassCache.find(tex.get());
+    if (it != mCharClassCache.end() && it->second.first.lock() == tex) {
+        return it->second.second;
+    }
+    const uint32_t flagged = (tex->Flags & TEX_FLAG_NEWDAWN_CHARCLASS_MASK) >> TEX_FLAG_NEWDAWN_CHARCLASS_SHIFT;
+    const uint8_t cls = flagged != 0 ? (uint8_t)flagged : tex->GetInitData() ? ClassFromName(tex->GetInitData()->Path) : 0;
+    if (mCharClassCache.size() > 4096) {
+        mCharClassCache.clear();
+    }
+    mCharClassCache[tex.get()] = { tex, cls };
+    if (mCharacterLightLog != 0 && cls != 0) {
+        SPDLOG_INFO("NewDawn character texture class {} ({}): {}", (int)cls, flagged != 0 ? "flag" : "name",
+                    tex->GetInitData() ? tex->GetInitData()->Path : std::string("?"));
+    }
+    return cls;
 }
 
 // Measurement aid (gNewDawn.Characters.LightLog=1): the light state that reaches a character draw, roughly once a second
@@ -5189,6 +5282,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
     uint32_t effective_tile[2];
+
+    // New Dawn character materials: the class of this draw's (first used) texture rides with the per-pixel state, 0 for a
+    // draw without a classified texture. The buffered triangles are flushed first when it changes, so each batch keeps the
+    // class it was drawn with.
+    {
+        float cls = 0.0f;
+        if (mCharacterLighting && mCharacterMaterials > 0.0f) {
+            for (int t = 0; t < 2; t++) {
+                if (comb->usedTextures[t]) {
+                    if (const auto res = mRdp->loaded_texture[t].raw_tex_metadata.resource) {
+                        cls = (float)CharacterTextureClass(res);
+                    }
+                    break;
+                }
+            }
+        }
+        if (cls != mPerPixelLightState.characterMat[0]) {
+            Flush();
+            mPerPixelLightState.characterMat[0] = cls;
+            mPerPixelLightState.serial = ++mPerPixelLightSerial;
+        }
+    }
 
     for (int i = 0; i < 2; i++) {
         uint32_t tile = mRdp->first_tile_index + i;
@@ -8866,6 +8981,11 @@ void Interpreter::StartFrame() {
         1.0f);
     mCharacterLightWrap = std::clamp(
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.LightWrap", 0.35f), 0.0f, 1.0f);
+    mCharacterMaterials = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.Materials", 0.8f), 0.0f, 1.0f);
+    mCharacterRelief = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.Relief", 0.6f), 0.0f, 1.0f);
+    mCharacterMatTerms = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Characters.MaterialTerms", 255);
     mCharacterLightDebug = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Characters.LightDebug", 0);
     mCharacterLightLog = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Characters.LightLog", 0);
     mPerPixelPointLightQuality = std::clamp(

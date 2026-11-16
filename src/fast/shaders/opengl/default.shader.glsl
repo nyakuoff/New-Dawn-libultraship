@@ -282,6 +282,7 @@
         // daylight white balance on actors (0 = the scene's light as it is), y: strength of the per-channel highlight shoulder,
         // z: debug view of the applied light (1 total, 2 ambient and sky ambient, 3 lights, 4 applied), w: diffuse wrap.
         uniform vec4 uCharGrade;
+        uniform vec4 uCharMat;
 
         // Same brightness, less hue, and a daylight white balance: the scene's warm sun and warm ambient multiplied onto
         // saturated cloth and skin clip the blue channel, which reads as yellow skin and acid green. The key moves towards a
@@ -311,6 +312,105 @@
         // low-poly, so the rim, the wrap and everything that is not metal read from a softened normal and broad lobes
         // (no facet edges); only bright neutral (metal) texels get a crisp highlight, tinted by their own albedo, plus a
         // reflection of the sky. Both terms are tied to the albedo so dark texels stay dark, and skin hues get no specular.
+        // New Dawn character materials. uCharMat: x class of the texture (0 none, 1 skin, 2 costume, 3 hair, 4 eyes and mouth,
+        // 5 metal, 6 cloth, 7 leather), y strength, z relief. Additive linear radiance on top of the lit albedo: relief taken
+        // from the albedo's own luminance (screen-space derivatives, so no tangents are needed), skin that scatters light red
+        // at the terminator and when backlit, cloth sheen, leather and skin sheen lobes, anisotropic hair bands. A costume atlas
+        // (one texture with tunic, belt, boots and skin) is split into those by colour.
+        vec3 newDawnCharMaterial(vec3 albedoLin, vec3 albedoGamma, vec3 shadeNormal, vec3 ambientIrr) {
+            int cls = int(uCharMat.x + 0.5);
+            if (cls <= 0 || cls == 4 || uCharMat.y <= 0.0) return vec3(0.0);
+            // Derivatives first, before any per-fragment early return.
+            vec3 p = vViewPos;
+            vec3 dpx = dFdx(p), dpy = dFdy(p);
+            float hx = dFdx(dot(albedoGamma, vec3(0.2126, 0.7152, 0.0722))), hy = dFdy(dot(albedoGamma, vec3(0.2126, 0.7152, 0.0722)));
+            vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
+            mat3 cof = mat3(cross(uViewMatrix[1], uViewMatrix[2]), cross(uViewMatrix[2], uViewMatrix[0]), cross(uViewMatrix[0], uViewMatrix[1]));
+            float det0 = dot(uViewMatrix[0], cof[0]);
+            vec3 wn = cof * n * (det0 < 0.0 ? -1.0 : 1.0);
+            wn = length(wn) > 1e-6 ? normalize(wn) : vec3(0.0, 1.0, 0.0);
+            vec3 v = uCharLight.xyz - vViewPos;
+            float vl = length(v);
+            if (vl < 1.0) return vec3(0.0);
+            v /= vl;
+            float fade = 1.0 - smoothstep(250.0, 700.0, vl);
+
+            // Class weights.
+            float mx = max(albedoGamma.r, max(albedoGamma.g, albedoGamma.b));
+            float mn = min(albedoGamma.r, min(albedoGamma.g, albedoGamma.b));
+            float sat = (mx - mn) / max(mx, 0.001);
+            float luma = dot(albedoGamma, vec3(0.2126, 0.7152, 0.0722));
+            float wSkin = 0.0, wCloth = 0.0, wLeather = 0.0, wMetal = 0.0, wHair = 0.0;
+            if (cls == 1) wSkin = 1.0;
+            else if (cls == 3) wHair = 1.0;
+            else if (cls == 5) wMetal = 1.0;
+            else if (cls == 6) wCloth = 1.0;
+            else if (cls == 7) wLeather = 1.0;
+            else {
+                float warm = step(albedoGamma.g, albedoGamma.r) * step(albedoGamma.b, albedoGamma.g);
+                wSkin = warm * smoothstep(0.10, 0.20, sat) * (1.0 - smoothstep(0.50, 0.66, sat)) * smoothstep(0.30, 0.45, luma);
+                float brown = warm * smoothstep(0.30, 0.45, sat) * (1.0 - smoothstep(0.40, 0.56, luma)) * smoothstep(0.04, 0.12, luma);
+                wLeather = brown * (1.0 - wSkin);
+                float gold = warm * smoothstep(0.50, 0.66, sat) * smoothstep(0.46, 0.60, luma);
+                float grey = (1.0 - smoothstep(0.16, 0.34, sat)) * smoothstep(0.24, 0.5, luma) * (1.0 - smoothstep(0.70, 0.86, luma));
+                wMetal = max(gold, grey) * (1.0 - wSkin);
+                wCloth = max(1.0 - wSkin - wLeather - wMetal, 0.0);
+            }
+
+            // Relief from the albedo: the surface gradient of the luminance (Mikkelsen, bump mapping unparametrized surfaces).
+            float classRelief = 1.0 * wCloth + 1.4 * wLeather + 0.8 * wHair + 0.45 * wMetal + 0.25 * wSkin;
+            vec3 r1 = cross(dpy, wn), r2 = cross(wn, dpx);
+            float det = dot(dpx, r1);
+            vec3 grad = sign(det) * (hx * r1 + hy * r2);
+            vec3 nb = normalize(abs(det) * wn - 0.32 * uCharMat.z * classRelief * grad * min(1.0, 80.0 / vl));
+            if (!(abs(det) > 1e-12)) nb = wn;
+            vec3 wnSoft = normalize(wn + 0.5 * v);
+            vec3 nbSoft = normalize(nb + 0.5 * v);
+            float ndv = clamp(dot(nbSoft, v), 0.0, 1.0);
+
+            vec3 tint = albedoLin / max(max(albedoLin.r, max(albedoLin.g, albedoLin.b)), 0.002);
+            vec3 add = vec3(0.0);
+            int tm = int(uCharMat.w + 0.5);
+            float tRelief = (tm & 1) != 0 ? 1.0 : 0.0, tSkin = (tm & 2) != 0 ? 1.0 : 0.0, tCloth = (tm & 4) != 0 ? 1.0 : 0.0,
+                  tLeather = (tm & 8) != 0 ? 1.0 : 0.0, tHair = (tm & 16) != 0 ? 1.0 : 0.0, tSky = (tm & 32) != 0 ? 1.0 : 0.0;
+            vec3 up = vec3(0.0, 1.0, 0.0);
+            vec3 hairT = up - wn * dot(up, wn);
+            hairT = length(hairT) > 0.05 ? normalize(hairT) : vec3(1.0, 0.0, 0.0);
+            for (int i = 0; i < uLightCount; ++i) {
+                if (uLightPositional[i] != 0) continue; // fires and torches colour the diffuse; no extra lobes from them
+                vec3 l = normalize(uViewMatrix * uLightDir[i]);
+                vec3 rad = uLightColor[i] / 255.0 * uHdrSun;
+                rad = mix(rad, vec3(dot(rad, vec3(0.2126, 0.7152, 0.0722))), 0.5 * uCharGrade.x);
+                float nl0 = dot(wn, l);
+                float nl = dot(nb, l);
+                vec3 h = normalize(l + v);
+                float nh = max(dot(nb, h), 0.0);
+                float lit = nl > 0.0 ? 1.0 : 0.0;
+                // Relief shading of the diffuse term.
+                add += tRelief * albedoLin * rad * (max(nl, 0.0) - max(nl0, 0.0)) * classRelief * uCharMat.z * 0.9;
+                // Skin: light that scatters under the surface turns red at the terminator and glows through thin parts.
+                float band = smoothstep(-0.30, 0.05, nl0) * (1.0 - smoothstep(0.05, 0.55, nl0));
+                float back = pow(clamp(dot(-v, l), 0.0, 1.0), 2.5) * (1.0 - clamp(nl0, 0.0, 1.0));
+                add += tSkin * wSkin * albedoLin * rad * (vec3(0.95, 0.32, 0.16) * band * 0.40 + vec3(1.0, 0.38, 0.20) * back * 0.45);
+                add += tSkin * wSkin * rad * lit * (pow(nh, 12.0) * 0.030 + pow(nh, 50.0) * 0.035);
+                // Cloth: a velvet-like sheen that grows towards the silhouette and follows the light.
+                add += tCloth * wCloth * mix(albedoLin * 1.4, vec3(dot(albedoLin, vec3(0.2126, 0.7152, 0.0722)) * 1.4), 0.25) * rad *
+                       pow(1.0 - ndv, 3.0) * smoothstep(-0.35, 0.5, nl0) * 0.55;
+                // Leather: a broad, low highlight.
+                add += tLeather * wLeather * mix(vec3(1.0), tint, 0.5) * rad * lit * (pow(nh, 18.0) * 0.12 + pow(nh, 70.0) * 0.06);
+                // Hair: two anisotropic bands (Kajiya-Kay) along the strands, the second tinted by the hair.
+                vec3 t1 = normalize(hairT + wn * 0.18), t2 = normalize(hairT - wn * 0.28);
+                float s1 = sqrt(max(1.0 - dot(t1, h) * dot(t1, h), 0.0)), s2 = sqrt(max(1.0 - dot(t2, h) * dot(t2, h), 0.0));
+                add += tHair * wHair * rad * smoothstep(-0.15, 0.35, nl0) * (pow(s1, 70.0) * 0.50 + pow(s2, 20.0) * 0.20 * mix(vec3(1.0), tint, 0.7));
+            }
+            // Sky light: cloth sheen and skin scattering from the ambient.
+            add += tSky * wCloth * albedoLin * ambientIrr * pow(1.0 - ndv, 3.0) * 0.45;
+            add += tSky * wSkin * albedoLin * ambientIrr * vec3(1.0, 0.45, 0.30) * (1.0 - ndv) * 0.22;
+            vec3 budget = albedoLin * 0.9 + vec3(0.012);
+            add = budget * add / max(budget + abs(add), vec3(0.000001));
+            return add * uCharMat.y * uCharLight.w * fade;
+        }
+
         vec3 newDawnCharacter(vec3 albedoLin, vec3 albedoGamma, vec3 shadeNormal, vec3 irradiance) {
             vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
             mat3 cof = mat3(cross(uViewMatrix[1], uViewMatrix[2]),
@@ -335,6 +435,13 @@
             float skin = step(albedoGamma.g, albedoGamma.r) * step(albedoGamma.b, albedoGamma.g) *
                          smoothstep(0.10, 0.20, sat) * (1.0 - smoothstep(0.55, 0.75, sat)) *
                          smoothstep(0.22, 0.38, luma);
+            // The texture's material class replaces the albedo guess where it knows better.
+            int matCls = int(uCharMat.x + 0.5);
+            if (uCharMat.y > 0.0 && matCls > 0) {
+                if (matCls == 5) { metal = 1.0; skin = 0.0; }
+                else if (matCls == 1) { metal = 0.0; skin = 1.0; }
+                else if (matCls == 3 || matCls == 6 || matCls == 7) { metal = 0.0; skin = 0.0; }
+            }
             float specWeight = mix(0.07 * (1.0 - skin), 1.0, metal);
 
             // The broad terms read from a normal pulled toward the view: facet borders of the low-poly meshes merge
@@ -956,12 +1063,17 @@
                     texel.rgb *= appliedIrradiance;
                     if (characterLit) {
                         texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal, appliedIrradiance);
+                        texel.rgb += newDawnCharMaterial(albedoLin, albedoGamma, shadeNormal, charAmbient);
                         texel.rgb = charShoulder(texel.rgb, uCharGrade.y);
                         int charDebug = int(uCharGrade.z + 0.5);
                         if (charDebug == 1) texel.rgb = charIrradiance;
                         else if (charDebug == 2) texel.rgb = charAmbient;
                         else if (charDebug == 3) texel.rgb = charIrradiance - charAmbient;
                         else if (charDebug == 4) texel.rgb = appliedIrradiance;
+                        else if (charDebug == 5) {
+                            int dc = int(uCharMat.x + 0.5);
+                            texel.rgb = dc == 1 ? vec3(0.9, 0.5, 0.35) : dc == 2 ? vec3(0.3, 0.3, 0.9) : dc == 3 ? vec3(0.95, 0.85, 0.1) : dc == 4 ? vec3(0.1, 0.8, 0.9) : dc == 5 ? vec3(0.8, 0.8, 0.8) : dc == 6 ? vec3(0.2, 0.8, 0.3) : dc == 7 ? vec3(0.55, 0.3, 0.1) : vec3(0.15);
+                        }
                     }
                 }
             @end

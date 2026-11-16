@@ -173,6 +173,10 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
 
+        if (mCurrentShaderProgram->per_pixel_character_mat_location >= 0) {
+            glUniform4f(mCurrentShaderProgram->per_pixel_character_mat_location, mPerPixelLightState.characterMat[0],
+                        mPerPixelLightState.characterMat[1], mPerPixelLightState.characterMat[2], mPerPixelLightState.characterMat[3]);
+        }
         if (mCurrentShaderProgram->stochastic_location >= 0) {
             GLint stochastic[2] = { textures[mCurrentTextureIds[0]].stochastic, textures[mCurrentTextureIds[1]].stochastic };
             glUniform1iv(mCurrentShaderProgram->stochastic_location, 2, stochastic);
@@ -992,6 +996,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->per_pixel_quality_location = glGetUniformLocation(shader_program, "uPointLightQuality");
     prg->per_pixel_character_location = glGetUniformLocation(shader_program, "uCharLight");
     prg->per_pixel_character_grade_location = glGetUniformLocation(shader_program, "uCharGrade");
+    prg->per_pixel_character_mat_location = glGetUniformLocation(shader_program, "uCharMat");
     prg->smooth = cc_features.opt_smooth;
     prg->smooth_vp_location = glGetUniformLocation(shader_program, "uSmoothVP");
     prg->smooth_params_location = glGetUniformLocation(shader_program, "uSmooth");

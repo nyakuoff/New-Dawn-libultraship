@@ -722,6 +722,13 @@ class Interpreter {
     float mCharacterLightNeutral = 0.5f;
     float mCharacterLightShoulder = 0.5f;
     float mCharacterLightWrap = 0.35f;
+    // Character materials (docs/CHARACTER_LIGHTING.md): strength of the per-class skin, cloth, leather, metal and hair response
+    // and of the relief detail taken from the albedo; the class of a texture comes from its flags or its name.
+    float mCharacterMaterials = 0.8f;
+    float mCharacterRelief = 0.6f;
+    int mCharacterMatTerms = 255; // debug bit mask of the material terms (see newDawnCharMaterial)
+    std::unordered_map<const void*, std::pair<std::weak_ptr<Ship::IResource>, uint8_t>> mCharClassCache;
+    uint8_t CharacterTextureClass(const std::shared_ptr<Fast::Texture>& tex);
     int mCharacterLightDebug = 0;
     int mCharacterLightLog = 0;
     struct MaterialMaps {

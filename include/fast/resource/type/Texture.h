@@ -8,6 +8,11 @@
 #define TEX_FLAG_LOAD_AS_IMG (1 << 1)
 // New Dawn: an isotropic remastered material (grass, dirt, rock, plaster); sampled stochastically so it does not visibly repeat.
 #define TEX_FLAG_NEWDAWN_STOCH (1 << 8)
+// New Dawn: material class of a character texture (bits 9 to 12; 0 = none): 1 skin, 2 costume (cloth, leather and metal told
+// apart per texel), 3 hair, 4 eyes and mouth, 5 metal, 6 cloth, 7 leather. Written by the 3DS character converter; N64
+// character textures are classified by name (interpreter.cpp). See docs/CHARACTER_LIGHTING.md.
+#define TEX_FLAG_NEWDAWN_CHARCLASS_SHIFT 9
+#define TEX_FLAG_NEWDAWN_CHARCLASS_MASK (0xFu << TEX_FLAG_NEWDAWN_CHARCLASS_SHIFT)
 
 namespace Fast {
 enum class TextureType {
