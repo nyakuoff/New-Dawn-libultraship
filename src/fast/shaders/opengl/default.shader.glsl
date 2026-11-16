@@ -199,7 +199,7 @@
         // colour with the same arithmetic evaluated per fragment. Values are kept in the 0..255
         // range the CPU uses, including its per-light truncation, so parity is exact where the
         // interpolated normal and position are constant across a triangle.
-        vec3 newDawnIrradiance(vec3 shadeNormal) {
+        vec3 newDawnIrradianceEx(vec3 shadeNormal, out vec3 ambientPart, float wrap, out vec3 wrapExtra, out vec3 pointPart) {
             vec3 n = shadeNormal / max(length(shadeNormal), 0.0001);
             vec3 lit = (uLightAmbient / 255.0) * uHdrAmbient;
 #ifndef GL_ES
@@ -215,6 +215,9 @@
                 lit = skyAmbientColor(lit,wn);
             }
 #endif
+            ambientPart = max(lit, vec3(0.0));
+            wrapExtra = vec3(0.0);
+            pointPart = vec3(0.0);
             for (int i = 0; i < uLightCount; ++i) {
                 float intensity;
                 if (uLightPositional[i] != 0) {
@@ -225,12 +228,24 @@
                     float attenuation = 1.0 +
                         (dist * uLightAtten[i].x * 2.0 + d2 * uLightAtten[i].y / 8.0) / 65535.0;
                     intensity = clamp(dot(n, clamp(508.0 * lm / d2, -127.0, 127.0)), 0.0, 1.0) / attenuation;
+                    pointPart += intensity * uLightColor[i] / 255.0;
                 } else {
-                    intensity = max(dot(n, uLightDir[i]), 0.0) * uHdrSun;
+                    float nl = dot(n, uLightDir[i]);
+                    intensity = max(nl, 0.0) * uHdrSun;
+                    // Wrapped diffuse (characters): the terminator is soft, the part of the wrap that the plain
+                    // Lambert term lacks is returned separately so the caller can colour it (subsurface).
+                    if (wrap > 0.0) {
+                        wrapExtra += (max((nl + wrap) / (1.0 + wrap), 0.0) * uHdrSun - intensity) * uLightColor[i] / 255.0;
+                    }
                 }
                 lit += intensity * uLightColor[i] / 255.0;
             }
             return max(lit, vec3(0.0));
+        }
+
+        vec3 newDawnIrradiance(vec3 shadeNormal) {
+            vec3 ambientPart, wrapExtra, pointPart;
+            return newDawnIrradianceEx(shadeNormal, ambientPart, 0.0, wrapExtra, pointPart);
         }
 
         vec3 newDawnShade(vec3 shadeNormal) {
@@ -262,6 +277,34 @@
         // New Dawn character lighting. xyz: camera position in the same (world) space as vViewPos; w: strength,
         // 0 for room meshes, the HUD and everything while the feature is off.
         uniform vec4 uCharLight;
+
+        // New Dawn modern character lighting (docs/CHARACTER_LIGHTING.md). x: how far the scene's light colour is moved to a
+        // daylight white balance on actors (0 = the scene's light as it is), y: strength of the per-channel highlight shoulder,
+        // z: debug view of the applied light (1 total, 2 ambient and sky ambient, 3 lights, 4 applied), w: diffuse wrap.
+        uniform vec4 uCharGrade;
+
+        // Same brightness, less hue, and a daylight white balance: the scene's warm sun and warm ambient multiplied onto
+        // saturated cloth and skin clip the blue channel, which reads as yellow skin and acid green. The key moves towards a
+        // warm white, the fill towards a cool one (a remake's sun and sky), each keeping its brightness (Rec.709 luma) and
+        // direction. Local point lights (torches, fires) keep their colour.
+        vec3 charWhiteBalance(vec3 irradiance, vec3 target, float amount) {
+            float y = dot(irradiance, vec3(0.2126, 0.7152, 0.0722));
+            return mix(irradiance, y * target, amount);
+        }
+
+        // Per-channel soft shoulder on the lit actor radiance (scene-linear, before the tonemap): below the knee nothing
+        // changes, above it each channel rolls off towards knee + 1, so a saturated channel stops running away from the
+        // other two (acid greens, hot reds); mid-tones are untouched.
+        vec3 charShoulder(vec3 c, float amount) {
+            const float knee = 0.55;
+            vec3 over = max(c - vec3(knee), vec3(0.0));
+            vec3 rolled = min(c, vec3(knee)) + over / (1.0 + over);
+            // And a soft floor under the weakest channel (17% of the luma): a saturated texel keeps a trace of every channel, as
+            // light scattering in cloth and skin leaves, instead of a pure primary after the display transform.
+            float y = dot(rolled, vec3(0.2126, 0.7152, 0.0722));
+            vec3 lifted = rolled + max(vec3(0.17 * y) - rolled, vec3(0.0)) * 0.8;
+            return mix(c, lifted, amount);
+        }
 
         // Additive linear radiance for lit actor draws: a soft Fresnel rim (sky behind the subject, the scene's own
         // light colours indoors, sun when backlit) and a bounded specular from the same lights. Actor meshes are
@@ -892,13 +935,34 @@
             @if(o_per_pixel_lighting)
                 if (hdrDiffuse) {
                     vec3 albedoLin = texel.rgb;
-                    vec3 charIrradiance = newDawnIrradiance(shadeNormal);
-                    texel.rgb *= charIrradiance;
                     bool characterLit = uCharLight.w > 0.0;
                     @if(o_material_maps)
                         characterLit = characterLit && !materialDiffuse;
                     @end
-                    if (characterLit) texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal, charIrradiance);
+                    vec3 charAmbient, charWrap, charPoint;
+                    vec3 charIrradiance = newDawnIrradianceEx(shadeNormal, charAmbient, characterLit ? uCharGrade.w : 0.0, charWrap, charPoint);
+                    vec3 appliedIrradiance = charIrradiance;
+                    // With the white balance and the wrap both at 0 the light is left exactly as the scene computed it.
+                    if (characterLit && (uCharGrade.x > 0.0 || uCharGrade.w > 0.0)) {
+                        vec3 keyPart = charIrradiance - charAmbient - charPoint;
+                        // Subsurface: light wrapping past the terminator takes on the surface's own colour (skin glows
+                        // red-orange at the edge of the light, cloth deepens), not the light's.
+                        vec3 sss = albedoLin / max(dot(albedoLin, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+                        sss = min(pow(max(sss, vec3(0.0)), vec3(0.6)), vec3(2.5));
+                        vec3 warm = vec3(1.04, 1.0, 0.94), cool = vec3(0.94, 0.99, 1.07);
+                        appliedIrradiance = charWhiteBalance(charAmbient, cool, uCharGrade.x) + charWhiteBalance(keyPart, warm, uCharGrade.x) +
+                                            charWhiteBalance(charWrap, warm, uCharGrade.x) * sss + charPoint;
+                    }
+                    texel.rgb *= appliedIrradiance;
+                    if (characterLit) {
+                        texel.rgb += newDawnCharacter(albedoLin, albedoGamma, shadeNormal, appliedIrradiance);
+                        texel.rgb = charShoulder(texel.rgb, uCharGrade.y);
+                        int charDebug = int(uCharGrade.z + 0.5);
+                        if (charDebug == 1) texel.rgb = charIrradiance;
+                        else if (charDebug == 2) texel.rgb = charAmbient;
+                        else if (charDebug == 3) texel.rgb = charIrradiance - charAmbient;
+                        else if (charDebug == 4) texel.rgb = appliedIrradiance;
+                    }
                 }
             @end
         }
