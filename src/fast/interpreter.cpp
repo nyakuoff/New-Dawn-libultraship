@@ -448,6 +448,11 @@ void Interpreter::GenerateCC(ColorCombiner* comb, const ColorCombinerKey& key) {
             shadeMask |= 1u << j;
     }
     comb->materialShadeMask &= shadeMask;
+    {
+        const auto& a = features.c[0][0];
+        comb->materialTwoLayer = features.opt_2cyc && features.do_multiply[0][0] &&
+                                 ((a[0] == SHADER_TEXEL0 && a[2] == SHADER_TEXEL1) || (a[0] == SHADER_TEXEL1 && a[2] == SHADER_TEXEL0));
+    }
 }
 
 ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& key) {
@@ -618,7 +623,7 @@ void Interpreter::PumpMaterialLoads() {
     }
 }
 
-bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
+bool Interpreter::BindMaterialMaps(int tile, int albedoSlot, int normalSlot) {
     const auto& loaded = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
     auto albedo = loaded.raw_tex_metadata.resource;
     // Full-image companions cannot describe a cropped/subloaded tile or a framebuffer mirror.
@@ -700,8 +705,8 @@ bool Interpreter::BindMaterialMaps(int tile, int albedoSlot) {
         return false;
     const uint8_t cms = base->second.cms, cmt = base->second.cmt;
     // These slots go idle immediately when a draw is ineligible; they still participate in LRU accounting.
-    for (int slot = MATERIAL_NORMAL_TEXTURE; slot <= MATERIAL_ROUGHNESS_TEXTURE; ++slot) {
-        const auto& texture = slot == MATERIAL_NORMAL_TEXTURE ? maps.normal : maps.roughness;
+    for (int slot = normalSlot; slot <= normalSlot + 1; ++slot) { // normal, then roughness/relief
+        const auto& texture = slot == normalSlot ? maps.normal : maps.roughness;
         TextureCacheKey key{ texture->ImageData, {}, 0, 0, 0, texture->ImageDataSize };
         if (!mRenderingState.mTextures[slot] || mRenderingState.mTextures[slot]->first != key) {
             Flush();
@@ -4416,8 +4421,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // every caster, lit or not.
         const bool per_pixel_lighting =
             (mPerPixelLightingEnabled || mRapi->HdrWorldActive()) && (mRsp->geometry_mode & G_LIGHTING) != 0;
+        // New Dawn: unlit room geometry gets material maps too; its fragments need the world position for a face normal.
+        const bool unlitMaterialVertex = mUnlitMaterialsEnabled && (mRsp->geometry_mode & G_LIGHTING) == 0;
         if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) || per_pixel_lighting || mShadowRecording || mWindSway || mVfx ||
-            mGrass || mInterior || mGiRecord || mFlow || mSmooth) {
+            mGrass || mInterior || mGiRecord || mFlow || mSmooth || unlitMaterialVertex) {
             float (*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
@@ -4563,7 +4570,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->normal[2] = vn->n[2];
         }
         if (per_pixel_lighting || mShadowRecording || mWindSway || mGrass || mInterior || mGiRecord || mVfx || mFlow ||
-            mSmooth) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
+            mSmooth || unlitMaterialVertex) { // mVfx: the flame sprites are unlit XLU draws, their world position places the flame light
             d->view_pos[0] = world_pos[0];
             d->view_pos[1] = world_pos[1];
             d->view_pos[2] = world_pos[2];
@@ -5062,8 +5069,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
+    // Lit geometry (per-pixel lighting) or, with gNewDawn.Materials.Unlit, unlit vertex-coloured geometry whose combiner multiplies a texture by
+    // the vertex colour (the baked light): the maps then add relief shading to the texture before that colour is applied.
+    const bool unlitMaterial = mUnlitMaterialsEnabled && !per_pixel_lighting && (mRsp->geometry_mode & G_LIGHTING) == 0 && !comb->materialBlend;
     const bool materialCandidate =
-        mMaterialsEnabled && per_pixel_lighting && !is_rect && !use_alpha && !texture_edge && !zmode_decal &&
+        mMaterialsEnabled && (per_pixel_lighting || unlitMaterial) && !is_rect && !use_alpha && !texture_edge && !zmode_decal &&
         !use_grayscale && !use_prim_depth && (mRsp->geometry_mode & G_TEXTURE_GEN) == 0 && mRendersToFb && !mFbActive &&
         comb->usedTextures[0] && !mRdp->loaded_texture[0].masked && !mRdp->loaded_texture[1].masked &&
         !mRdp->loaded_texture[0].blended && !mRdp->loaded_texture[1].blended && mShaderStack.empty();
@@ -5322,12 +5332,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     }
+    // New Dawn: a multiplied two-texture draw (base times detail) whose layers both have maps is lit with both pairs.
+    bool materialReady2 = false;
+    if (materialReady && per_pixel_lighting && comb->materialTwoLayer && !materialBlend && comb->usedTextures[0] && comb->usedTextures[1] &&
+        mRdp->loaded_texture[mRdp->texture_tile[effective_tile[0]].tmem_index].raw_tex_metadata.resource !=
+            mRdp->loaded_texture[mRdp->texture_tile[effective_tile[1]].tmem_index].raw_tex_metadata.resource &&
+        mTwoLayerMaterialsEnabled) {
+        const int other = 1 - materialTile;
+        materialReady2 = BindMaterialMaps(effective_tile[other], other, MATERIAL_NORMAL2_TEXTURE);
+    }
+    if (materialReady && !per_pixel_lighting) {
+        // Unlit material: the shader orients its face normal toward the camera. The camera position travels in the per-pixel state
+        // (uploaded to the backend when its serial changes); an unlit program takes only that field from it.
+        float eye[4];
+        eye[3] = SolveCameraPosition(eye) ? 1.0f : 0.0f;
+        if (memcmp(eye, mPerPixelLightState.cameraPosition, sizeof(eye)) != 0) {
+            Flush();
+            memcpy(mPerPixelLightState.cameraPosition, eye, sizeof(eye));
+            mPerPixelLightState.serial = ++mPerPixelLightSerial;
+        }
+    }
     if (materialReady) {
         key.options |= SHADER_OPT(MATERIAL_MAPS);
         if (materialTile == 1)
             key.options |= SHADER_OPT(MATERIAL_MAPS_TILE1);
         if (materialBlend)
             key.options |= SHADER_OPT(MATERIAL_MAPS_BLEND);
+        if (materialReady2)
+            key.options |= SHADER_OPT(MATERIAL_MAPS2);
         // Variants have the same input/UV layout as their base. Do not move mPrevCombiner
         // away from that base: bouncing between the two would flush every material triangle.
         auto variant = mColorCombinerPool.find(key);
@@ -5456,6 +5488,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 memcpy(&mBufVbo[mBufVboLen], smoothOffsets[i], 6 * sizeof(float));
                 mBufVboLen += 6;
             }
+        } else if (materialReady) { // unlit material: the world position only (see default.shader.glsl, o_unlit_material)
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[0];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[1];
+            mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[2];
         }
 
         for (int t = 0; t < 2; t++) {
@@ -8692,6 +8728,11 @@ void Interpreter::StartFrame() {
         mPerPixelLightingEnabled && mRapi->SupportsMaterialMaps() &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Enabled", 0) != 0 &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.Strength", 1.0f) > 0.0f;
+    mTwoLayerMaterialsEnabled =
+        mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.TwoLayer", 1) != 0;
+    mUnlitMaterialsEnabled =
+        mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Unlit", 1) != 0 &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.UnlitStrength", 0.6f) > 0.0f;
     PumpMaterialLoads();
     mAlphaToCoverageEnabled =
         mRapi->SupportsAlphaToCoverage() &&
@@ -9161,6 +9202,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_material_maps = (shader_id1 & SHADER_OPT(MATERIAL_MAPS)) != 0;
     cc_features->opt_material_tile1 = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_TILE1)) != 0;
     cc_features->opt_material_blend = (shader_id1 & SHADER_OPT(MATERIAL_MAPS_BLEND)) != 0;
+    cc_features->opt_material_maps2 = (shader_id1 & SHADER_OPT(MATERIAL_MAPS2)) != 0;
     cc_features->opt_smooth = (shader_id1 & SHADER_OPT(SMOOTH)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);

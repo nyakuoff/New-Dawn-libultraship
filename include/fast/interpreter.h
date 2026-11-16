@@ -92,7 +92,8 @@ enum class ShaderOpts {
     MATERIAL_MAPS_TILE1,
     MATERIAL_MAPS_BLEND,
     SMOOTH,       // New Dawn smooth characters: curved patches through tessellation stages
-    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 23
+    MATERIAL_MAPS2, // New Dawn: a second pair of maps for the other layer of a multiplied two-texture draw
+    PRISM_SHADER, // first bit after the shader options, so SHADER_ID_SHIFT must be 24
     MAX
 };
 
@@ -115,7 +116,13 @@ struct ColorCombinerKey {
 #define SHADER_MAX_TEXTURES 6
 #define MATERIAL_NORMAL_TEXTURE 6
 #define MATERIAL_ROUGHNESS_TEXTURE 7
-#define MATERIAL_TEXTURE_SLOTS 8
+// New Dawn: the second pair (tile 1 of a multiplied two-texture draw) lives in slots 8 and 9, which the backend binds to texture units 22 and 23
+// (units 8 and up are postfx's; 22 and 23 are used by no pass).
+#define MATERIAL_NORMAL2_TEXTURE 8
+#define MATERIAL_ROUGHNESS2_TEXTURE 9
+#define MATERIAL_NORMAL2_UNIT 22
+#define MATERIAL_ROUGHNESS2_UNIT 23
+#define MATERIAL_TEXTURE_SLOTS 10
 #define SHADER_FIRST_TEXTURE 0
 #define SHADER_FIRST_MASK_TEXTURE 2
 #define SHADER_FIRST_REPLACEMENT_TEXTURE 4
@@ -136,6 +143,7 @@ struct CCFeatures {
     bool opt_material_maps;
     bool opt_material_tile1;
     bool opt_material_blend;
+    bool opt_material_maps2;
     bool opt_smooth;
     bool usedTextures[2];
     bool used_masks[2];
@@ -159,7 +167,7 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 23;
+constexpr size_t SHADER_ID_SHIFT = 24;
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -387,6 +395,7 @@ struct ColorCombiner {
     uint8_t shader_input_mapping[2][7];
     uint32_t materialShadeMask = 0;
     bool materialBlend = false;
+    bool materialTwoLayer = false; // texel0 x texel1 (base times detail): both layers can carry maps
 };
 
 struct RenderingState {
@@ -472,7 +481,7 @@ class Interpreter {
     std::shared_ptr<Ship::IResource> ResolveTextureResource(const char* path, bool& usedFallback);
     // New Dawn: retire finished alternate texture loads. Called once per frame on the render thread.
     void PumpAltTextureLoads();
-    bool BindMaterialMaps(int tile, int albedoSlot);
+    bool BindMaterialMaps(int tile, int albedoSlot, int normalSlot = MATERIAL_NORMAL_TEXTURE);
     void PumpMaterialLoads();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
@@ -694,6 +703,8 @@ class Interpreter {
     uint64_t mTextureCacheBudgetBytes = 2048ull * 1024 * 1024;
     bool mTextureCacheDebug = false;
     bool mMaterialsEnabled = false;
+    bool mTwoLayerMaterialsEnabled = true; // gNewDawn.Materials.TwoLayer
+    bool mUnlitMaterialsEnabled = false; // New Dawn: material maps on unlit, vertex-coloured geometry (interiors, dungeons)
     bool mCharacterLighting = false;
     uint32_t mMatrixLoadsSinceLights = 0;
     float mCharacterStrength = 1.0f;
