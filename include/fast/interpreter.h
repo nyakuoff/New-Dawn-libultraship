@@ -823,6 +823,7 @@ class Interpreter {
     int64_t mVfxArrowInst = -1;
     // New Dawn grass: world-space ground triangles with a grass texture (NEWDAWN_GRASS_TRI_FLOATS floats each).
     bool mGrass = false, mGrassDebug = false;
+    std::unordered_map<std::string, uint32_t> mGrassOtherGround; // Grass.Debug=2: level ground triangles per unclassified texture
     std::vector<float> mGrassTris;
     // New Dawn world GI: recording is on only inside a room scope, on the frames the renderer asks for geometry.
     bool mGiRecord = false, mGiDebug = false;
