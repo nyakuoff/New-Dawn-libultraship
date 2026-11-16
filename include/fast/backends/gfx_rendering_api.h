@@ -34,6 +34,7 @@ struct GfxPerPixelLightingState {
     int32_t shadeMask;   // bit n set: shader input n comes from the shade colour
     float pointLightQuality;
     float characterLight[4]; // xyz: camera position (world), w: character lighting strength (0 = off for this draw)
+    float characterMat[4];   // x: material class of this draw's texture (set by the interpreter per draw), y: material strength, z: relief strength, w: unused
     float characterGrade[4]; // x: light chroma neutralised (0..1), y: highlight shoulder (0..1), z: debug view, w: diffuse wrap (0..1)
     float cameraPosition[4]; // xyz: camera position (world) for every lit draw, w: 1 when recovered from P
     int32_t serial;
