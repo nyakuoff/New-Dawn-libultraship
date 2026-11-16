@@ -3203,6 +3203,7 @@ bool Interpreter::SolveCameraPosition(float out[3]) {
 // (the HUD's orthographic projection has no such point, so it stays off).
 void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, const float (*mtx)[4]) {
     state.characterLight[0] = state.characterLight[1] = state.characterLight[2] = state.characterLight[3] = 0.0f;
+    state.characterGrade[0] = state.characterGrade[1] = state.characterGrade[2] = state.characterGrade[3] = 0.0f;
     if (!mCharacterLighting || !mRapi->HdrWorldActive()) {
         return;
     }
@@ -3228,6 +3229,37 @@ void Interpreter::UpdateCharacterLightingState(GfxPerPixelLightingState& state, 
     state.characterLight[1] = eye[1];
     state.characterLight[2] = eye[2];
     state.characterLight[3] = mCharacterStrength;
+    state.characterGrade[0] = mCharacterLightNeutral;
+    state.characterGrade[1] = mCharacterLightShoulder;
+    state.characterGrade[2] = (float)mCharacterLightDebug;
+    state.characterGrade[3] = mCharacterLightWrap;
+    if (mCharacterLightLog != 0 && mCharacterStrength > 0.0f) {
+        LogCharacterLight(state);
+    }
+}
+
+// Measurement aid (gNewDawn.Characters.LightLog=1): the light state that reaches a character draw, roughly once a second
+// of draws, with the HDR scales the shader applies. Colours are the scene's own (0..1); `world dir` is the light direction
+// in world space (y up) so the sun's elevation reads off it.
+void Interpreter::LogCharacterLight(const GfxPerPixelLightingState& state) {
+    static uint32_t calls = 0;
+    if (++calls % 900 != 1) {
+        return;
+    }
+    auto cv = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const float sun = cv->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f), amb = cv->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f);
+    std::string msg = fmt::format("NewDawn char light: ambient ({:.3f},{:.3f},{:.3f}) x fill {:.2f}; sun scale {:.2f}; {} lights", state.ambient[0] / 255.0f,
+                                  state.ambient[1] / 255.0f, state.ambient[2] / 255.0f, amb, sun, state.numLights);
+    for (int i = 0; i < state.numLights && i < 6; i++) {
+        const GfxPerPixelLight& l = state.lights[i];
+        const float* m = state.viewMatrix; // column-major model-to-world 3x3
+        float wd[3] = { m[0] * l.dir[0] + m[3] * l.dir[1] + m[6] * l.dir[2], m[1] * l.dir[0] + m[4] * l.dir[1] + m[7] * l.dir[2],
+                        m[2] * l.dir[0] + m[5] * l.dir[1] + m[8] * l.dir[2] };
+        const float len = std::sqrt(wd[0] * wd[0] + wd[1] * wd[1] + wd[2] * wd[2]);
+        msg += fmt::format(" | {} ({:.3f},{:.3f},{:.3f}) {}", l.positional ? "point" : "dir", l.color[0] / 255.0f, l.color[1] / 255.0f,
+                           l.color[2] / 255.0f, l.positional ? std::string("") : fmt::format("world dir y {:.2f}", len > 1e-6f ? wd[1] / len : 0.0f));
+    }
+    SPDLOG_INFO("{}", msg);
 }
 
 // ---- New Dawn smooth characters (docs/SMOOTH_CHARACTERS.md) ------------------------------------------------------
@@ -8827,6 +8859,16 @@ void Interpreter::StartFrame() {
     mCharacterStrength = std::clamp(
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.CharactersStrength", 1.0f),
         0.0f, 2.0f);
+    mCharacterLightNeutral = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.LightNeutral", 0.5f), 0.0f,
+        1.0f);
+    mCharacterLightShoulder = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.LightShoulder", 0.5f), 0.0f,
+        1.0f);
+    mCharacterLightWrap = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Characters.LightWrap", 0.35f), 0.0f, 1.0f);
+    mCharacterLightDebug = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Characters.LightDebug", 0);
+    mCharacterLightLog = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Characters.LightLog", 0);
     mPerPixelPointLightQuality = std::clamp(
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Lighting.PointLightQuality", 0.0f),
         0.0f, 1.0f);
