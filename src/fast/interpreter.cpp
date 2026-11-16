@@ -623,6 +623,82 @@ void Interpreter::PumpMaterialLoads() {
     }
 }
 
+bool Interpreter::ModelviewIsIdentity() const {
+    if (mRsp->modelview_matrix_stack_size <= 0) {
+        return false;
+    }
+    const float(*m)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            const float want = i == j ? 1.0f : 0.0f;
+            if (std::fabs(m[i][j] - want) > 1e-3f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Smooth corner normals for unlit room geometry (see interpreter.h). A position key welds the vertices of neighbouring triangles; the key
+// is the world position quantised to half a unit, which is exact for the integer room meshes.
+void Interpreter::SmoothUnlitNormals(const LoadedVertex* const v[3], float out[3][3]) {
+    auto key = [](const float* p) -> uint64_t {
+        const int64_t x = std::llround(p[0] * 2.0f), y = std::llround(p[1] * 2.0f), z = std::llround(p[2] * 2.0f);
+        uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ULL;
+        h = (h ^ ((uint64_t)y * 0xC2B2AE3D27D4EB4FULL)) * 0x165667B19E3779F9ULL;
+        h = (h ^ ((uint64_t)z * 0x27D4EB2F165667C5ULL)) * 0x9E3779B97F4A7C15ULL;
+        return h ^ (h >> 29);
+    };
+    const float* p0 = v[0]->view_pos;
+    const float* p1 = v[1]->view_pos;
+    const float* p2 = v[2]->view_pos;
+    const float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] }, e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+    float fn[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] }; // area-weighted
+    const float area2 = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+    if (area2 < 1e-4f) {
+        std::memset(out, 0, 9 * sizeof(float)); // degenerate: the shader derives its own
+        return;
+    }
+    const float fu[3] = { fn[0] / area2, fn[1] / area2, fn[2] / area2 };
+    const uint64_t k[3] = { key(p0), key(p1), key(p2) };
+    if (mUnlitNormals.size() > 600000) { // bounded: a new scene refills it in a frame or two
+        mUnlitNormals.clear();
+        mUnlitTriSeen.clear();
+    }
+    const uint64_t tri = (k[0] * 0x9E3779B97F4A7C15ULL) ^ (k[1] * 0xC2B2AE3D27D4EB4FULL) ^ (k[2] * 0x165667B19E3779F9ULL);
+    if (mUnlitTriSeen.insert(tri).second) {
+        for (int c = 0; c < 3; c++) {
+            mUnlitNormals[k[c]].push_back({ fn[0], fn[1], fn[2] });
+        }
+    }
+    constexpr float kCosCrease = 0.766f; // 40 degrees
+    for (int c = 0; c < 3; c++) {
+        float sum[3] = { 0, 0, 0 };
+        auto it = mUnlitNormals.find(k[c]);
+        if (it != mUnlitNormals.end()) {
+            for (const auto& e : it->second) {
+                const float len = std::sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+                if (len < 1e-6f) {
+                    continue;
+                }
+                const float d = (e[0] * fu[0] + e[1] * fu[1] + e[2] * fu[2]) / len;
+                if (std::fabs(d) >= kCosCrease) { // a neighbour wound the other way still shares the surface
+                    const float s = d >= 0 ? 1.0f : -1.0f;
+                    sum[0] += s * e[0];
+                    sum[1] += s * e[1];
+                    sum[2] += s * e[2];
+                }
+            }
+        }
+        const float sl = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+        const float* src = sl > 1e-6f ? sum : fu;
+        const float il = sl > 1e-6f ? 1.0f / sl : 1.0f;
+        out[c][0] = src[0] * il;
+        out[c][1] = src[1] * il;
+        out[c][2] = src[2] * il;
+    }
+}
+
 bool Interpreter::BindMaterialMaps(int tile, int albedoSlot, int normalSlot) {
     const auto& loaded = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
     auto albedo = loaded.raw_tex_metadata.resource;
@@ -5491,6 +5567,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    float unlitNormals[3][3] = {};
+    if (materialReady && !per_pixel_lighting && mUnlitSmoothEnabled && ModelviewIsIdentity()) {
+        SmoothUnlitNormals(v_arr, unlitNormals);
+    }
     float smoothNormals[3][3], smoothOffsets[3][2][3];
     if (smoothTri != nullptr) {
         SmoothSyncCamera();
@@ -5520,10 +5600,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 memcpy(&mBufVbo[mBufVboLen], smoothOffsets[i], 6 * sizeof(float));
                 mBufVboLen += 6;
             }
-        } else if (materialReady) { // unlit material: the world position only (see default.shader.glsl, o_unlit_material)
+        } else if (materialReady) { // unlit material: the world position and a smooth normal (zero: derive in the shader)
             mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[0];
             mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[1];
             mBufVbo[mBufVboLen++] = v_arr[i]->view_pos[2];
+            mBufVbo[mBufVboLen++] = unlitNormals[i][0];
+            mBufVbo[mBufVboLen++] = unlitNormals[i][1];
+            mBufVbo[mBufVboLen++] = unlitNormals[i][2];
         }
 
         for (int t = 0; t < 2; t++) {
@@ -8762,6 +8845,7 @@ void Interpreter::StartFrame() {
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.Strength", 1.0f) > 0.0f;
     mTwoLayerMaterialsEnabled =
         mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.TwoLayer", 1) != 0;
+    mUnlitSmoothEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.UnlitSmooth", 1) != 0;
     mUnlitMaterialsEnabled =
         mMaterialsEnabled && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Materials.Unlit", 1) != 0 &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Materials.UnlitStrength", 0.6f) > 0.0f;

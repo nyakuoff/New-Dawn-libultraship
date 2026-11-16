@@ -705,6 +705,14 @@ class Interpreter {
     bool mTextureCacheDebug = false;
     bool mMaterialsEnabled = false;
     bool mTwoLayerMaterialsEnabled = true; // gNewDawn.Materials.TwoLayer
+    // New Dawn unlit materials: smooth vertex normals for room geometry (gNewDawn.Materials.UnlitSmooth). Room triangles (identity modelview)
+    // are welded by world position; a corner's normal is the area-weighted mean of the neighbouring face normals within 40 degrees of
+    // its own face. Built from the triangles drawn so far, persistent across frames, bounded.
+    bool mUnlitSmoothEnabled = true;
+    std::unordered_map<uint64_t, std::vector<std::array<float, 3>>> mUnlitNormals;
+    std::unordered_set<uint64_t> mUnlitTriSeen;
+    bool ModelviewIsIdentity() const;
+    void SmoothUnlitNormals(const LoadedVertex* const v[3], float out[3][3]);
     bool mUnlitMaterialsEnabled = false; // New Dawn: material maps on unlit, vertex-coloured geometry (interiors, dungeons)
     bool mCharacterLighting = false;
     uint32_t mMatrixLoadsSinceLights = 0;
