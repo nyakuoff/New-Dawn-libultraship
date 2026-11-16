@@ -16,6 +16,7 @@
 //      visibility; added to the HDR scene (dual-source blend, MSAA samples intact).
 // Nothing here reads or writes game state; with gNewDawn.GI.World=0 none of it runs.
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_wind.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 #include <spdlog/spdlog.h>
@@ -477,7 +478,10 @@ int FloorDiv(int a, int b) {
 bool PostFxGL::WorldGiWantsGeometry(uint32_t frameIndex) const {
     // Every frame while a scene settles or the window has just moved (rooms and their textures arrive over several
     // frames), then four times a second: enough to pick up meshes the game starts submitting when the camera turns.
-    return mWgi.ready && mHdrActive && (mWgi.want > 0 || frameIndex % 15u == 0u);
+    // Frozen-frame fixture: the restart on landing needs this frame's geometry, and the cadence counts from the landing.
+    const uint32_t tick = NewDawnFreezeTick().load(std::memory_order_relaxed);
+    const bool restart = mWgi.freezeEpoch != NewDawnFreezeEpoch().load(std::memory_order_relaxed);
+    return mWgi.ready && mHdrActive && (mWgi.want > 0 || restart || (tick != 0 ? tick : frameIndex) % 15u == 0u);
 }
 
 bool PostFxGL::BuildWorldGi() {
@@ -674,9 +678,11 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     const Tier& t = kTiers[tier - 1];
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
-    if (g.tier != tier || g.scene != params.giSceneId ||
+    const uint32_t freezeEpoch = NewDawnFreezeEpoch().load(std::memory_order_relaxed);
+    if (g.tier != tier || g.scene != params.giSceneId || g.freezeEpoch != freezeEpoch ||
         memcmp(g.boundsMin, params.giWorldBoundsMin, sizeof(g.boundsMin)) != 0 ||
         memcmp(g.boundsMax, params.giWorldBoundsMax, sizeof(g.boundsMax)) != 0) {
+        g.freezeEpoch = freezeEpoch;
         ResetWorldGi(params, tier);
     } else {
         // Follow the camera in big scenes. The window only moves once the camera is most of a snap step off-centre,
@@ -745,7 +751,16 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
             const int a = axis == 0 ? 1 : 0, b = axis == 2 ? 1 : 2;
             glViewport(0, 0, 2 * g.dim[a], 2 * g.dim[b]);
             glUniform1i(Loc("uAxis"), axis);
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)mWgiTriCount * 3);
+            if (NewDawnTimeFrozen().load(std::memory_order_relaxed)) {
+                // Frozen-frame fixture: the shader keeps the first triangle to write a voxel, which is a race between
+                // fragments. One triangle per draw with a barrier after each fixes the winner (the draw order).
+                for (uint32_t tri = 0; tri < mWgiTriCount; ++tri) {
+                    glDrawArrays(GL_TRIANGLES, (GLint)tri * 3, 3);
+                    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                }
+            } else {
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)mWgiTriCount * 3);
+            }
         }
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         glBindVertexArray(mVao);
@@ -775,9 +790,9 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     // 30, 0 = every displayed frame), so its cost no longer grows with the interpolated frame rate: the probes follow
     // the sun and the lamps over seconds, a 60 or 144 Hz update bought nothing visible. The first frames of a scene and
     // of a window move always update.
-    const double nowT = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double nowT = NewDawnClockSeconds(); // stands still under gNewDawn.Debug.FreezeTime: only the warm-up sweeps run
     const float updateHz = std::clamp(CvF("gNewDawn.GI.WorldUpdateHz", 30.0f), 0.0f, 1000.0f);
-    const bool step = !frozen && (warm || g.want > 0 || updateHz <= 0.0f || nowT - g.lastUpdateT >= 0.9 / updateHz);
+    const bool step = !frozen && !NewDawnFreezeHold() && (warm || g.want > 0 || updateHz <= 0.0f || nowT - g.lastUpdateT >= 0.9 / updateHz);
     if (step) {
     g.lastUpdateT = nowT;
     Use(g.inject);

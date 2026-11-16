@@ -394,8 +394,7 @@ void PostFxGL::RunAtmos(const NewDawnPostFxParams& p, const FramebufferOGL& fb, 
     auto* vars = Ship::Context::GetRawInstance()->GetConsoleVariables().get();
     const float strength = std::clamp(vars->GetFloat("gNewDawn.Atmos.Strength", 1.0f), 0.0f, 2.0f);
     glUniform1f(Loc("uStrength"), strength);
-    static const auto epoch = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const double seconds = NewDawnClockSeconds();
     // Double precision drift before converting bounded offsets to shader floats.
     const float t = static_cast<float>(seconds);
     glUniform1f(Loc("uTime"), t);

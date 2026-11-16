@@ -1981,6 +1981,10 @@ void Interpreter::SubmitGrass() {
             }
             std::sort(big.rbegin(), big.rend());
             SPDLOG_INFO("GRASSDBG {} triangles recorded", n);
+            for (const auto& [name, count] : mGrassOtherGround) {
+                SPDLOG_INFO("GRASSDBG2 unclassified ground texture {} ({} tris this window)", name, count);
+            }
+            mGrassOtherGround.clear();
             for (size_t k = 0; k < std::min<size_t>(12, big.size()); k++) {
                 const float* t = &mGrassTris[big[k].second * NEWDAWN_GRASS_TRI_FLOATS];
                 SPDLOG_INFO("GRASSDBG tri area {:.0f} centre {:.0f},{:.0f},{:.0f}", big[k].first * 0.5f,
@@ -4442,7 +4446,7 @@ void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
     float jitterX = 0.0f, jitterY = 0.0f, jitterPxX = 0.0f, jitterPxY = 0.0f;
     if (taa) {
         // 16-sample Halton(2,3), centred on the pixel: offsets within (-0.5, 0.5) pixels.
-        const uint32_t i = (frame % 16) + 1;
+        const uint32_t i = (NewDawnTimeFrozen() ? 0u : frame % 16) + 1; // frozen: one fixed jitter phase
         jitterPxX = Halton(i, 2) - 0.5f;
         jitterPxY = Halton(i, 3) - 0.5f;
         jitterX = jitterPxX * 2.0f / w * ndcXScale;
@@ -4899,6 +4903,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
             RecordGrassTriangle(v_arr);
+            // gNewDawn.Grass.Debug=2: also count the level opaque ground triangles whose texture is NOT classified grass, per
+        // texture, so a missing lawn can be traced to the texture that carries it (logged with the recorded-triangle summary).
+        } else if (mGrassDebug && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Grass.Debug", 0) >= 2 &&
+                 (grassOm & G_ZS_PRIM) == 0 && (grassOm & CVG_X_ALPHA) == 0 && lt.raw_tex_metadata.resource != nullptr) {
+            const float* a = v_arr[0]->view_pos;
+            const float* b = v_arr[1]->view_pos;
+            const float* c = v_arr[2]->view_pos;
+            const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+            const float ny = e1[2] * e2[0] - e1[0] * e2[2], nx = e1[1] * e2[2] - e1[2] * e2[1], nz = e1[0] * e2[1] - e1[1] * e2[0];
+            const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 1e-3f && std::fabs(ny) >= 0.85f * len) {
+                mGrassOtherGround[lt.raw_tex_metadata.resource->GetInitData()->Path] += 1;
+            }
         }
         skipGrass:;
     }
@@ -7853,7 +7870,9 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
             // The camera captured at the start of the world; the water time advances with the interpolation fraction
             // (the display list is the newer tick, the interpolated frames run from the previous one towards it).
             gfx->FillShadowCameraParams(effective);
-            effective.waterTime += (gfx->mInterpolationT - 1.0f) * (1.0f / 20.0f);
+            if (!NewDawnTimeFrozen().load(std::memory_order_relaxed)) { // frozen fixture: no per-display-frame phase
+                effective.waterTime += (gfx->mInterpolationT - 1.0f) * (1.0f / 20.0f);
+            }
             if (effective.shadowUseExactProj == 0) {
                 effective.waterEnabled = 0;
             }
@@ -8893,6 +8912,20 @@ void Interpreter::StartFrame() {
     }
 
     auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    // Test fixtures (docs/VALIDATION.md): a stopped render clock makes a frozen game state render identical pixels.
+    {
+        const bool frozenTime = cvars->GetInteger("gNewDawn.Debug.FreezeTime", 0) != 0;
+        NewDawnTimeFrozen().store(frozenTime, std::memory_order_relaxed);
+        auto& tick = NewDawnFreezeTick();
+        if (frozenTime && NewDawnFreezeLanded().load(std::memory_order_relaxed)) {
+            if (tick.load(std::memory_order_relaxed) == 0) {
+                NewDawnFreezeEpoch().fetch_add(1, std::memory_order_relaxed);
+            }
+            tick.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            tick.store(0, std::memory_order_relaxed);
+        }
+    }
     {
         // New Dawn smooth characters (docs/SMOOTH_CHARACTERS.md). The cached analysis depends on what counts as a
         // character and on the crease angle, so a change of either starts it again.

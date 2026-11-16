@@ -2,6 +2,7 @@
 // New Dawn VFX: native effect sprites recorded by the interpreter (clip-space quads, see Interpreter::RecordVfxTriangle)
 // are redrawn as HD HDR sprites from downloaded CC0 art. Render-side only; the native draw is suppressed per class.
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_wind.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 #include <stb_image.h>
@@ -586,8 +587,7 @@ void PostFxGL::RunVfx(const NewDawnPostFxParams& p, const FramebufferOGL& fb) {
     glUniform1i(Loc("uFlameGlow"), Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Lighting.FlameLight", 0) != 0 ? 1 : 0);
     glUniform1f(Loc("uGlowRadius"), std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat("gNewDawn.Vfx.GlowRadius", 0.5f), 0.1f, 2.0f));
     glUniform3f(Loc("uWind"), 0.0f, 0.0f, 0.0f);
-    static const auto epoch = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch).count();
+    const double seconds = NewDawnClockSeconds();
     glUniform1f(Loc("uTime"), static_cast<float>(std::fmod(seconds, 3600.0)));
 
     std::vector<float> flames, glows, puffs, arrows, overlays;
