@@ -15,7 +15,10 @@
     @end
     @if(o_unlit_material)
         @{attr} vec3 aViewPos;
+        @{attr} vec3 aNormal;
         @{out} vec3 vViewPos;
+        @{out} vec3 vNormal;
+        @{update_floats(3)}
         @{update_floats(3)}
     @end
     @if(o_smooth)
@@ -101,6 +104,7 @@
         @end
         @if(o_unlit_material)
             vViewPos = aViewPos;
+            vNormal = aNormal;
         @end
         @if(o_smooth)
             vSmooth0 = aSmooth0;
@@ -395,6 +399,7 @@
     // light from above (MM is Y up) plus the height cavities. The baked colour then multiplies it, so the room keeps its mood.
     @if(o_unlit_material)
         @{attr} vec3 vViewPos;
+        @{attr} vec3 vNormal; // smooth normal of room geometry (the interpreter welds neighbouring triangles); zero: derive it here
         uniform sampler2D uMaterialNormal;
         uniform sampler2D uMaterialRoughness;
         uniform float uMaterialStrength;
@@ -408,10 +413,16 @@
         }
         float ndUnlitShade(vec2 uv, vec2 dx, vec2 dy) {
             vec3 px = dFdx(vViewPos), py = dFdy(vViewPos);
-            vec3 n = cross(px, py);
+            vec3 n = vNormal;
             float nl = length(n);
-            if (nl < 1e-9) return 1.0;
-            n /= nl;
+            if (nl > 0.1) {
+                n /= nl;
+            } else {
+                n = cross(px, py);
+                nl = length(n);
+                if (nl < 1e-9) return 1.0;
+                n /= nl;
+            }
             if (dot(n, (uMaterialEye.w > 0.0 ? uMaterialEye.xyz : vec3(0.0)) - vViewPos) < 0.0) n = -n;
             float det = dx.x * dy.y - dx.y * dy.x;
             float handedness = det < 0.0 ? -1.0 : 1.0;
