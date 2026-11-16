@@ -525,6 +525,19 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveTextureResource(const char*
         }
     }
 
+    // New Dawn: the generated overlay (3DS character models) wins over alternate assets for textures an actor points a
+    // segment at (the converted display lists read the N64 face textures through segment 8/9); without this the HD pack's
+    // N64 face textures would be drawn on the 3DS faces.
+    if (rm->IsOverlayEnabled()) {
+        auto overlay = rm->LoadResourceProcess(Ship::IResource::gOverlayAssetPrefix + std::string(pathView), true);
+        if (overlay != nullptr) {
+            if (mResolvedResourceCacheEnabled) {
+                mResolvedResourceCache[path] = overlay;
+            }
+            return overlay;
+        }
+    }
+
     std::string altPath = Ship::IResource::gAltAssetPrefix + std::string(pathView);
     if (!rm->AltLookupAllowed(altPath)) { // remastered textures only: the path is not one of ours
         return rm->LoadResourceProcess(path);
