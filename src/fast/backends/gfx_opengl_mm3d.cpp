@@ -1,4 +1,5 @@
 #include "ship/window/Window.h"
+#include "fast/newdawn_look.h"
 #if defined(ENABLE_OPENGL) && !defined(USE_OPENGLES)
 #include "gfx_opengl_mm3d.h"
 #include "ship/Context.h"
@@ -385,9 +386,15 @@ void MM3DGL::Draw(const NewDawnMM3DRoomParams& params,const float* projection,fl
         glUniform1f(U("uTintMix"),cvars->GetFloat("gNewDawn.MM3D.TintMix",1.0f));
         glUniform1f(U("uGain"),cvars->GetFloat("gNewDawn.MM3D.Gain",0.93f));
         glUniform1i(U("uPerPixel"),cvars->GetInteger("gNewDawn.Lighting.PerPixel",0));
-        glUniform1f(U("uHdrAmbient"),std::clamp(cvars->GetFloat("gNewDawn.HDR.AmbientFill",0.4f),0.f,4.f));
-        glUniform1f(U("uHdrSun"),std::clamp(cvars->GetFloat("gNewDawn.HDR.SunIntensity",1.8f),0.f,16.f));
-        glUniform1f(U("uHdrFog"),std::clamp(cvars->GetFloat("gNewDawn.HDR.FogIntensity",1.f),0.f,4.f));
+        glUniform1f(U("uHdrAmbient"), std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FILL_LEVEL,
+                                                                  cvars->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f)),
+                                                 0.f, 4.f));
+        glUniform1f(U("uHdrSun"), std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL,
+                                                              cvars->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f)),
+                                             0.f, 16.f));
+        glUniform1f(U("uHdrFog"), std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FOG_LEVEL,
+                                                              cvars->GetFloat("gNewDawn.HDR.FogIntensity", 1.f)),
+                                             0.f, 4.f));
         glUniform1i(U("uTexture0"),8); glUniform1i(U("uTexture1"),9); glUniform1i(U("uTexture2"),10);
         for(uint32_t mi=0;mi<params.meshCount;++mi) {
             const auto& mesh=*params.meshes[mi]; glBindVertexArray(mMeshes.at(mesh.id).vao);

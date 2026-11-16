@@ -16,6 +16,7 @@
 //      visibility; added to the HDR scene (dual-source blend, MSAA samples intact).
 // Nothing here reads or writes game state; with gNewDawn.GI.World=0 none of it runs.
 #include "fast/backends/gfx_opengl_postfx.h"
+#include "fast/newdawn_look.h"
 #include "fast/newdawn_wind.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
@@ -776,9 +777,13 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     }
 
     // 2. Relight a block of radiance slices.
-    const float sun = std::clamp(CvF("gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f);
-    const float fill = std::clamp(CvF("gNewDawn.HDR.AmbientFill", 0.4f), 0.0f, 4.0f);
-    const float skyScale = std::clamp(CvF("gNewDawn.HDR.SkyIntensity", 1.0f), 0.0f, 4.0f);
+    const float sun =
+        std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL, CvF("gNewDawn.HDR.SunIntensity", 1.8f)),
+                   0.0f, 16.0f);
+    const float fill = std::clamp(
+        NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FILL_LEVEL, CvF("gNewDawn.HDR.AmbientFill", 0.4f)), 0.0f, 4.0f);
+    const float skyScale = std::clamp(
+        NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_SKY_LEVEL, CvF("gNewDawn.HDR.SkyIntensity", 1.0f)), 0.0f, 4.0f);
     float sunRgb[3], skyRgb[3];
     for (int i = 0; i < 3; ++i) {
         sunRgb[i] = params.giWorldSunColor[i] * sun * skyScale;
@@ -807,12 +812,19 @@ void PostFxGL::RunWorldGi(const NewDawnPostFxParams& params, const FramebufferOG
     glUniform1f(Loc("uBounce"), std::clamp(CvF("gNewDawn.GI.WorldBounce", 1.0f), 0.0f, 1.0f));
     // Art direction: daylight is plentiful, so only part of it is sent on (the game's ambient already stands for
     // some of it); a lamp's pool is small and capped, so its bounce is pushed to carry across a room.
-    glUniform2f(Loc("uGain"), std::clamp(CvF("gNewDawn.GI.WorldSunGain", 0.5f), 0.0f, 4.0f),
-                std::clamp(CvF("gNewDawn.GI.WorldLocalGain", 3.0f), 0.0f, 16.0f));
+    glUniform2f(
+        Loc("uGain"),
+        std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_GI_SUN, CvF("gNewDawn.GI.WorldSunGain", 0.5f)), 0.0f,
+                   4.0f),
+        std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_GI_LAMP, CvF("gNewDawn.GI.WorldLocalGain", 3.0f)),
+                   0.0f, 16.0f));
     // Baked surfaces are displayed as their painted colour, pulled down by the local-light pass's darkening.
     // Only part of it is sent on: the paint already contains the artists' own bounce.
-    glUniform1f(Loc("uBaked"), std::clamp(CvF("gNewDawn.GI.WorldBakedGain", 0.6f), 0.0f, 4.0f) * skyScale *
-                                   (params.localEnabled ? 1.0f - std::clamp(params.localDarken, 0.0f, 0.9f) : 1.0f));
+    glUniform1f(
+        Loc("uBaked"),
+        std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_GI_BAKED, CvF("gNewDawn.GI.WorldBakedGain", 0.6f)),
+                   0.0f, 4.0f) *
+            skyScale * (params.localEnabled ? 1.0f - std::clamp(params.localDarken, 0.0f, 0.9f) : 1.0f));
     glBindFramebuffer(GL_FRAMEBUFFER, g.radFbo);
     glViewport(0, 0, g.dim[0], g.dim[1]);
     for (int i = 0, n = std::min(t.slices * boost, g.dim[2]); i < n; ++i) {

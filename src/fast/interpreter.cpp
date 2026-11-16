@@ -3344,7 +3344,10 @@ void Interpreter::LogCharacterLight(const GfxPerPixelLightingState& state) {
         return;
     }
     auto cv = Ship::Context::GetRawInstance()->GetConsoleVariables();
-    const float sun = cv->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f), amb = cv->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f);
+    const float sun = NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL,
+                                       cv->GetFloat("gNewDawn.HDR.SunIntensity", 1.8f)),
+                amb = NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_FILL_LEVEL,
+                                       cv->GetFloat("gNewDawn.HDR.AmbientFill", 0.4f));
     std::string msg = fmt::format("NewDawn char light: ambient ({:.3f},{:.3f},{:.3f}) x fill {:.2f}; sun scale {:.2f}; {} lights", state.ambient[0] / 255.0f,
                                   state.ambient[1] / 255.0f, state.ambient[2] / 255.0f, amb, sun, state.numLights);
     for (int i = 0; i < state.numLights && i < 6; i++) {
@@ -7923,6 +7926,14 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
     }
     gfx->Flush();
     const auto& params = *reinterpret_cast<const NewDawnPostFxParams*>(cmd->words.w1);
+    {
+        // The look of this display list, for every renderer read below and for the world draws that follow.
+        NewDawnLookFrame& look = NewDawnLookNow();
+        look.on = params.lookOn != 0;
+        if (look.on) {
+            memcpy(look.v, params.look, sizeof(look.v));
+        }
+    }
 
     if (stage == NEWDAWN_POSTFX_STAGE_SHADOW_BEGIN) {
         // Water only needs the camera of this frame, not the casters.
@@ -7931,8 +7942,12 @@ bool gfx_newdawn_postfx_handler_custom(F3DGfx** cmd0) {
         {
             // Sun for the light through the leaves: linear radiance the way the grass lights its blades.
             auto decode = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
-            const float sunK = std::clamp(Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
-                                              "gNewDawn.HDR.SunIntensity", 1.8f), 0.0f, 16.0f) * 0.5f;
+            const float sunK =
+                std::clamp(NewDawnLookValue(NewDawnLookNow(), NEWDAWN_LOOK_KEY_LEVEL,
+                                            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetFloat(
+                                                "gNewDawn.HDR.SunIntensity", 1.8f)),
+                           0.0f, 16.0f) *
+                0.5f;
             const float col[3] = { decode(params.foliageSunColor[0]) * sunK, decode(params.foliageSunColor[1]) * sunK,
                                    decode(params.foliageSunColor[2]) * sunK };
             gfx->mRapi->SetFoliageFrame(params.giCameraEye, params.foliageSunDir, col,
