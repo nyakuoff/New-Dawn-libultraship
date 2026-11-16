@@ -567,6 +567,7 @@ void Interpreter::PumpAltTextureLoads() {
     mAsyncAltLoadEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.AsyncAltLoad", 1) != 0;
     mLogDraws = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.LogDraws", 0) != 0;
+    mStochasticEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Textures.Stochastic", 1) != 0;
     if (!mAsyncAltLoadEnabled) {
         mPendingAltTextures.clear();
         mReadyAltTextures.clear();
@@ -5169,7 +5170,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // New Dawn: an isotropic remastered material asks the backend for stochastic sampling through one extra bit
             // of the wrap mode (only where the tile repeats: clamped tiles would sample outside their edge).
             const auto albedoRes = mRdp->loaded_texture[i].raw_tex_metadata.resource;
-            const bool stochastic = albedoRes && (albedoRes->Flags & TEX_FLAG_NEWDAWN_STOCH) && !(cms & G_TX_CLAMP) &&
+            const bool stochastic = mStochasticEnabled && albedoRes && (albedoRes->Flags & TEX_FLAG_NEWDAWN_STOCH) && !(cms & G_TX_CLAMP) &&
                                     !(cmt & G_TX_CLAMP) && !((tm >> (2 * i)) & 3);
             if (stochastic) {
                 cms |= 0x100;

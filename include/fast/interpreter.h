@@ -714,6 +714,7 @@ class Interpreter {
     bool mAsyncAltLoadEnabled = true;
     // New Dawn: gNewDawn.Textures.LogDraws=1 logs each distinct pair of textures drawn together (layer-role analysis).
     bool mLogDraws = false;
+    bool mStochasticEnabled = true; // gNewDawn.Textures.Stochastic
     std::unordered_set<std::string> mLoggedDraws;
     bool mResolvedResourceCacheEnabled = false;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
