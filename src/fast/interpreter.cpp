@@ -1980,6 +1980,10 @@ void Interpreter::SubmitGrass() {
             }
             std::sort(big.rbegin(), big.rend());
             SPDLOG_INFO("GRASSDBG {} triangles recorded", n);
+            for (const auto& [name, count] : mGrassOtherGround) {
+                SPDLOG_INFO("GRASSDBG2 unclassified ground texture {} ({} tris this window)", name, count);
+            }
+            mGrassOtherGround.clear();
             for (size_t k = 0; k < std::min<size_t>(12, big.size()); k++) {
                 const float* t = &mGrassTris[big[k].second * NEWDAWN_GRASS_TRI_FLOATS];
                 SPDLOG_INFO("GRASSDBG tri area {:.0f} centre {:.0f},{:.0f},{:.0f}", big[k].first * 0.5f,
@@ -4898,6 +4902,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
             RecordGrassTriangle(v_arr);
+            // gNewDawn.Grass.Debug=2: also count the level opaque ground triangles whose texture is NOT classified grass, per
+        // texture, so a missing lawn can be traced to the texture that carries it (logged with the recorded-triangle summary).
+        } else if (mGrassDebug && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Grass.Debug", 0) >= 2 &&
+                 (grassOm & G_ZS_PRIM) == 0 && (grassOm & CVG_X_ALPHA) == 0 && lt.raw_tex_metadata.resource != nullptr) {
+            const float* a = v_arr[0]->view_pos;
+            const float* b = v_arr[1]->view_pos;
+            const float* c = v_arr[2]->view_pos;
+            const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+            const float ny = e1[2] * e2[0] - e1[0] * e2[2], nx = e1[1] * e2[2] - e1[2] * e2[1], nz = e1[0] * e2[1] - e1[1] * e2[0];
+            const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 1e-3f && std::fabs(ny) >= 0.85f * len) {
+                mGrassOtherGround[lt.raw_tex_metadata.resource->GetInitData()->Path] += 1;
+            }
         }
         skipGrass:;
     }
