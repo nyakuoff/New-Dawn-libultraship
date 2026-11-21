@@ -4523,7 +4523,9 @@ void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
     // Debug only (measurement fixture): a deterministic constant-speed sideways camera pan in pixels per rendered frame
     // (gNewDawn.TAA.DebugPan). It is a real part of the camera as far as TAA is concerned, and works with TAA off too.
     const float pan = cvars->GetFloat("gNewDawn.TAA.DebugPan", 0.0f);
-    if (!taa && pan == 0.0f) {
+    // Neural rendering reprojects with the same camera, with or without TAA.
+    const bool neural = cvars->GetInteger("gNewDawn.Neural.Enabled", 0) != 0;
+    if (!taa && pan == 0.0f && !neural) {
         return;
     }
     const float (*P)[4] = mRsp->P_matrix;
@@ -4534,11 +4536,27 @@ void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
     const float ndcXScale = xScale > 1e-6f ? 1.0f / xScale : 1.0f;
     const float flipY = mRapi->GetClipParameters().invertY ? -1.0f : 1.0f;
     const float w = (float)std::max<int>(mCurDimensions.width, 1), h = (float)std::max<int>(mCurDimensions.height, 1);
-    const uint32_t frame = mTaaIndex++;
+    const bool still = !taa && pan == 0.0f; // neural rendering alone: the camera is left as it is
+    const uint32_t frame = still ? 0 : mTaaIndex++;
     // Pixel offsets become clip-space shifts in the projection's own x/y (the mapping the post passes use to
     // unproject).
     const float panPx = pan * (float)frame;
     const float panX = panPx * 2.0f / w * ndcXScale;
+    // The camera the renderer reprojects with: loaded before this marker, so still the current P; the pan is part
+    // of it, the jitter is not.
+    float vp[16];
+    for (int r = 0; r < 4; r++) {
+        vp[r * 4 + 0] = P[r][0] + panX * P[r][3];
+        vp[r * 4 + 1] = P[r][1];
+        vp[r * 4 + 2] = P[r][2];
+        vp[r * 4 + 3] = P[r][3];
+    }
+    if (neural) {
+        mRapi->SetNeuralCamera(vp, ndcXScale, flipY);
+    }
+    if (still) {
+        return;
+    }
     float jitterX = 0.0f, jitterY = 0.0f, jitterPxX = 0.0f, jitterPxY = 0.0f;
     if (taa) {
         // 16-sample Halton(2,3), centred on the pixel: offsets within (-0.5, 0.5) pixels.
@@ -4547,15 +4565,6 @@ void Interpreter::BeginTaa(const NewDawnPostFxParams& params) {
         jitterPxY = Halton(i, 3) - 0.5f;
         jitterX = jitterPxX * 2.0f / w * ndcXScale;
         jitterY = jitterPxY * 2.0f / h * flipY;
-        // The camera the renderer reprojects with: loaded before this marker, so still the current P; the pan is part
-        // of it, the jitter is not.
-        float vp[16];
-        for (int r = 0; r < 4; r++) {
-            vp[r * 4 + 0] = P[r][0] + panX * P[r][3];
-            vp[r * 4 + 1] = P[r][1];
-            vp[r * 4 + 2] = P[r][2];
-            vp[r * 4 + 3] = P[r][3];
-        }
         mRapi->SetTaaCamera(vp, ndcXScale, flipY, params.zNear, params.zFar, jitterPxX, jitterPxY);
     }
     mTaaOffset[0] = panX + jitterX;

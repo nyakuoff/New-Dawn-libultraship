@@ -134,6 +134,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void FinishWorld() override;
     void SetTaaCamera(const float* viewProj, float ndcXScale, float flipY, float zNear, float zFar, float jitterPxX,
                       float jitterPxY) override;
+    void SetNeuralCamera(const float* viewProj, float ndcXScale, float flipY) override;
     void StartFrame() override;
     void EndFrame() override;
     void FinishRender() override;

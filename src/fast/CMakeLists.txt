@@ -39,5 +39,13 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_opengl*")
 endif()
 
+# New Dawn neural rendering (neural/): its own static library, so its Vulkan headers stay out of everything else.
+# Linux only for now: the buffers it shares with OpenGL are exported as file descriptors.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(neural)
+    target_link_libraries(libultraship PRIVATE newdawn_neural)
+    target_compile_definitions(libultraship PRIVATE NEWDAWN_NEURAL)
+endif()
+
 source_group("graphic" FILES ${Source_Files__Graphic})
 target_sources(libultraship PRIVATE ${Source_Files__Graphic})

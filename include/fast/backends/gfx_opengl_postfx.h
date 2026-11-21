@@ -2,6 +2,7 @@
 #pragma once
 
 #include "gfx_opengl.h"
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -73,6 +74,8 @@ void PackInteriorWindows(const NewDawnPostFxParams& params, float (*win0)[4], fl
 class PostFxGL {
   public:
     // Checks the GL version and builds the shaders. On failure the feature stays unusable.
+    PostFxGL();
+    ~PostFxGL();
     void Init();
     bool Usable() const {
         return mUsable;
@@ -128,6 +131,8 @@ class PostFxGL {
     bool BeginHdr(const FramebufferOGL& fb);
     void RunPhysicalSky(const NewDawnPostFxParams& params, const FramebufferOGL& fb, uint32_t frameIndex);
     void RunSunFlare(const NewDawnPostFxParams& params, const FramebufferOGL& fb);
+    // Neural rendering: this frame's world camera as SetTaaCamera takes it (un-jittered), with or without TAA.
+    void SetNeuralCamera(const float* viewProj, float ndcXScale, float flipY);
     void EndHdr(const FramebufferOGL& fb);
     // final: the last read of the finished world (EndHdr); TAA only resolves then, never on mid-frame snapshots.
     GLuint HdrSnapshot(const FramebufferOGL& fb, bool final = false);
@@ -300,7 +305,11 @@ class PostFxGL {
     void RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa = false);
     // Resolves this frame's jittered world against the reprojected history; returns the resolved linear target, or
     // nullptr when TAA is not active (the caller then keeps using mScene).
-    const Target* RunTaa(const FramebufferOGL& fb, const Settings& s);
+    const Target* RunTaa(const FramebufferOGL& fb, const Settings& s, const Target& scene);
+    // The scene with the network's residual on it, or null when there is none to apply (off, loading, no result yet).
+    const Target* RunNeural(const FramebufferOGL& fb, const Target& scene);
+    bool NeuralPrepare(int w, int h);
+    void NeuralRelease(bool runtime);
     void Draw(const Target& t);
     void Draw(GLuint fbo, int w, int h);
     void Bind(int unit, GLuint tex);
@@ -491,8 +500,20 @@ class PostFxGL {
     bool mTaaDidReset = false; // diagnostics: the last resolve started from scratch
     float mKernel[16 * 3] = {};
 
+    // Neural rendering (gNewDawn.Neural.*, src/fast/neural): a network in Vulkan re-renders the world image. This
+    // side builds its inputs, hands them over in shared buffers and carries its last result onto every frame.
+    struct NeuralState; // the Vulkan runtime and what goes with it; empty where the feature is not built
+    std::unique_ptr<NeuralState> mNr;
+    struct NeuralCamera {
+        bool valid = false;
+        float vp[16] = {}, ndcXScale = 1.0f, flipY = 1.0f;
+    } mNrCam;
+    Program mNrInput, mNrApply;
+    Target mNrProxy, mNrHistory, mNrResidual, mNrScene, mNrDepth;
+
     static constexpr int kQueryRing = 4;
-    static constexpr int kQueryStages = 26;
+    static constexpr int kQueryStages = 27;
+    static constexpr int kNeuralTimerStage = 26;
     static constexpr int kPointTimerStage = 22;
     static constexpr int kInteriorTimerStage = 23;
     static constexpr int kEmissiveTimerStage = 24;

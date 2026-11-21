@@ -2009,6 +2009,14 @@ void GfxRenderingAPIOGL::SetTaaCamera(const float* viewProj, float ndcXScale, fl
 #endif
 }
 
+void GfxRenderingAPIOGL::SetNeuralCamera(const float* viewProj, float ndcXScale, float flipY) {
+#ifndef USE_OPENGLES
+    if (mPostFx && mPostFx->HdrActive()) {
+        mPostFx->SetNeuralCamera(viewProj, ndcXScale, flipY);
+    }
+#endif
+}
+
 void GfxRenderingAPIOGL::FinishWorld() {
 #ifndef USE_OPENGLES
     if (mHdrGameFb >= 0 && mPostFx && mPostFx->HdrActive()) {

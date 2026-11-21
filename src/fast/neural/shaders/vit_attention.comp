@@ -1,0 +1,88 @@
+#version 460
+// The ViT's attention over every level-5 token, one (16-query tile, head) per subgroup, the keys streamed sixteen
+// at a time: scores Q K^T, exponentials, P V accumulated, the reciprocal of the denominator applied at the end.
+//
+// It differs from window attention (OpenDLSS-NR global_attend.comp, MIT): there is no prior, the E4M3 weights are
+// the raw exponentials, and the keys are padded to a multiple of 64 with zero vectors whose exp(0) still enters
+// the denominator and is subtracted once. Each subgroup is on its own: 512 bytes of shared memory, no barrier.
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 128) in;   // four independent subgroups of 32
+
+layout(push_constant) uniform Push { uint tokens, padded; } pc;
+
+layout(std430, binding = 0) readonly buffer Q_ { float16_t qn[]; };    // [tokens][1024]
+layout(std430, binding = 1) readonly buffer K_ { float16_t kn[]; };    // [padded][1024]
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };     // [tokens][1024]
+layout(std430, binding = 3) readonly buffer V_ { float16_t vt[]; };    // [1024][padded]
+
+shared float16_t lds[4u * 256u];
+
+// 2^(1.4326 s - 3.6502) with a linear mantissa. Per half the reference's ((bits << 4) + 0x4000) kept to 16 bits;
+// the clamp bounds the pattern to 0x3dc2..0x3fe9, so that is the mantissa shifted up by four.
+f16vec4 expWeight(f16vec4 s) {
+  precise f16vec4 affine = fma(s, f16vec4(float16_t(0.08953946828842163)), f16vec4(float16_t(1.7093614339828491)));
+  affine = clamp(affine, f16vec4(1.439453125), f16vec4(1.9775390625));
+  uvec2 bits = uvec2(packFloat2x16(affine.xy), packFloat2x16(affine.zw));
+  bits = (bits & 0x03ff03ffu) << 4u;
+  return f16vec4(unpackFloat2x16(bits.x), unpackFloat2x16(bits.y));
+}
+
+void main() {
+  const uint head = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+  const uint tile = gl_WorkGroupID.y * 4u + gl_SubgroupID;
+  if (tile * 16u >= pc.tokens) return;
+  const uint row = lane >> 1u, part = lane & 1u;
+  const uint stage = gl_SubgroupID * 256u, mine = stage + row * 16u + part * 8u;
+  const int ROW = gl_CooperativeMatrixLayoutRowMajor, COL = gl_CooperativeMatrixLayoutColumnMajor;
+
+  MA Q0, Q1;
+  coopMatLoad(Q0, qn, tile * 16u * 1024u + head * 32u, 1024u, ROW);
+  coopMatLoad(Q1, qn, tile * 16u * 1024u + head * 32u + 16u, 1024u, ROW);
+  ACC acc0 = ACC(0.0), acc1 = ACC(0.0);
+  precise f16vec4 sum = f16vec4(0.0);
+  for (uint kt = 0u; kt < pc.padded / 16u; ++kt) {
+    MB K0, K1, V0, V1;
+    coopMatLoad(K0, kn, kt * 16u * 1024u + head * 32u, 1024u, COL);
+    coopMatLoad(K1, kn, kt * 16u * 1024u + head * 32u + 16u, 1024u, COL);
+    ACC scores = coopMatMulAdd(Q0, K0, ACC(0.0));
+    scores = coopMatMulAdd(Q1, K1, scores);
+    coopMatStore(ACC16(scores), lds, stage, 16u, ROW);
+    const Oct e = Oct(expWeight(f16vec4(lds[mine], lds[mine + 1u], lds[mine + 2u], lds[mine + 3u])),
+                      expWeight(f16vec4(lds[mine + 4u], lds[mine + 5u], lds[mine + 6u], lds[mine + 7u])));
+    sum += e.lo;
+    sum += e.hi;
+    const Oct p = quantOct(e);
+    lds[mine] = p.lo.x; lds[mine + 1u] = p.lo.y; lds[mine + 2u] = p.lo.z; lds[mine + 3u] = p.lo.w;
+    lds[mine + 4u] = p.hi.x; lds[mine + 5u] = p.hi.y; lds[mine + 6u] = p.hi.z; lds[mine + 7u] = p.hi.w;
+    MA P;
+    coopMatLoad(P, lds, stage, 16u, ROW);
+    coopMatLoad(V0, vt, head * 32u * pc.padded + kt * 16u, pc.padded, COL);
+    coopMatLoad(V1, vt, (head * 32u + 16u) * pc.padded + kt * 16u, pc.padded, COL);
+    acc0 = coopMatMulAdd(P, V0, acc0);
+    acc1 = coopMatMulAdd(P, V1, acc1);
+  }
+  precise f16vec2 s2 = sum.xy + sum.zw;
+  precise float16_t partial = s2.x + s2.y;
+  precise float16_t total = partial + subgroupShuffleXor(partial, 1u);
+  if (pc.padded > pc.tokens) {   // the padding keys' exp(0) leaves the denominator
+    precise float16_t correction = float16_t(float(expWeight(f16vec4(0.0)).x) * float(pc.padded - pc.tokens));
+    total -= correction;
+  }
+  const float reciprocal = float(float16_t(1.0 / float(total)));
+  [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+    if (t == 0u) coopMatStore(ACC16(acc0), lds, stage, 16u, ROW);
+    else coopMatStore(ACC16(acc1), lds, stage, 16u, ROW);
+    precise vec4 lo = vec4(lds[mine], lds[mine + 1u], lds[mine + 2u], lds[mine + 3u]) * reciprocal;
+    precise vec4 hi = vec4(lds[mine + 4u], lds[mine + 5u], lds[mine + 6u], lds[mine + 7u]) * reciprocal;
+    out8[((tile * 16u + row) * 1024u + head * 32u + t * 16u + part * 8u) >> 3u] =
+        packOct(Oct(quantE4(f16vec4(lo)), quantE4(f16vec4(hi))));
+  }
+}
