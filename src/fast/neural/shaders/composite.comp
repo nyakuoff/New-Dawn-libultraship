@@ -1,0 +1,47 @@
+#version 460
+// The head back into an image: the residual on the proxy, the temporal blend with the history, the publication
+// (OpenDLSS-NR's composition, docs/frame.md and nr_composite.comp, MIT). What leaves is not the image but its
+// difference from the proxy, in display code values: the renderer carries that residual onto its own later frames.
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+  uint validWidth, validHeight;
+  uint width4;        // field width in tiles
+  uint historyValid;
+  float blendScale;   // the model's learned cap on the history weight
+} pc;
+
+layout(std430, binding = 0) readonly buffer Hd_ { uvec4 head8[]; };   // [token][8] halves: rgb residual, blend logit
+layout(std430, binding = 2) writeonly buffer O_ { uvec2 delta[]; };   // rgba16f [validHeight][validWidth]
+layout(std430, binding = 3) readonly buffer P_ { uvec2 proxy[]; };
+layout(std430, binding = 4) readonly buffer H_ { uvec2 history[]; };
+
+// Round toward zero to the half grid: the history is a publication point, and this is its rule.
+float truncateHalf(float value) {
+  const float nearest = float(float16_t(value));
+  if (abs(nearest) <= abs(value)) return nearest;
+  const uint bits = packHalf2x16(vec2(nearest, 0.0)) & 0xffffu;   // one step toward zero: the magnitude bits - 1
+  return unpackHalf2x16(bits - 1u).x;
+}
+
+void main() {
+  const uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= pc.validWidth || id.y >= pc.validHeight) return;
+  const uint index = id.y * pc.validWidth + id.x;
+  const vec4 code = vec4(unpackHalf2x16(proxy[index].x), unpackHalf2x16(proxy[index].y));
+  const vec4 past = vec4(unpackHalf2x16(history[index].x), unpackHalf2x16(history[index].y));
+  const vec4 head = vec4(unpackOct(head8[tiledIndex(id.x, id.y, pc.width4)]).lo);
+  vec3 neural = clamp(fma(head.rgb, vec3(0.03125), fma(code.rgb, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0),
+                      vec3(1.0));
+  if (pc.historyValid != 0u && past.a > 0.5) {
+    const float weight =
+        clamp((1.0 / (1.0 + exp2(head.a * uintBitsToFloat(0xbfb8aa3bu)))) * clamp(pc.blendScale, 0.0, 1.0), 0.0, 1.0);
+    neural = fma(vec3(weight), past.rgb - neural, neural);
+  }
+  const vec3 published = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  const vec4 result = vec4(published - code.rgb, code.a);
+  delta[index] = uvec2(packHalf2x16(result.rg), packHalf2x16(result.ba));
+}

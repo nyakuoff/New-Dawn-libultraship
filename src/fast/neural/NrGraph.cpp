@@ -21,8 +21,8 @@ uint32_t TiledIndex(uint32_t x, uint32_t y, uint32_t width) {
 
 } // namespace
 
-Graph::Graph(Context& context, const Model& model, const Geometry& geometry)
-    : mContext(context), mModel(model), mGeometry(geometry) {
+Graph::Graph(Context& context, const Model& model, const Geometry& geometry, bool externalFeatures)
+    : mContext(context), mModel(model), mGeometry(geometry), mExternalFeatures(externalFeatures) {
     Build();
     mArenaBytes = (uint64_t)mArena.size() * 2;
     mWeights = mContext.CreateBuffer(mArenaBytes);
@@ -501,7 +501,7 @@ void Graph::AddVitBlock(int block, Activation* state, Activation* out) {
 void Graph::Build() {
     const Geometry& g = mGeometry;
     const uint32_t FW = g.mFullWidth, FH = g.mFullHeight;
-    mFeatures = mContext.CreateBuffer((uint64_t)g.FieldTokens() * 16 * 4);
+    mFeatures = mContext.CreateBuffer(mExternalFeatures ? 16 : (uint64_t)g.FieldTokens() * 16 * 4);
 
     // Block 0 at full resolution: features -> halves -> the f16 16 -> 32 input adapter (its half output is the FFN's
     // skip, its E4M3 publication the state) -> the block. Its E4M3 output is kept for block 70, its half output
@@ -514,7 +514,9 @@ void Graph::Build() {
     Activation* block0 = Allocate("block 0", FW, FH, 32);
     Activation* fieldRaw = Allocate("field raw", FW, FH, 32);
     Begin("block 0");
-    AddOps(kFeatures, nullptr, nullptr, featureHalves, nullptr, 0, 0, 0, 0, 0);
+    if (!mExternalFeatures) {
+        AddOps(kFeatures, nullptr, nullptr, featureHalves, nullptr, 0, 0, 0, 0, 0);
+    }
     {
         GemmArgs a;
         a.mRows = g.FieldTokens();

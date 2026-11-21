@@ -24,6 +24,13 @@ struct Buffer {
     VkDeviceSize mSize = 0;
 };
 
+// A buffer that another API on the same GPU can import (GL_EXT_memory_object_fd): the bytes are the interface.
+struct SharedBuffer {
+    Buffer mBuffer;
+    int mFd = -1; // the importer takes ownership of it
+    VkDeviceSize mAllocationSize = 0;
+};
+
 struct Pipeline {
     VkPipeline mPipeline = VK_NULL_HANDLE;
     VkShaderModule mModule = VK_NULL_HANDLE;
@@ -85,6 +92,23 @@ class Context {
     void Submit(VkCommandBuffer commands, bool wait);
     void WaitIdle();
     void Barrier(VkCommandBuffer commands);
+
+    // Sharing with the renderer's own API (throws VkError when the device cannot export).
+    SharedBuffer CreateSharedBuffer(VkDeviceSize size);
+    VkSemaphore CreateSharedSemaphore(int& fd); // signalled by the other API, waited on by a submission here
+    void DestroySemaphore(VkSemaphore semaphore);
+
+    // Work that is recorded once and submitted many times without anyone waiting for it: End() closes a command
+    // buffer from Begin(), SubmitRecorded() queues some as one job (optionally after `wait`, optionally signalling
+    // `fence`), FreeRecorded() releases it once nothing pending uses it.
+    void End(VkCommandBuffer commands);
+    void SubmitRecorded(const std::vector<VkCommandBuffer>& commands, VkSemaphore wait = VK_NULL_HANDLE,
+                        VkFence fence = VK_NULL_HANDLE);
+    void FreeRecorded(VkCommandBuffer commands);
+    VkFence CreateFence();
+    bool FenceSignaled(VkFence fence);
+    void ResetFence(VkFence fence);
+    void DestroyFence(VkFence fence);
 
     // Timestamps: Stamp() writes query `index`; ElapsedMs reads two after the queue is idle.
     static constexpr uint32_t kQueries = 256;

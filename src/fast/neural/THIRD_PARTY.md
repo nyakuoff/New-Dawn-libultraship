@@ -21,7 +21,10 @@ Used here:
   (`src/nr_graph.cpp`, the GLSL reference kernels in `shaders/`, `docs/numerics.md`);
 - `shaders/`: the kernels are written for this path (half-float cooperative matrices on RADV), after the structure
   and the arithmetic of `shaders/common.glsl`, `fused_block32.comp`, `attention_common.glsl`, `global_normalize.comp`,
-  `global_attend.comp` and `ops.comp`.
+  `global_attend.comp` and `ops.comp`;
+- `shaders/features.comp`, `shaders/composite.comp` and the proxy in `backends/gfx_opengl_postfx.cpp` (`kNrLib`): the
+  feature lanes and their noise sequence, the proxy's shoulder and the composition with its temporal blend
+  (`shaders/preprocess.comp`, `demo/shaders/nr_composite.comp`, `demo/shaders/nr_common.glsl`, `docs/frame.md`).
 
     MIT License
 

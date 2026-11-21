@@ -9,6 +9,9 @@
 //                                                    the GPU network against the CPU reference, step by step
 //   nd-nr bench <model dir> <width> <height> [--runs N] [--no-tune] [--reuse-vit]
 //                                                    milliseconds per frame and per stage on this GPU
+//   nd-nr runtime <model dir> <width> <height> [--image file.ppm]
+//                                                    the in-game path without a renderer: its feature and composite
+//                                                    kernels against the CPU, a run whole and split over frames
 //   nd-nr fixture <model dir> <width> <height> <out dir> [--image file.ppm] [--bisect]
 //                                                    the FP8 CPU reference's frame as an OpenDLSS-NR parity fixture,
 //                                                    so that project's own checker can confirm it bit for bit
@@ -23,11 +26,15 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <thread>
+
+#include <unistd.h>
 
 #include "NrGraph.h"
 #include "NrModel.h"
 #include "NrNumeric.h"
 #include "NrReference.h"
+#include "NrRuntime.h"
 
 using namespace Fast::Neural;
 
@@ -255,6 +262,113 @@ int Bench(const std::string& modelPath, uint32_t width, uint32_t height, int run
     printf("  frame%s: min %.2f ms, median %.2f ms over %d runs\n", reuseVit ? " (ViT reused)" : "", sorted.front(),
            sorted[sorted.size() / 2], runs);
     return 0;
+}
+
+// The in-game path without a renderer: the feature and composite kernels against the CPU, then what a run costs
+// whole, split over frames, and with the ViT reused.
+int RuntimeCheck(const std::string& modelPath, uint32_t width, uint32_t height, const std::string& image) {
+    Runtime runtime;
+    Runtime::Request request;
+    request.mModel = modelPath;
+    request.mWidth = width;
+    request.mHeight = height;
+    runtime.Load(request);
+    while (runtime.GetState() == Runtime::State::Working) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    printf("%s\n", runtime.Status().c_str());
+    if (runtime.GetState() != Runtime::State::Ready) {
+        return 1;
+    }
+    const Runtime::Shared shared = runtime.TakeShared();
+    for (int fd : { shared.mProxyFd, shared.mHistoryFd, shared.mResidualFd, shared.mSemaphoreFd }) {
+        close(fd);
+    }
+    const Geometry g = Geometry::FromValid(width, height);
+    const std::vector<float> proxy = image.empty() ? TestProxy(width, height) : LoadPpm(image, width, height);
+    const size_t pixels = (size_t)width * height;
+    std::vector<uint16_t> proxyHalves(pixels * 4), historyHalves(pixels * 4, 0);
+    std::vector<float> proxyRounded(pixels * 4);
+    for (size_t i = 0; i < pixels * 4; ++i) {
+        proxyHalves[i] = Num::F16Bits(proxy[i]);
+        proxyRounded[i] = Num::F16ToF32(proxyHalves[i]);
+    }
+    int failures = 0;
+
+    // A first frame: no history.
+    Runtime::Run run;
+    run.mSeed = 7;
+    run.mWaitRenderer = false;
+    runtime.WriteInputs(proxyHalves, historyHalves);
+    runtime.Start(run);
+    runtime.Wait();
+    Reference::Conditioning conditioning;
+    conditioning.mSeed = 7;
+    const std::vector<float> expected = Reference::Features(g, proxy, conditioning), features = runtime.ReadFeatures();
+    double noise = 0, rest = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        double& worst = i % 16 < 3 ? noise : rest;
+        worst = std::max(worst, (double)std::fabs(expected[i] - features[i]));
+    }
+    printf("features against the CPU: noise lanes within %.2g, the others within %.2g\n", noise, rest);
+    failures += noise > 4e-3 || rest != 0;
+
+    auto composite = [&](const std::vector<uint16_t>& history, bool valid) {
+        const std::vector<float> head = runtime.ReadHead();
+        const std::vector<uint16_t> residual = runtime.ReadResidual();
+        double worst = 0, mean = 0;
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                const size_t p = ((size_t)y * width + x) * 4, h = ((size_t)y * g.mFullWidth + x) * 4;
+                const bool blend = valid && Num::F16ToF32(history[p + 3]) > 0.5f;
+                const float weight = std::clamp(1.0f / (1.0f + std::exp(-head[h + 3])) * 0.73974609375f, 0.0f, 1.0f);
+                for (int c = 0; c < 3; ++c) {
+                    float value = std::clamp(proxyRounded[p + c] + head[h + c] * 0.25f, 0.0f, 1.0f);
+                    if (blend) {
+                        value += weight * (Num::F16ToF32(history[p + c]) - value);
+                    }
+                    const double d = std::fabs(value - proxyRounded[p + c] - Num::F16ToF32(residual[p + c]));
+                    worst = std::max(worst, d);
+                    mean += std::fabs(Num::F16ToF32(residual[p + c]));
+                }
+            }
+        }
+        printf("composite against the CPU%s: within %.2g (mean |residual| %.4f)\n", valid ? " (with history)" : "",
+               worst, mean / (pixels * 3));
+        return worst > 2e-3 || mean == 0;
+    };
+    failures += composite(historyHalves, false);
+
+    // A second frame: the history is the first one's image, valid on the left half only.
+    const std::vector<uint16_t> first = runtime.ReadResidual();
+    for (size_t i = 0; i < pixels; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            historyHalves[i * 4 + c] = Num::F16Bits(proxyRounded[i * 4 + c] + Num::F16ToF32(first[i * 4 + c]));
+        }
+        historyHalves[i * 4 + 3] = Num::F16Bits(i % width < width / 2 ? 1.0f : 0.0f);
+    }
+    runtime.WriteInputs(proxyHalves, historyHalves);
+    run.mSeed = 8;
+    run.mHistory = true;
+    run.mSpread = 3;
+    runtime.Start(run);
+    runtime.Wait();
+    failures += composite(historyHalves, true);
+
+    for (const auto& [spread, reuse] : { std::pair{ 1u, false }, { 1u, true }, { 2u, true }, { 3u, true } }) {
+        run.mSpread = spread;
+        run.mReuseVit = reuse;
+        double best = 1e30;
+        for (int i = 0; i < 12; ++i) {
+            run.mSeed++;
+            runtime.Start(run);
+            runtime.Wait();
+            best = std::min(best, runtime.LastMs());
+        }
+        printf("  run in %u part%s%s: %.2f ms\n", spread, spread > 1 ? "s" : "", reuse ? ", ViT reused" : "", best);
+    }
+    printf(failures ? "FAIL\n" : "PASS\n");
+    return failures ? 1 : 0;
 }
 
 int Verify(const std::string& modelPath, uint32_t width, uint32_t height, bool fp8, const std::string& image,
@@ -485,6 +599,7 @@ int Usage() {
                     "       nd-nr reference <model dir> <width> <height> [--fp8] [--last N]\n"
                     "       nd-nr verify <model dir> <width> <height> [--fp8] [--image file.ppm] [--save stem]\n"
                     "       nd-nr bench <model dir> <width> <height> [--runs N] [--no-tune] [--reuse-vit]\n"
+                    "       nd-nr runtime <model dir> <width> <height> [--image file.ppm]\n"
                     "       nd-nr fixture <model dir> <width> <height> <out dir> [--image file.ppm] [--bisect]\n"
                     "       nd-nr sensitivity <model dir> <width> <height> [--image file.ppm]\n");
     return 2;
@@ -597,6 +712,9 @@ int main(int argc, char** argv) try {
     }
     if (command == "verify") {
         return Verify(argv[2], width, height, flag("--fp8"), option("--image", ""), option("--save", ""));
+    }
+    if (command == "runtime") {
+        return RuntimeCheck(argv[2], width, height, option("--image", ""));
     }
     if (command == "bench") {
         return Bench(argv[2], width, height, atoi(option("--runs", "12").c_str()), !flag("--no-tune"),

@@ -40,6 +40,7 @@ add_library(newdawn_neural STATIC
     NrVk.cpp
     NrModel.cpp
     NrGraph.cpp
+    NrRuntime.cpp
     ${nd_volk_SOURCE_DIR}/volk.c
 )
 target_include_directories(newdawn_neural PUBLIC

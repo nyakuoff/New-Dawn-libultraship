@@ -2,6 +2,7 @@
 
 #include "fast/backends/gfx_opengl_postfx.h"
 #include "fast/newdawn_perf.h"
+#include "fast/newdawn_neural.h"
 #include "fast/newdawn_wind.h"
 #include "fast/newdawn_look.h"
 
@@ -23,6 +24,9 @@
 #include <spdlog/spdlog.h>
 
 #include "ship/Context.h"
+#ifdef NEWDAWN_NEURAL
+#include "NrRuntime.h"
+#endif
 #include "ship/config/ConsoleVariable.h"
 
 namespace Fast {
@@ -1953,6 +1957,118 @@ void main() {
     oScene = vec4(expandC(rgb), 1.0);
     if (uDebug == 1) oScene = vec4(vec3(blend), 1.0);
     else if (uDebug == 2) oScene = vec4(tint, actor, grass, 1.0);
+}
+)GLSL";
+
+// New Dawn neural rendering (src/fast/neural): a network re-renders the world image, in Vulkan, from a small display-
+// referred copy of it (the proxy), and returns how that copy should change (the residual, in display code values).
+// A run takes one to a few frames, so the residual on screen belongs to an earlier camera: both passes below fetch it
+// through that camera, per surface point, and drop it where that run saw another surface.
+static const char* kNrLib = R"GLSL(
+uniform sampler2D uScene;      // the world, scene-referred
+uniform sampler2D uDepth;      // this frame's depth, at the scene's size
+uniform sampler2D uNrResidual; // rgb: the network's change, a: clip w at its run. Row 0 is the top of the image.
+uniform mat4 uInvViewProj;     // this frame's camera
+uniform mat4 uRunViewProj;     // the camera of the run the residual came from
+uniform vec2 uNdc;
+uniform vec2 uStep;            // one residual texel, in scene uv
+uniform float uExposure;       // scene radiance -> paper-white relative
+uniform int uHaveResidual;
+
+// The network's images have their top row first. So have this renderer's off-screen targets when it draws the world
+// flipped into them (uNdc.y < 0, the usual case); otherwise the rows are turned over on the way in and out.
+float nrRow(float v) { return uNdc.y < 0.0 ? v : 1.0 - v; }
+
+// The proxy, linear: paper-white relative light with the network's soft shoulder above 0.75.
+vec3 nrProxy(vec3 scene) {
+    vec3 v = max(scene, vec3(0.0)) * uExposure;
+    return mix(v, 0.75 + 0.25 * (1.0 - exp(-5.770780 * (v - 0.75))), greaterThan(v, vec3(0.75)));
+}
+vec3 nrEncode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+}
+vec3 nrDecode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+vec4 nrNdc(vec2 uv, float d) { return vec4((uv * 2.0 - 1.0) * uNdc, d * 2.0 - 1.0, 1.0); }
+// Clip w (distance along the view axis) of this frame's surface at uv: unprojection leaves 1 / w in the fourth lane.
+float nrClipW(vec2 uv) {
+    vec4 n = nrNdc(uv, texture(uDepth, uv).r);
+    return 1.0 / dot(vec4(uInvViewProj[0].w, uInvViewProj[1].w, uInvViewProj[2].w, uInvViewProj[3].w), n);
+}
+
+// The residual for this frame's surface point at uv. rgb: the change; a: how much of it the run actually saw (0..1).
+// The four texels around the point's position in the run's image, each by its bilinear share, without those that
+// held another surface then: full-resolution edges stay clean, and what moved in front of something loses nothing
+// but the uncovered strip.
+vec4 nrResidual(vec2 uv) {
+    if (uHaveResidual == 0) return vec4(0.0);
+    float d = texture(uDepth, uv).r;
+    vec4 wp = uInvViewProj * nrNdc(uv, d);
+    vec4 pc = uRunViewProj * vec4(wp.xyz / wp.w, 1.0);
+    if (pc.w <= 0.0) return vec4(0.0);
+    vec2 size = vec2(textureSize(uNrResidual, 0));
+    vec2 rUv = clamp((pc.xy / pc.w / uNdc) * 0.5 + 0.5, -0.02, 1.02); // a little past the edge: its last texels
+    vec2 pos = vec2(rUv.x, nrRow(rUv.y)) * size - 0.5;
+    ivec2 base = ivec2(floor(pos));
+    vec2 f = pos - vec2(base);
+    // How far apart two neighbouring residual texels are in depth on this surface, plus a floor
+    float here = 1.0 / wp.w;
+    float slope = max(max(abs(nrClipW(uv + vec2(uStep.x, 0.0)) - here), abs(nrClipW(uv - vec2(uStep.x, 0.0)) - here)),
+                      max(abs(nrClipW(uv + vec2(0.0, uStep.y)) - here), abs(nrClipW(uv - vec2(0.0, uStep.y)) - here)));
+    float tol = 0.015 * pc.w + 1.5 * slope + 0.5;
+    vec4 sum = vec4(0.0);
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            vec4 t = texelFetch(uNrResidual, clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1), 0);
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) *
+                      step(abs(t.a - min(pc.w, 60000.0)), tol);
+            sum += vec4(t.rgb, 1.0) * w;
+        }
+    }
+    return sum.a > 0.02 ? vec4(sum.rgb / sum.a, smoothstep(0.02, 0.3, sum.a)) : vec4(0.0);
+}
+)GLSL";
+
+// What a run reads, at the network's resolution with the top row first: the proxy (display code, clip w in alpha)
+// and the history: the proxy with the last residual carried onto it (alpha 1 where that residual reached).
+static const char* kNrInputShader = R"GLSL(
+in vec2 vUv;
+layout(location = 0) out vec4 oProxy;
+layout(location = 1) out vec4 oHistory;
+void main() {
+    vec2 uv = vec2(vUv.x, nrRow(vUv.y));
+    // The scene averaged over this pixel's footprint, in display light (four bilinear taps)
+    vec3 v = nrProxy(textureLod(uScene, uv + uStep * vec2(-0.25, -0.25), 0.0).rgb) +
+             nrProxy(textureLod(uScene, uv + uStep * vec2(0.25, -0.25), 0.0).rgb) +
+             nrProxy(textureLod(uScene, uv + uStep * vec2(-0.25, 0.25), 0.0).rgb) +
+             nrProxy(textureLod(uScene, uv + uStep * vec2(0.25, 0.25), 0.0).rgb);
+    vec3 code = nrEncode(v * 0.25);
+    vec4 r = nrResidual(uv);
+    oProxy = vec4(code, min(nrClipW(uv), 60000.0)); // a half holds it
+    oHistory = vec4(clamp(code + r.rgb, 0.0, 1.0), step(0.5, r.a));
+}
+)GLSL";
+
+// The residual onto this frame's scene. It is a change of display code values; the scene is scene-referred light:
+// each channel goes to the proxy's code, takes the change, and comes back as a ratio on the scene value, which keeps
+// whatever the proxy's shoulder had compressed.
+static const char* kNrApplyShader = R"GLSL(
+in vec2 vUv;
+out vec4 oColor;
+uniform float uStrength;
+uniform int uDebug;
+void main() {
+    vec4 scene = texelFetch(uScene, ivec2(gl_FragCoord.xy), 0);
+    vec4 r = nrResidual(vUv);
+    vec3 v = nrProxy(scene.rgb);
+    vec3 v2 = nrDecode(nrEncode(v) + r.rgb * (r.a * uStrength));
+    vec3 c = mix(v2 / uExposure, max(scene.rgb, vec3(0.0)) * (v2 / max(v, vec3(1e-4))), step(vec3(1e-3), v));
+    if (uDebug == 1) c = (0.5 + 2.0 * r.rgb * r.a) / uExposure * 0.5; // the residual itself
+    else if (uDebug == 2) c = vec3(r.a, 0.25 * r.a, 1.0 - r.a) / uExposure * 0.5; // where it reached
+    oColor = vec4(c, scene.a);
 }
 )GLSL";
 
@@ -4077,6 +4193,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uGiHistory", 11 },
                           { "uTaaHistory", 10 },
                           { "uTaaMask", 11 },
+                          { "uNrResidual", 10 },
                           { "uRayMask", 8 },
                           { "uRays", 11 },
                           { "uRaySky", 10 },
@@ -4425,6 +4542,11 @@ void main() { oColor = vec4(1.0); }
     mTaaMaskFill.id = BuildProgram("TAA actor mask", taaFill, 2, mTaaMaskFill.uniforms);
     const char* taaSharpen[] = { kVersion, kTaaSharpenShader };
     mTaaSharpen.id = BuildProgram("TAA sharpen", taaSharpen, 2, mTaaSharpen.uniforms);
+    // Optional as well: a failure leaves neural rendering unavailable. Lanes 8..10, dummies bound above.
+    const char* nrInput[] = { kVersion, kNrLib, kNrInputShader };
+    const char* nrApply[] = { kVersion, kNrLib, kNrApplyShader };
+    mNrInput.id = BuildProgram("neural rendering input", nrInput, 3, mNrInput.uniforms);
+    mNrApply.id = BuildProgram("neural rendering apply", nrApply, 3, mNrApply.uniforms);
     const char* comp[] = { kVersion, kCompositeShader };
     const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
     const char* compNoDither[] = { kVersion, "#define NO_DITHER\n", kCompositeShader };
@@ -4659,12 +4781,33 @@ void PostFxGL::CheckError(const char* where) {
     }
 }
 
-static const char* const kStageNames[NEWDAWN_PERF_STAGES] = {
-    "opaque end / AO", "scene end / bloom+grade", "shadows", "sun shafts", "water", "water opaque copy",
-    "physical sky", "volumetric clouds", "sky ambient cube", "volumetric fog", "textured sun flare",
-    "ambient particles", "wet surfaces and rain shelter", "rain and snow", "screen-space GI", "VFX sprites",
-    "local lights", "water caustics", "underwater", "grass", "night stars", "TAA", "point-light shadows",
-    "interior window light", "emissive surfaces", "world GI" };
+static const char* const kStageNames[NEWDAWN_PERF_STAGES] = { "opaque end / AO",
+                                                              "scene end / bloom+grade",
+                                                              "shadows",
+                                                              "sun shafts",
+                                                              "water",
+                                                              "water opaque copy",
+                                                              "physical sky",
+                                                              "volumetric clouds",
+                                                              "sky ambient cube",
+                                                              "volumetric fog",
+                                                              "textured sun flare",
+                                                              "ambient particles",
+                                                              "wet surfaces and rain shelter",
+                                                              "rain and snow",
+                                                              "screen-space GI",
+                                                              "VFX sprites",
+                                                              "local lights",
+                                                              "water caustics",
+                                                              "underwater",
+                                                              "grass",
+                                                              "night stars",
+                                                              "TAA",
+                                                              "point-light shadows",
+                                                              "interior window light",
+                                                              "emissive surfaces",
+                                                              "world GI",
+                                                              "neural rendering (GL side)" };
 static float sStageMs[NEWDAWN_PERF_STAGES] = {};
 float gNewDawnGpuFrameMs = 0.0f; // written by GfxRenderingAPIOGL
 
@@ -4755,6 +4898,7 @@ bool PostFxGL::BeginHdr(const FramebufferOGL& fb) {
     mRaySkyReady = false;
     mLocalMarking = false;
     mTaaCam.valid = false; // the interpreter sets it again, after this call, when TAA is on for the frame
+    mNrCam.valid = false;  // and this one when neural rendering is
     if (!mUsable || !mHdrCopy.id || !CvInt("gNewDawn.HDR.Enabled", 0))
         return false;
     GlStateGuard guard;
@@ -5497,6 +5641,25 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
     Draw(fb.fbo, fb.width, fb.height);
     CheckError("HDR presentation copy");
     if (mStats) {
+        // How evenly frames arrive (CPU clock at this point of each frame): mean, and the worst of the window.
+        static std::chrono::steady_clock::time_point last{};
+        static double sum = 0.0, worst = 0.0;
+        static int count = 0, late = 0;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+        if (ms < 1000.0) {
+            sum += ms;
+            worst = std::max(worst, ms);
+            late += ms > 25.0;
+            if (++count == 300) {
+                SPDLOG_INFO(
+                    "NewDawnPostFx: frame interval averages {:.2f} ms, worst {:.2f} ms, {} over 25 ms, in 300 frames",
+                    sum / 300.0, worst, late);
+                sum = worst = 0.0;
+                count = late = 0;
+            }
+        }
         // Whole 3D world on the GPU: HDR world open to the presentation copy (timestamps, so the per-pass timers nest).
         glQueryCounter(mWorldQuery[mWorldNext][1], GL_TIMESTAMP);
         mWorldPending[mWorldNext] = true;
@@ -5517,6 +5680,17 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
             glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
             glPixelStorei(GL_PACK_ALIGNMENT, packAlign);
             char name[512];
+            if (mDumpDone == 0 && mNrProxy.tex != 0) { // what the neural network was last given, as it is stored
+                std::vector<uint8_t> proxy((size_t)mNrProxy.w * mNrProxy.h * 3);
+                Bind(0, mNrProxy.tex);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, proxy.data());
+                snprintf(name, sizeof(name), "%s/nrproxy_%dx%d.rgb", dir, mNrProxy.w, mNrProxy.h);
+                if (FILE* f = fopen(name, "wb")) {
+                    fwrite(proxy.data(), 1, proxy.size(), f);
+                    fclose(f);
+                }
+                Bind(0, mHdrDisplay.tex);
+            }
             snprintf(name, sizeof(name), "%s/f%04d_%dx%d.rgb", dir, mDumpDone, mHdrDisplay.w, mHdrDisplay.h);
             if (FILE* f = fopen(name, "wb")) {
                 fwrite(pixels.data(), 1, pixels.size(), f);
@@ -8434,7 +8608,7 @@ void PostFxGL::SetTaaCamera(const float* viewProj, float ndcXScale, float flipY,
     mTaaCam.valid = true;
 }
 
-const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Settings& s) {
+const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Settings& s, const Target& scene) {
     mTaaDidReset = false;
     if (!mTaaCam.valid || !mTaa.id || !mTaaMaskFill.id || s.debugView != 0) {
         mTaaValid = false;
@@ -8521,7 +8695,7 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mTaaOut.tex, 0);
     const GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
     glDrawBuffers(2, buffers);
-    Bind(0, mScene.tex);
+    Bind(0, scene.tex);
     Bind(1, mTaaDepth.tex);
     Bind(2, mTaaHist[mTaaRead].tex);
     Bind(3, useMask ? mTaaMask.tex : mFogNeutral);
@@ -8583,6 +8757,381 @@ const PostFxGL::Target* PostFxGL::RunTaa(const FramebufferOGL& fb, const Setting
     return &mTaaOut;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Neural rendering
+// ---------------------------------------------------------------------------------------------------------------------
+
+#ifdef NEWDAWN_NEURAL
+static NewDawnNeuralInfo sNeural = { 0, "Off" };
+#else
+static NewDawnNeuralInfo sNeural = { 3, "Not available in this build yet (Linux only for now)" };
+#endif
+
+void NewDawnNeuralGet(NewDawnNeuralInfo* out) {
+    *out = sNeural;
+}
+
+#ifdef NEWDAWN_NEURAL
+static void NeuralStatus(int state, const std::string& text) {
+    if (state != sNeural.state || text != sNeural.status) {
+        SPDLOG_INFO("NewDawnPostFx: neural rendering: {}", text);
+    }
+    sNeural.state = state;
+    snprintf(sNeural.status, sizeof sNeural.status, "%s", text.c_str());
+    if (state != 2) {
+        sNeural.width = sNeural.height = 0;
+        sNeural.runMs = sNeural.runsPerSecond = 0.0f;
+    }
+}
+
+// GL_EXT_memory_object_fd and GL_EXT_semaphore_fd, looked up by name: the headers this file is built against differ
+// per platform and need not know them.
+static struct NeuralGl {
+    bool looked = false, usable = false;
+    void(APIENTRY* GetUnsignedBytei_v)(GLenum, GLuint, GLubyte*) = nullptr;
+    void(APIENTRY* CreateMemoryObjects)(GLsizei, GLuint*) = nullptr;
+    void(APIENTRY* DeleteMemoryObjects)(GLsizei, const GLuint*) = nullptr;
+    void(APIENTRY* ImportMemoryFd)(GLuint, GLuint64, GLenum, GLint) = nullptr;
+    void(APIENTRY* BufferStorageMem)(GLenum, GLsizeiptr, GLuint, GLuint64) = nullptr;
+    void(APIENTRY* GenSemaphores)(GLsizei, GLuint*) = nullptr;
+    void(APIENTRY* DeleteSemaphores)(GLsizei, const GLuint*) = nullptr;
+    void(APIENTRY* ImportSemaphoreFd)(GLuint, GLenum, GLint) = nullptr;
+    void(APIENTRY* SignalSemaphore)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*) = nullptr;
+
+    bool Usable() {
+        if (looked) {
+            return usable;
+        }
+        looked = true;
+        bool memory = false, semaphore = false;
+        GLint count = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+        for (GLint i = 0; i < count; i++) {
+            const char* name = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+            memory |= name && !strcmp(name, "GL_EXT_memory_object_fd");
+            semaphore |= name && !strcmp(name, "GL_EXT_semaphore_fd");
+        }
+        auto get = [](auto& function, const char* name) {
+            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(SDL_GL_GetProcAddress(name));
+            return function != nullptr;
+        };
+        usable = memory && semaphore && get(GetUnsignedBytei_v, "glGetUnsignedBytei_vEXT") &&
+                 get(CreateMemoryObjects, "glCreateMemoryObjectsEXT") &&
+                 get(DeleteMemoryObjects, "glDeleteMemoryObjectsEXT") && get(ImportMemoryFd, "glImportMemoryFdEXT") &&
+                 get(BufferStorageMem, "glBufferStorageMemEXT") && get(GenSemaphores, "glGenSemaphoresEXT") &&
+                 get(DeleteSemaphores, "glDeleteSemaphoresEXT") && get(ImportSemaphoreFd, "glImportSemaphoreFdEXT") &&
+                 get(SignalSemaphore, "glSignalSemaphoreEXT");
+        return usable;
+    }
+} sNrGl;
+constexpr GLenum kHandleTypeOpaqueFd = 0x9586; // GL_HANDLE_TYPE_OPAQUE_FD_EXT
+constexpr GLenum kDeviceUuid = 0x9597;         // GL_DEVICE_UUID_EXT
+
+struct PostFxGL::NeuralState {
+    Neural::Runtime runtime;
+    Neural::Runtime::Request request;                     // what the runtime was last asked for
+    int extractSeen = 0;                                  // gNewDawn.Neural.ExtractRequest as last acted on
+    GLuint memory[3] = {}, buffer[3] = {}, semaphore = 0; // proxy, history, residual
+    bool imported = false, importFailed = false;
+    bool haveResidual = false;
+    float runVP[16] = {}, residualVP[16] = {}; // the camera of the run in flight, and of the residual on screen
+    bool camValid = false;
+    float prevEye[3] = {}, prevFwd[3] = {};
+    uint32_t frame = 0, runFrame = 0, runs = 0;
+    uint32_t epoch = 0, runEpoch = 0; // bumped by every reset: a run from before one is dropped when it lands
+    uint32_t freezeEpoch = 0;
+    float fade = 0.0f; // a first result after a reset comes in over a few frames
+    std::chrono::steady_clock::time_point lastResult{};
+};
+#else
+struct PostFxGL::NeuralState {};
+#endif
+
+PostFxGL::PostFxGL() = default;
+PostFxGL::~PostFxGL() = default;
+
+void PostFxGL::SetNeuralCamera(const float* viewProj, float ndcXScale, float flipY) {
+    std::copy(viewProj, viewProj + 16, mNrCam.vp);
+    mNrCam.ndcXScale = ndcXScale;
+    mNrCam.flipY = flipY;
+    mNrCam.valid = true;
+}
+
+void PostFxGL::NeuralRelease(bool runtime) {
+#ifdef NEWDAWN_NEURAL
+    if (!mNr) {
+        return;
+    }
+    NeuralState& n = *mNr;
+    if (n.imported) {
+        glDeleteBuffers(3, n.buffer);
+        sNrGl.DeleteMemoryObjects(3, n.memory);
+        sNrGl.DeleteSemaphores(1, &n.semaphore);
+        n.imported = false;
+    }
+    n.haveResidual = false;
+    n.epoch++;
+    if (runtime) {
+        for (Target* t : { &mNrProxy, &mNrHistory, &mNrResidual, &mNrScene, &mNrDepth }) {
+            glDeleteTextures(1, &t->tex);
+            glDeleteFramebuffers(1, &t->fbo);
+            *t = Target{};
+        }
+        for (int unit = 0; unit < 3; ++unit) {
+            Bind(unit, mFogNeutral); // the lanes keep a complete texture
+        }
+        mNr.reset(); // waits for a load in progress
+    }
+#endif
+}
+
+// Brings the runtime to what the settings ask for. True when it is ready to run and its buffers are imported.
+bool PostFxGL::NeuralPrepare(int w, int h) {
+#ifdef NEWDAWN_NEURAL
+    using Neural::Runtime;
+    if (!mNr) {
+        mNr = std::make_unique<NeuralState>();
+        mNr->extractSeen = CvInt("gNewDawn.Neural.ExtractRequest", 0); // a saved count is not a new request
+    }
+    NeuralState& n = *mNr;
+    const Runtime::State state = n.runtime.GetState();
+    if (state == Runtime::State::Working) {
+        NeuralStatus(1, n.runtime.Status());
+        return false;
+    }
+    Runtime::Request request;
+    const std::string directory = CvString("gNewDawn.Neural.ModelDir", "");
+    request.mModel =
+        directory.empty() ? Ship::Context::GetPathRelativeToAppDirectory("newdawn-neural-model") : directory;
+    request.mHeight = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.Height", 540), 180, std::max(h, 180)) & ~1u;
+    request.mWidth = (uint32_t)std::lround((double)w * request.mHeight / std::max(h, 1)) & ~1u;
+    sNrGl.GetUnsignedBytei_v(kDeviceUuid, 0, request.mUuid);
+    request.mHaveUuid = true;
+    const int extract = CvInt("gNewDawn.Neural.ExtractRequest", 0);
+    const bool asked = extract != n.extractSeen;
+    if (state == Runtime::State::Idle || !(request == n.request) || asked) {
+        n.extractSeen = extract;
+        const std::string dll = CvString("gNewDawn.Neural.DllPath", "");
+        std::error_code ec;
+        const bool haveModel = std::filesystem::exists(request.mModel / "manifest.json", ec);
+        if (!haveModel && dll.empty()) {
+            NeuralStatus(3, "No network yet: choose your nvngx_dlssnr.dll, then Extract");
+            return false;
+        }
+        NeuralRelease(false);
+        n.request = request;
+        n.importFailed = false;
+        if (asked || !haveModel) {
+            request.mExtractFrom = dll; // not part of the comparison above
+        }
+        n.runtime.Load(request);
+        NeuralStatus(1, "Starting...");
+        return false;
+    }
+    if (state == Runtime::State::Failed || n.importFailed) {
+        NeuralStatus(3,
+                     n.importFailed ? "The OpenGL driver refused the buffers shared with Vulkan" : n.runtime.Status());
+        return false;
+    }
+    if (!n.imported) {
+        while (glGetError() != GL_NO_ERROR) {}
+        const Runtime::Shared shared = n.runtime.TakeShared();
+        const int fds[3] = { shared.mProxyFd, shared.mHistoryFd, shared.mResidualFd };
+        sNrGl.CreateMemoryObjects(3, n.memory);
+        glGenBuffers(3, n.buffer);
+        for (int i = 0; i < 3; i++) {
+            sNrGl.ImportMemoryFd(n.memory[i], shared.mAllocationBytes, kHandleTypeOpaqueFd, fds[i]);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, n.buffer[i]);
+            sNrGl.BufferStorageMem(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)shared.mImageBytes, n.memory[i], 0);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        sNrGl.GenSemaphores(1, &n.semaphore);
+        sNrGl.ImportSemaphoreFd(n.semaphore, kHandleTypeOpaqueFd, shared.mSemaphoreFd);
+        n.imported = true;
+        if (const GLenum error = glGetError(); error != GL_NO_ERROR) {
+            SPDLOG_ERROR("NewDawnPostFx: neural rendering buffer import failed, GL error 0x{:X}", error);
+            NeuralRelease(false);
+            n.importFailed = true;
+            return false;
+        }
+        n.camValid = false;
+        SPDLOG_INFO("NewDawnPostFx: neural rendering {}", n.runtime.Status());
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Target& scene) {
+#ifdef NEWDAWN_NEURAL
+    if (!CvInt("gNewDawn.Neural.Enabled", 0)) {
+        if (mNr) {
+            NeuralRelease(true);
+            NeuralStatus(0, "Off");
+        }
+        return nullptr;
+    }
+    if (!mNrInput.id || !mNrApply.id || !sNrGl.Usable()) {
+        NeuralStatus(3, mNrInput.id && mNrApply.id
+                            ? "This OpenGL driver cannot share memory with Vulkan (GL_EXT_memory_object_fd)"
+                            : "The neural rendering shaders did not compile on this driver (see the log)");
+        return nullptr;
+    }
+    const int w = fb.width, h = fb.height;
+    if (!NeuralPrepare(w, h)) {
+        return nullptr;
+    }
+    NeuralState& n = *mNr;
+    const int nw = (int)n.request.mWidth, nh = (int)n.request.mHeight;
+    n.frame++;
+
+    // A reset drops the residual on screen and whatever run is in flight: no perspective camera this frame, a cut
+    // (the rule TAA uses), the frozen-frame fixture starting over.
+    float eye[3] = {}, fwd[3] = { 0, 0, 1 }, invVP[16];
+    const bool haveCamera = mNrCam.valid && TaaCameraOf(mNrCam.vp, eye, fwd) && TaaInvert4x4(mNrCam.vp, invVP);
+    bool reset = !haveCamera || !n.camValid;
+    if (!reset) {
+        const float dx = eye[0] - n.prevEye[0], dy = eye[1] - n.prevEye[1], dz = eye[2] - n.prevEye[2];
+        reset = dx * dx + dy * dy + dz * dz > 400.0f * 400.0f ||
+                fwd[0] * n.prevFwd[0] + fwd[1] * n.prevFwd[1] + fwd[2] * n.prevFwd[2] < 0.9f;
+    }
+    const uint32_t freezeEpoch = NewDawnFreezeEpoch().load(std::memory_order_relaxed);
+    reset |= n.freezeEpoch != freezeEpoch;
+    n.freezeEpoch = freezeEpoch;
+    if (reset) {
+        n.haveResidual = false;
+        n.fade = 0.0f;
+        n.epoch++;
+    }
+    n.camValid = haveCamera;
+    std::copy(eye, eye + 3, n.prevEye);
+    std::copy(fwd, fwd + 3, n.prevFwd);
+
+    if (n.runtime.Finished()) {
+        if (n.runEpoch == n.epoch) {
+            EnsureTarget(mNrResidual, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
+            Bind(2, mNrResidual.tex);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, n.buffer[2]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nw, nh, GL_RGBA, GL_HALF_FLOAT, nullptr);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            std::copy(n.runVP, n.runVP + 16, n.residualVP);
+            n.haveResidual = true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const float seconds = std::chrono::duration<float>(now - n.lastResult).count();
+        n.lastResult = now;
+        sNeural.runMs += ((float)n.runtime.LastMs() - sNeural.runMs) * (sNeural.runMs > 0.0f ? 0.1f : 1.0f);
+        if (seconds > 0.0f && seconds < 1.0f) {
+            sNeural.runsPerSecond +=
+                (1.0f / seconds - sNeural.runsPerSecond) * (sNeural.runsPerSecond > 0.0f ? 0.1f : 1.0f);
+        }
+        if (mStats && n.runs % 300 == 0) {
+            SPDLOG_INFO("NewDawnPostFx: neural rendering {}x{}, {:.2f} ms a run, {:.1f} runs a second", nw, nh,
+                        sNeural.runMs, sNeural.runsPerSecond);
+        }
+    }
+    sNeural.state = 2;
+    sNeural.width = nw;
+    sNeural.height = nh;
+    snprintf(sNeural.status, sizeof sNeural.status, "%s", n.runtime.Status().c_str());
+    if (!haveCamera) {
+        return nullptr;
+    }
+
+    // This frame's depth, single sample
+    EnsureTarget(mNrDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
+    if (!mUsable) {
+        return nullptr;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mNrDepth.fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    auto uniforms = [&] {
+        glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, invVP);
+        glUniformMatrix4fv(Loc("uRunViewProj"), 1, GL_FALSE, n.residualVP);
+        glUniform2f(Loc("uNdc"), mNrCam.ndcXScale, mNrCam.flipY);
+        glUniform2f(Loc("uStep"), 1.0f / nw, 1.0f / nh);
+        glUniform1f(Loc("uExposure"), std::exp2(std::clamp(LookCv(NEWDAWN_LOOK_EXPOSURE, -0.2f), -8.0f, 8.0f)));
+        glUniform1i(Loc("uHaveResidual"), n.haveResidual ? 1 : 0);
+    };
+    Bind(0, scene.tex);
+    Bind(1, mNrDepth.tex);
+    Bind(2, n.haveResidual ? mNrResidual.tex : mFogNeutral);
+
+    // A new run every `interleave` frames, once the last one has landed; its work is spread over those frames.
+    const uint32_t interleave = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.Interleave", 2), 1, 8);
+    if (!n.runtime.Busy() && n.frame - n.runFrame >= interleave) {
+        EnsureTarget(mNrProxy, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
+        EnsureTarget(mNrHistory, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
+        if (!mUsable) {
+            return nullptr;
+        }
+        Bind(2, n.haveResidual ? mNrResidual.tex : mFogNeutral); // EnsureTarget binds on its own lane
+        glBindFramebuffer(GL_FRAMEBUFFER, mNrProxy.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mNrHistory.tex, 0);
+        const GLenum both[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        glDrawBuffers(2, both);
+        Bind(0, scene.tex);
+        Use(mNrInput);
+        uniforms();
+        Draw(mNrProxy);
+        // Into the buffers Vulkan reads; the semaphore tells it when they are written.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, mNrProxy.fbo);
+        for (int i = 0; i < 2; i++) {
+            glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, n.buffer[i]);
+            glReadPixels(0, 0, nw, nh, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        sNrGl.SignalSemaphore(n.semaphore, 2, n.buffer, 0, nullptr, nullptr);
+        glFlush();
+        Neural::Runtime::Run run;
+        run.mSeed = n.runs;
+        run.mStyle = (float)std::clamp(CvInt("gNewDawn.Neural.Style", 0), 0, 2);
+        run.mTone = std::clamp(CvFloat("gNewDawn.Neural.Tone", 1.0f), 0.0f, 1.0f);
+        run.mStructure = std::clamp(CvFloat("gNewDawn.Neural.Structure", 1.0f), 0.0f, 1.0f);
+        run.mHistory = n.haveResidual;
+        // Experimental, off by default: the global-attention blocks see the whole image at 1/64 scale, and a run can
+        // reuse the last one's result instead of computing them (every `refresh`-th run and every first run after a
+        // reset does compute). Measured on a still frame: reused once (refresh 2) the picture holds; reused three
+        // times running (refresh 4) the temporal loop swings its brightness by a third, every ten runs.
+        const uint32_t refresh = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.VitRefresh", 2), 1, 64);
+        run.mReuseVit = CvInt("gNewDawn.Neural.VitReuse", 0) != 0 && n.haveResidual && n.runs % refresh != 0;
+        run.mSpread = interleave;
+        n.runtime.Start(run);
+        n.runs++;
+        n.runFrame = n.frame;
+        n.runEpoch = n.epoch;
+        std::copy(mNrCam.vp, mNrCam.vp + 16, n.runVP);
+        CheckError("neural rendering input");
+    } else {
+        n.runtime.Advance();
+    }
+    if (!n.haveResidual) {
+        return nullptr;
+    }
+
+    n.fade = std::min(1.0f, n.fade + 0.125f);
+    EnsureTarget(mNrScene, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
+    if (!mUsable) {
+        return nullptr;
+    }
+    Bind(0, scene.tex);
+    Bind(2, mNrResidual.tex);
+    Use(mNrApply);
+    uniforms();
+    glUniform1f(Loc("uStrength"), std::clamp(CvFloat("gNewDawn.Neural.Strength", 1.0f), 0.0f, 1.0f) * n.fade);
+    glUniform1i(Loc("uDebug"), CvInt("gNewDawn.Neural.Debug", 0));
+    Draw(mNrScene);
+    CheckError("neural rendering apply");
+    return &mNrScene;
+#else
+    return nullptr;
+#endif
+}
+
 void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa) {
     const int w = fb.width, h = fb.height;
     // Linear: the first bloom downsample is a 13-tap kernel that relies on bilinear taps
@@ -8613,18 +9162,36 @@ void PostFxGL::RunSceneEnd(const FramebufferOGL& fb, const Settings& s, bool taa
     // Temporal anti-aliasing resolves the jittered world here: before bloom and the display transform, so the
     // temporal supersampling happens in scene-referred light, and before the HUD, which is drawn after the world.
     const Target* sceneSrc = &mScene;
+    // Neural rendering works on the finished world only (`taa` is "this is the final read"), before or after the
+    // resolve. Off, it costs one cvar read.
+    const bool neural = taa && mHdrActive && (mNr || CvInt("gNewDawn.Neural.Enabled", 0));
+    const bool neuralFirst = neural && CvInt("gNewDawn.Neural.BeforeTaa", 0) != 0;
+    auto runNeural = [&] {
+        if (mTimers)
+            glEndQuery(GL_TIME_ELAPSED); // as for TAA below
+        BeginTimer(kNeuralTimerStage);
+        if (const Target* changed = RunNeural(fb, *sceneSrc))
+            sceneSrc = changed;
+        EndTimer(kNeuralTimerStage);
+        if (mTimers)
+            glBeginQuery(GL_TIME_ELAPSED, mQueries[1][mQueryNext[1]]);
+    };
+    if (neuralFirst)
+        runNeural();
     if (taa && mHdrActive && mTaaCam.valid && mTaa.id) {
         // Stage 1's timer is open around this function; GL_TIME_ELAPSED queries cannot nest, so TAA gets its own and
         // stage 1 (bloom, display transform) resumes after it.
         if (mTimers)
             glEndQuery(GL_TIME_ELAPSED);
         BeginTimer(kTaaTimerStage);
-        if (const Target* resolved = RunTaa(fb, s))
+        if (const Target* resolved = RunTaa(fb, s, *sceneSrc))
             sceneSrc = resolved;
         EndTimer(kTaaTimerStage);
         if (mTimers)
             glBeginQuery(GL_TIME_ELAPSED, mQueries[1][mQueryNext[1]]);
     }
+    if (neural && !neuralFirst)
+        runNeural();
 
     const bool useBloom = s.bloomOn && levels > 0;
     if (useBloom) {

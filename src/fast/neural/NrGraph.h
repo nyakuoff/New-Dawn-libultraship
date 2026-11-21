@@ -40,7 +40,9 @@ class Graph {
         bool mVit = false;  // one of the eight global-attention blocks (skippable: ViT reuse)
     };
 
-    Graph(Context& context, const Model& model, const Geometry& geometry);
+    // With `externalFeatures` the caller writes the "features" activation itself (the in-game path: a kernel builds
+    // it from the renderer's images) and SetFeatures is not used.
+    Graph(Context& context, const Model& model, const Geometry& geometry, bool externalFeatures = false);
     ~Graph();
     Graph(const Graph&) = delete;
     Graph& operator=(const Graph&) = delete;
@@ -58,6 +60,10 @@ class Graph {
     uint64_t ActivationBytes() const;
     size_t Dispatches() const {
         return mOps.size();
+    }
+    // "features" ([field][16], the input) and "head" ([field][8], four valid) are the two ends of the graph.
+    const Activation& Find(const std::string& name) const {
+        return *mByName.at(name);
     }
 
     // Input: [field][16] f32 in row-major token order. Output: the head, [field][4].
@@ -131,6 +137,7 @@ class Graph {
     Context& mContext;
     const Model& mModel;
     Geometry mGeometry;
+    bool mExternalFeatures = false;
     std::vector<std::unique_ptr<Activation>> mActivations;
     std::map<std::string, Activation*> mByName;
     std::vector<uint16_t> mArena; // released once uploaded

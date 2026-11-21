@@ -11,7 +11,7 @@ import struct, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-KERNELS = ["gemm", "block32", "attention", "vit_normalize", "vit_attention", "ops"]
+KERNELS = ["gemm", "block32", "attention", "vit_normalize", "vit_attention", "ops", "features", "composite"]
 
 
 def compile_one(name: str) -> bytes:

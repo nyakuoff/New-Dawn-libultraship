@@ -150,6 +150,10 @@ class GfxRenderingAPI {
                               float jitterPxX, float jitterPxY) {
     }
 
+    // New Dawn neural rendering: the same camera (un-jittered), handed over whether TAA is on or not.
+    virtual void SetNeuralCamera(const float* viewProj, float ndcXScale, float flipY) {
+    }
+
     virtual bool PostFxAvailable() {
         return false;
     }

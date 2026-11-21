@@ -1,6 +1,7 @@
 #include "NrVk.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace Fast::Neural {
@@ -171,10 +172,20 @@ Context::Context(const char* deviceNameFilter, const uint8_t* uuid) {
     vkGetPhysicalDeviceQueueFamilyProperties(mPhysical, &families, nullptr);
     std::vector<VkQueueFamilyProperties> queues(families);
     vkGetPhysicalDeviceQueueFamilyProperties(mPhysical, &families, queues.data());
+    // The first family that computes; NEWDAWN_NR_QUEUE=compute asks for one that does nothing else (an experiment:
+    // on AMD that is another ring of the GPU, scheduled beside the renderer's instead of in line with it).
+    const char* wanted = getenv("NEWDAWN_NR_QUEUE");
+    const bool dedicated = wanted && !strcmp(wanted, "compute");
+    bool found = false;
     for (uint32_t i = 0; i < families; ++i) {
-        if (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+        const bool computes = queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT;
+        const bool draws = queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT;
+        if (computes && (!found || (dedicated && !draws))) {
             mQueueFamily = i;
-            break;
+            found = true;
+            if (!dedicated || !draws) {
+                break;
+            }
         }
     }
 
@@ -449,6 +460,105 @@ void Context::WaitIdle() {
     if (!mPending.empty()) {
         vkFreeCommandBuffers(mDevice, mCommandPool, (uint32_t)mPending.size(), mPending.data());
         mPending.clear();
+    }
+}
+
+SharedBuffer Context::CreateSharedBuffer(VkDeviceSize size) {
+    if (!mInfo.mExternalFd) {
+        throw VkError(mInfo.mName + " cannot share memory with the renderer");
+    }
+    SharedBuffer shared;
+    shared.mBuffer.mSize = (size + 4095) & ~VkDeviceSize(4095);
+    VkExternalMemoryBufferCreateInfo external{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external };
+    info.size = shared.mBuffer.mSize;
+    info.usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    Check(vkCreateBuffer(mDevice, &info, nullptr, &shared.mBuffer.mBuffer), "vkCreateBuffer (shared)");
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(mDevice, shared.mBuffer.mBuffer, &requirements);
+    VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    dedicated.buffer = shared.mBuffer.mBuffer;
+    VkExportMemoryAllocateInfo exported{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &dedicated };
+    exported.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exported };
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Check(vkAllocateMemory(mDevice, &allocation, nullptr, &shared.mBuffer.mMemory), "vkAllocateMemory (shared)");
+    Check(vkBindBufferMemory(mDevice, shared.mBuffer.mBuffer, shared.mBuffer.mMemory, 0), "vkBindBufferMemory");
+    VkMemoryGetFdInfoKHR get{ VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+    get.memory = shared.mBuffer.mMemory;
+    get.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    Check(vkGetMemoryFdKHR(mDevice, &get, &shared.mFd), "vkGetMemoryFdKHR");
+    shared.mAllocationSize = requirements.size;
+    Fill(shared.mBuffer);
+    return shared;
+}
+
+VkSemaphore Context::CreateSharedSemaphore(int& fd) {
+    if (!mInfo.mExternalFd) {
+        throw VkError(mInfo.mName + " cannot share a semaphore with the renderer");
+    }
+    VkExportSemaphoreCreateInfo exported{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+    exported.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkSemaphoreCreateInfo info{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &exported };
+    VkSemaphore semaphore;
+    Check(vkCreateSemaphore(mDevice, &info, nullptr, &semaphore), "vkCreateSemaphore");
+    VkSemaphoreGetFdInfoKHR get{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+    get.semaphore = semaphore;
+    get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    Check(vkGetSemaphoreFdKHR(mDevice, &get, &fd), "vkGetSemaphoreFdKHR");
+    return semaphore;
+}
+
+void Context::DestroySemaphore(VkSemaphore semaphore) {
+    if (semaphore) {
+        vkDestroySemaphore(mDevice, semaphore, nullptr);
+    }
+}
+
+void Context::End(VkCommandBuffer commands) {
+    Check(vkEndCommandBuffer(commands), "vkEndCommandBuffer");
+}
+
+void Context::SubmitRecorded(const std::vector<VkCommandBuffer>& commands, VkSemaphore wait, VkFence fence) {
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = (uint32_t)commands.size();
+    submit.pCommandBuffers = commands.data();
+    if (wait) {
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &wait;
+        submit.pWaitDstStageMask = &stage;
+    }
+    Check(vkQueueSubmit(mQueue, 1, &submit, fence), "vkQueueSubmit");
+}
+
+void Context::FreeRecorded(VkCommandBuffer commands) {
+    if (commands) {
+        vkFreeCommandBuffers(mDevice, mCommandPool, 1, &commands);
+    }
+}
+
+VkFence Context::CreateFence() {
+    VkFenceCreateInfo info{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence;
+    Check(vkCreateFence(mDevice, &info, nullptr, &fence), "vkCreateFence");
+    return fence;
+}
+
+bool Context::FenceSignaled(VkFence fence) {
+    return vkGetFenceStatus(mDevice, fence) == VK_SUCCESS;
+}
+
+void Context::ResetFence(VkFence fence) {
+    Check(vkResetFences(mDevice, 1, &fence), "vkResetFences");
+}
+
+void Context::DestroyFence(VkFence fence) {
+    if (fence) {
+        vkDestroyFence(mDevice, fence, nullptr);
     }
 }
 

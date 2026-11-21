@@ -1,0 +1,73 @@
+#version 460
+// The network's input, straight from the renderer's two image buffers: sixteen half lanes per padded pixel, written
+// in the tiled token order. Lanes: three Gaussian noise lanes, 1, the centred proxy colour, the centred history
+// colour (the proxy again where there is no history), style / 128, tone, 1, structure, structure, 0. The lane
+// definitions and the noise sequence are OpenDLSS-NR's preprocess.comp (MIT).
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+  uint tokens;        // the padded field
+  uint rowStride;     // threads per dispatch row
+  uint width4;        // field width in tiles
+  uint validWidth, validHeight;
+  uint seed;
+  uint historyValid;  // 0: no pixel has a history (a reset)
+  float style, tone, structure;
+} pc;
+
+// rgba16f [validHeight][validWidth], top row first. Proxy: display code values. History: the same, a > 0.5 where
+// the pixel has one.
+layout(std430, binding = 0) readonly buffer P_ { uvec2 proxy[]; };
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };
+layout(std430, binding = 3) readonly buffer H_ { uvec2 history[]; };
+
+float hashUniform(uint value) {
+  uint mixed = value;
+  mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
+  mixed *= 0x108ef2d9u;
+  uint integer = ((mixed >> 30u) ^ (mixed >> 8u)) + 1u;
+  return float(integer) * uintBitsToFloat(0x33800000u);
+}
+
+vec3 gaussian3(uint x, uint y, uint seed) {
+  uint base = (x * 0x8da6b343u) ^ (seed * 0x9e3779b9u) ^ (y * 0xd8163841u) ^ 0x243f6a88u;
+  base = (base >> ((base >> 28u) + 4u)) ^ base;
+  base *= 0x108ef2d9u;
+  base = (base >> 22u) ^ base;
+  float u0 = hashUniform(base * 0x2c9277b5u + 0xac564b05u);
+  float u1 = hashUniform(base * 0xfa6dc5f9u + 0x4712a88eu);
+  float u2 = hashUniform(base * 0xcaa5b80du + 0x21dd796bu);
+  float u3 = hashUniform(base * 0x83232c31u + 0x3463e0acu);
+  float radius0 = sqrt(log2(u0) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float radius1 = sqrt(log2(u2) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float angle0 = u1 * uintBitsToFloat(0x40c90fdbu);
+  float angle1 = u3 * uintBitsToFloat(0x40c90fdbu);
+  return vec3(radius0 * cos(angle0), radius0 * sin(angle0), radius1 * cos(angle1));
+}
+
+f16vec3 centred(vec3 code) {   // f16(f16(f16(code) - 0.5) * 0.125)
+  precise f16vec3 shifted = f16vec3(code) - f16vec3(0.5);
+  precise f16vec3 scaled = shifted * f16vec3(0.125);
+  return scaled;
+}
+
+void main() {
+  const uint token = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * pc.rowStride;
+  if (token >= pc.tokens) return;
+  const uvec2 pixel = tiledPixel(token, pc.width4);
+  // Outside the valid rectangle the image is mirrored; the noise hashes the padded coordinate.
+  const uint sx = pixel.x < pc.validWidth ? pixel.x : 2u * pc.validWidth - pixel.x - 2u;
+  const uint sy = pixel.y < pc.validHeight ? pixel.y : 2u * pc.validHeight - pixel.y - 2u;
+  const uint source = sy * pc.validWidth + sx;
+  const vec3 code = vec3(unpackHalf2x16(proxy[source].x), unpackHalf2x16(proxy[source].y).x);
+  const vec4 past = vec4(unpackHalf2x16(history[source].x), unpackHalf2x16(history[source].y));
+  const f16vec3 now = centred(code);
+  const f16vec3 before = pc.historyValid != 0u && past.a > 0.5 ? centred(past.rgb) : now;
+  const f16vec3 noise = f16vec3(gaussian3(pixel.x, pixel.y, pc.seed));
+  out8[token * 2u] = packOct(Oct(f16vec4(noise, 1.0), f16vec4(now, before.r)));
+  out8[token * 2u + 1u] =
+      packOct(Oct(f16vec4(before.gb, pc.style / 128.0, pc.tone), f16vec4(1.0, pc.structure, pc.structure, 0.0)));
+}
