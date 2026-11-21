@@ -1,0 +1,56 @@
+#version 460
+// Window attention of the blocks wider than 32 channels: one (8x8 window, head) per workgroup. Reads the raw QKV
+// projection [tokens][3C] (head-major: Q | K | V, 32 each) and publishes the attended values as E4M3 [tokens][C].
+// See nr_window.glsl for the layout and nr_common.glsl for what shapes it.
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Push {
+  uvec2 size4;       // level size in 4-pixel tiles
+  uvec2 shift;       // window phase in tiles (0 or 1 per axis)
+  uint channels;     // C
+  uint priorBase;    // [heads][64][64] f16 in the arena, in halves
+  uint scaleBase;    // [heads] f16 learned attention scales, in halves
+} pc;
+
+layout(std430, binding = 0) readonly buffer X8_ { uvec4 x8[]; };
+layout(std430, binding = 1) readonly buffer W_ { float16_t w[]; };
+layout(std430, binding = 1) readonly buffer W8_ { uvec4 w8[]; };
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };
+
+#include "nr_window.glsl"
+
+void main() {
+  const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, head = gl_WorkGroupID.z;
+  const uint row = lane >> 1u, part = lane & 1u, token = sg * 16u + row;
+  const int tileBase = windowTileRow(sg, pc.shift, pc.size4);
+  const uint stage = sg * PRIVATE, operand = stage + 256u;
+  const float16_t qScale = w[pc.scaleBase + head];
+
+  [[unroll]] for (uint which = 0u; which < 3u; ++which) {
+    Oct v[2];
+    [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+      v[t] = Oct(f16vec4(0.0), f16vec4(0.0));
+      if (tileBase >= 0)
+        v[t] = unpackOct(x8[((uint(tileBase) + row) * pc.channels * 3u + head * 96u + which * 32u + t * 16u + part * 8u) >> 3u]);
+    }
+    publishQkv(which, v[0], v[1], qScale, operand, row, part, token);
+  }
+  barrier();   // every tile's K and V are in place
+
+  ACC acc0, acc1;
+  windowAttend(stage, operand, row, part, token, pc.priorBase + head * 4096u, acc0, acc1);
+  [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+    if (t == 0u) coopMatStore(ACC16(acc0), lds, stage, 16u, ROW);
+    else coopMatStore(ACC16(acc1), lds, stage, 16u, ROW);
+    const Oct o = quantOct(loadLds(stage + row * 16u + part * 8u));
+    if (tileBase >= 0)
+      out8[((uint(tileBase) + row) * pc.channels + head * 32u + t * 16u + part * 8u) >> 3u] = packOct(o);
+  }
+}

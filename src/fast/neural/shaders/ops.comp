@@ -1,0 +1,77 @@
+#version 460
+// The element-wise steps between blocks, one thread per eight channels of one output token (OpenDLSS-NR ops.comp,
+// MIT; here every tensor is half-float and tiled, so the 2x2 quad and the 2x upsample are index arithmetic).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(constant_id = 0) const uint MODE = 0;
+layout(local_size_x = 64) in;
+
+const uint MODE_FEATURES = 0u;   // f32 [field][16], row-major -> halves, tiled
+const uint MODE_POOL = 1u;       // raw halves, 2x2 box pool -> E4M3 at the next level
+const uint MODE_MERGE = 2u;      // 2x upsample of the low-level half projection + skip * scale -> E4M3 (+ the half)
+const uint MODE_POST = 3u;       // 2x upsample of block 69 * scale + block 0 * scale -> the half and its E4M3
+
+layout(push_constant) uniform Push {
+  uint groups;        // output tokens * channels / 8
+  uint rowStride;     // threads per dispatch row
+  uint channels;
+  uint outWidth4;     // output level width in tiles
+  uint inWidth4;      // input (pool: finer; merge, post: coarser) level width in tiles
+  uvec2 inSize;       // pool: the input level in pixels
+  uint scaleA, scaleB; // per-channel f16 scales in the arena, in halves (multiples of 8)
+  uint dual;          // merge: also store the half at binding 5
+} pc;
+
+layout(std430, binding = 0) readonly buffer In_ { uvec4 in8[]; };
+layout(std430, binding = 0) readonly buffer In32_ { vec4 in32[]; };
+layout(std430, binding = 1) readonly buffer W8_ { uvec4 w8[]; };
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };
+layout(std430, binding = 3) readonly buffer S_ { uvec4 skip8[]; };
+layout(std430, binding = 5) writeonly buffer R_ { uvec4 raw8[]; };
+
+void main() {
+  const uint group = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * pc.rowStride;
+  if (group >= pc.groups) return;
+  const uint perToken = pc.channels / 8u;
+  const uint token = group / perToken, c = (group % perToken) * 8u;
+  const uvec2 pixel = tiledPixel(token, pc.outWidth4);
+
+  if (MODE == MODE_FEATURES) {
+    const uint source = (pixel.y * pc.outWidth4 * 4u + pixel.x) * 4u + (c >> 2u);
+    out8[group] = packOct(Oct(f16vec4(in32[source]), f16vec4(in32[source + 1u])));
+  } else if (MODE == MODE_POOL) {
+    // ((a + b) + (c + d)) * 0.25, every step a half. A quad that is not inside the input (a level rounded up to
+    // a multiple of 4) pools to zero.
+    const uvec2 s = pixel * 2u;
+    Oct value = Oct(f16vec4(0.0), f16vec4(0.0));
+    if (s.x + 1u < pc.inSize.x && s.y + 1u < pc.inSize.y) {
+      const Oct a = unpackOct(in8[(tiledIndex(s.x, s.y, pc.inWidth4) * pc.channels + c) >> 3u]);
+      const Oct b = unpackOct(in8[(tiledIndex(s.x + 1u, s.y, pc.inWidth4) * pc.channels + c) >> 3u]);
+      const Oct d = unpackOct(in8[(tiledIndex(s.x, s.y + 1u, pc.inWidth4) * pc.channels + c) >> 3u]);
+      const Oct e = unpackOct(in8[(tiledIndex(s.x + 1u, s.y + 1u, pc.inWidth4) * pc.channels + c) >> 3u]);
+      precise f16vec4 topL = a.lo + b.lo, topH = a.hi + b.hi, bottomL = d.lo + e.lo, bottomH = d.hi + e.hi;
+      precise f16vec4 sumL = topL + bottomL, sumH = topH + bottomH;
+      precise f16vec4 lo = sumL * float16_t(0.25), hi = sumH * float16_t(0.25);
+      value = Oct(lo, hi);
+    }
+    out8[group] = packOct(quantOct(value));
+  } else {
+    const uint low = (tiledIndex(pixel.x >> 1u, pixel.y >> 1u, pc.inWidth4) * pc.channels + c) >> 3u;
+    const Oct up = unpackOct(in8[low]), skip = unpackOct(skip8[group]);
+    const Oct a = unpackOct(w8[(pc.scaleA + c) >> 3u]);
+    Oct value;
+    if (MODE == MODE_MERGE) {   // one FMA in f32, then a half
+      precise vec4 lo = fma(vec4(skip.lo), vec4(a.lo), vec4(up.lo)), hi = fma(vec4(skip.hi), vec4(a.hi), vec4(up.hi));
+      value = Oct(f16vec4(lo), f16vec4(hi));
+    } else {                    // f16(up * scaleA), then fma(adapter, scaleB, that), then a half
+      const Oct b = unpackOct(w8[(pc.scaleB + c) >> 3u]);
+      precise f16vec4 il = up.lo * a.lo, ih = up.hi * a.hi;
+      precise vec4 lo = fma(vec4(skip.lo), vec4(b.lo), vec4(il)), hi = fma(vec4(skip.hi), vec4(b.hi), vec4(ih));
+      value = Oct(f16vec4(lo), f16vec4(hi));
+    }
+    out8[group] = packOct(quantOct(value));
+    if (MODE == MODE_POST || pc.dual != 0u) raw8[group] = packOct(value);
+  }
+}

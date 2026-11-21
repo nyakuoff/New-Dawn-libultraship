@@ -1,0 +1,135 @@
+#version 460
+// One whole 32-channel block (FFN -> QKV -> window attention -> projection, two scaled skips) for one 8x8 window
+// per workgroup: 256 WMMAs and every intermediate on chip.
+//
+// The same structure as the reference's fused C32 block (OpenDLSS-NR fused_block32.comp, MIT). The FFN's hidden
+// layer is streamed through the subgroup's staging tile sixteen channels at a time; the raw FFN output stays in
+// registers for the attention skip. See nr_window.glsl for the layout and nr_common.glsl for what shapes it.
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(constant_id = 0) const uint FLAGS = 0;
+layout(local_size_x = 128) in;
+
+const uint F_SKIP = 1u;      // the FFN's skip is the half tensor at binding 3, not the E4M3 state (blocks 0, 66, 70)
+const uint F_RAW_OUT = 2u;   // also store the block's half output at binding 4 (what the next pool or the head reads)
+
+layout(push_constant) uniform Push {
+  uvec2 size4;                 // level size in 4-pixel tiles
+  uvec2 shift;                 // window phase in tiles (0 or 1 per axis)
+  uint w1, w2, wQkv, wProj;    // matrices in the arena, in halves: k16-tile-major [K/16][N][16]
+  uint ffnScale, attnScale;    // per-channel f16 skip scales (multiples of 8 halves)
+  uint prior;                  // [64 query][64 key] f16, both tiled
+  float qScale;                // the head's learned attention scale
+} pc;
+
+layout(std430, binding = 0) readonly buffer X_ { float16_t x[]; };
+layout(std430, binding = 0) readonly buffer X8_ { uvec4 x8[]; };
+layout(std430, binding = 1) readonly buffer W_ { float16_t w[]; };
+layout(std430, binding = 1) readonly buffer W8_ { uvec4 w8[]; };
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };
+layout(std430, binding = 3) readonly buffer S8_ { uvec4 skip8[]; };
+layout(std430, binding = 4) writeonly buffer R_ { uvec4 raw8[]; };
+
+#include "nr_window.glsl"
+
+MB weightTile(uint base, uint N, uint kt, uint t) {
+  MB B;
+  coopMatLoad(B, w, base + (kt * N + t * 16u) * 16u, 16u, COL);
+  return B;
+}
+
+void main() {
+  const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+  const uint row = lane >> 1u, part = lane & 1u, token = sg * 16u + row;
+  const int tileBase = windowTileRow(sg, pc.shift, pc.size4);
+  const uint stage = sg * PRIVATE, operand = stage + 256u;
+  const uint mine = stage + row * 16u + part * 8u;
+
+  // FFN: x[16][32] * W1 -> hidden, SiLU, E4M3, * W2, sixteen hidden channels at a time.
+  MA X0 = MA(float16_t(0.0)), X1 = MA(float16_t(0.0));
+  if (tileBase >= 0) {
+    coopMatLoad(X0, x, uint(tileBase) * 32u, 32u, ROW);
+    coopMatLoad(X1, x, uint(tileBase) * 32u + 16u, 32u, ROW);
+  }
+  ACC ffn0 = ACC(0.0), ffn1 = ACC(0.0);
+  [[unroll]] for (uint kt = 0u; kt < 8u; ++kt) {
+    ACC hidden = coopMatMulAdd(X0, weightTile(pc.w1, 128u, 0u, kt), ACC(0.0));
+    hidden = coopMatMulAdd(X1, weightTile(pc.w1, 128u, 1u, kt), hidden);
+    coopMatStore(ACC16(hidden), lds, stage, 16u, ROW);
+    const Oct h = loadLds(mine);
+    storeLds(mine, Oct(quantE4(silu(h.lo)), quantE4(silu(h.hi))));
+    MA A;
+    coopMatLoad(A, lds, stage, 16u, ROW);
+    ffn0 = coopMatMulAdd(A, weightTile(pc.w2, 32u, kt, 0u), ffn0);
+    ffn1 = coopMatMulAdd(A, weightTile(pc.w2, 32u, kt, 1u), ffn1);
+  }
+  // y = FFN + skip * ffnScale (a half). Raw in registers for the attention skip; its E4M3 publication is the QKV input.
+  Oct y[2];
+  [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+    if (t == 0u) coopMatStore(ACC16(ffn0), lds, stage, 16u, ROW);
+    else coopMatStore(ACC16(ffn1), lds, stage, 16u, ROW);
+    const uint c = t * 16u + part * 8u;
+    const Oct acc = loadLds(mine);
+    Oct xs = Oct(f16vec4(0.0), f16vec4(0.0));
+    if (tileBase >= 0) {
+      const uint at = ((uint(tileBase) + row) * 32u + c) >> 3u;
+      if ((FLAGS & F_SKIP) != 0u) xs = unpackOct(skip8[at]);
+      else xs = unpackOct(x8[at]);
+    }
+    const Oct scale = unpackOct(w8[(pc.ffnScale + c) >> 3u]);
+    precise f16vec4 pl = xs.lo * scale.lo, ph = xs.hi * scale.hi;
+    precise f16vec4 yl = acc.lo + pl, yh = acc.hi + ph;
+    y[t] = Oct(yl, yh);
+    storeLds(operand + row * 32u + c, quantOct(y[t]));
+  }
+
+  // QKV: y[16][32] * Wqkv, two column tiles each for Q, K and V.
+  {
+    MA A0, A1;
+    coopMatLoad(A0, lds, operand, 32u, ROW);
+    coopMatLoad(A1, lds, operand + 16u, 32u, ROW);
+    [[unroll]] for (uint which = 0u; which < 3u; ++which) {
+      Oct v[2];
+      [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+        ACC acc = coopMatMulAdd(A0, weightTile(pc.wQkv, 96u, 0u, which * 2u + t), ACC(0.0));
+        acc = coopMatMulAdd(A1, weightTile(pc.wQkv, 96u, 1u, which * 2u + t), acc);
+        coopMatStore(ACC16(acc), lds, stage, 16u, ROW);
+        v[t] = loadLds(mine);
+      }
+      publishQkv(which, v[0], v[1], float16_t(pc.qScale), operand, row, part, token);
+    }
+  }
+  barrier();   // every tile's K and V are in place
+
+  ACC acc0, acc1;
+  windowAttend(stage, operand, row, part, token, pc.prior, acc0, acc1);
+  [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+    if (t == 0u) coopMatStore(ACC16(acc0), lds, stage, 16u, ROW);
+    else coopMatStore(ACC16(acc1), lds, stage, 16u, ROW);
+    storeLds(operand + row * 32u + t * 16u + part * 8u, quantOct(loadLds(mine)));
+  }
+
+  // Projection: O[16][32] * Wproj + y * attnScale; E4M3 out (and the half, where the next stage reads it).
+  MA A0, A1;
+  coopMatLoad(A0, lds, operand, 32u, ROW);
+  coopMatLoad(A1, lds, operand + 16u, 32u, ROW);
+  [[unroll]] for (uint t = 0u; t < 2u; ++t) {
+    ACC acc = coopMatMulAdd(A0, weightTile(pc.wProj, 32u, 0u, t), ACC(0.0));
+    acc = coopMatMulAdd(A1, weightTile(pc.wProj, 32u, 1u, t), acc);
+    coopMatStore(ACC16(acc), lds, stage, 16u, ROW);
+    const uint c = t * 16u + part * 8u;
+    const Oct o = loadLds(mine);
+    const Oct scale = unpackOct(w8[(pc.attnScale + c) >> 3u]);
+    precise f16vec4 pl = y[t].lo * scale.lo, ph = y[t].hi * scale.hi;
+    precise f16vec4 ol = o.lo + pl, oh = o.hi + ph;
+    if (tileBase < 0) continue;
+    const uint at = ((uint(tileBase) + row) * 32u + c) >> 3u;
+    out8[at] = packOct(Oct(quantE4(ol), quantE4(oh)));
+    if ((FLAGS & F_RAW_OUT) != 0u) raw8[at] = packOct(Oct(ol, oh));
+  }
+}

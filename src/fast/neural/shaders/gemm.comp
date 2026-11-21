@@ -1,0 +1,90 @@
+#version 460
+// FP16 GEMM on VK_KHR_cooperative_matrix (RDNA3 WMMA through RADV): D[rows][N] = A[rows][K] * W with f32
+// accumulation, then the publication: + residual * scale (a half), cubic SiLU, the E4M3 grid.
+//
+// A is f16 row-major. W is f16, k16-tile-major [K/16][N][16] inside the weight arena, so a 16x16 B tile is 512
+// contiguous bytes and each lane's column is two 16-byte reads. Each subgroup owns 16 rows and TILES 16-column
+// tiles and publishes them itself, one tile at a time through its private 16x16 staging tile.
+// gl_WorkGroupID.z batches independent GEMMs of one shape (the expert and branch MLPs) into one dispatch.
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(constant_id = 0) const uint K = 32;
+layout(constant_id = 1) const uint TILES = 4;      // 16-column tiles per subgroup
+layout(constant_id = 2) const uint FLAGS = 0;
+layout(local_size_x = 128) in;                     // four independent subgroups of 32
+
+const uint F_RESIDUAL = 1u;   // + residual[row][column] * scale[column]
+const uint F_SILU = 2u;
+const uint F_QUANT = 4u;      // binding 2 receives the E4M3 publication instead of the half
+const uint F_DUAL = 8u;       // the half to binding 2 and its E4M3 publication to binding 5
+
+layout(push_constant) uniform Push {
+  uint rows, N;                    // N: columns of the weight matrix (a multiple of 16)
+  uint validN;                     // columns actually stored (a multiple of 8; the padded RGBA head stores 8)
+  uint inStride, inCol, outStride, outCol, resStride, resCol;
+  uint wBase;                      // the matrix, in halves within the arena
+  uint scaleBase;                  // the residual's per-column f16 scale, in halves (a multiple of 8)
+  uint batchIn, batchOut, batchW;  // per gl_WorkGroupID.z: input / output column step, weight step (halves)
+} pc;
+
+layout(std430, binding = 0) readonly buffer A_ { float16_t a[]; };
+layout(std430, binding = 1) readonly buffer W_ { float16_t w[]; };
+layout(std430, binding = 1) readonly buffer W8_ { uvec4 w8[]; };
+layout(std430, binding = 2) writeonly buffer O_ { uvec4 out8[]; };
+layout(std430, binding = 3) readonly buffer R_ { uvec4 res8[]; };
+layout(std430, binding = 5) writeonly buffer Q_ { uvec4 quant8[]; };
+
+shared float16_t lds[4u * 256u];
+
+void main() {
+  const uint rowBase = (gl_WorkGroupID.y * 4u + gl_SubgroupID) * 16u;
+  const uint colBase = gl_WorkGroupID.x * TILES * 16u;
+  if (rowBase >= pc.rows) return;
+  const uint inCol = pc.inCol + gl_WorkGroupID.z * pc.batchIn;
+  const uint outCol = pc.outCol + gl_WorkGroupID.z * pc.batchOut;
+  const uint wBase = pc.wBase + gl_WorkGroupID.z * pc.batchW;
+
+  ACC acc[TILES];
+  [[unroll]] for (uint t = 0u; t < TILES; ++t) acc[t] = ACC(0.0);
+  for (uint kt = 0u; kt < K / 16u; ++kt) {
+    MA A;
+    coopMatLoad(A, a, rowBase * pc.inStride + inCol + kt * 16u, pc.inStride, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint t = 0u; t < TILES; ++t) {
+      MB B;
+      coopMatLoad(B, w, wBase + (kt * pc.N + colBase + t * 16u) * 16u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+      acc[t] = coopMatMulAdd(A, B, acc[t]);
+    }
+  }
+
+  const uint lane = gl_SubgroupInvocationID;
+  const uint row = rowBase + (lane >> 1u);
+  const uint stage = gl_SubgroupID * 256u;
+  const uint mine = stage + (lane >> 1u) * 16u + (lane & 1u) * 8u;
+  [[unroll]] for (uint t = 0u; t < TILES; ++t) {
+    coopMatStore(ACC16(acc[t]), lds, stage, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    Oct v = Oct(f16vec4(lds[mine], lds[mine + 1u], lds[mine + 2u], lds[mine + 3u]),
+                f16vec4(lds[mine + 4u], lds[mine + 5u], lds[mine + 6u], lds[mine + 7u]));
+    const uint column = colBase + t * 16u + (lane & 1u) * 8u;
+    if ((FLAGS & F_RESIDUAL) != 0u) {
+      const Oct r = unpackOct(res8[(row * pc.resStride + pc.resCol + column) >> 3u]);
+      const Oct s = unpackOct(w8[(pc.scaleBase + column) >> 3u]);
+      precise f16vec4 pl = r.lo * s.lo, ph = r.hi * s.hi;   // the scaled skip is a half publication
+      precise f16vec4 yl = v.lo + pl, yh = v.hi + ph;
+      v = Oct(yl, yh);
+    }
+    if ((FLAGS & F_SILU) != 0u) v = Oct(silu(v.lo), silu(v.hi));
+    if (column >= pc.validN) continue;
+    const uint at = (row * pc.outStride + outCol + column) >> 3u;
+    if ((FLAGS & F_DUAL) != 0u) {
+      out8[at] = packOct(v);
+      quant8[at] = packOct(quantOct(v));
+    } else {
+      out8[at] = packOct((FLAGS & F_QUANT) != 0u ? quantOct(v) : v);
+    }
+  }
+}

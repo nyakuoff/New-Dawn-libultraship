@@ -1,0 +1,66 @@
+#version 460
+// The ViT's cosine normalization, one thread per (token, head): raw QKV [tokens][3072] -> Q [tokens][1024] and
+// K [padded][1024] on the E4M3 grid, and V transposed to [1024][padded] so a channel's keys are contiguous (the B
+// operand of P V in vit_attention.comp). Rows past `tokens` are never written: they stay zero, which is what the
+// padding keys are.
+//
+// It differs from the window blocks' (OpenDLSS-NR global_normalize.comp, MIT): the low square stays in f32 and the
+// sum is rounded once, and Q takes sqrt(32) and the learned scale as two further half multiplies.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+  uint tokens, padded;
+  uint scaleBase;   // [32] f16 learned scales in the arena, in halves
+} pc;
+
+layout(std430, binding = 0) readonly buffer X8_ { uvec4 x8[]; };
+layout(std430, binding = 1) readonly buffer W_ { float16_t w[]; };
+layout(std430, binding = 2) writeonly buffer Q_ { uvec4 q8[]; };
+layout(std430, binding = 3) writeonly buffer K_ { uvec4 k8[]; };
+layout(std430, binding = 4) writeonly buffer V_ { float16_t vt[]; };
+
+// 1 / |v| over 32 halves: r[c] = f16(f32(v[c])^2 + f32(f16(v[c + 16]^2))), then a stride 8/4/2/1 tree of halves.
+float16_t inverseNorm32(Oct v0, Oct v1, Oct v2, Oct v3) {   // channels 0-7, 8-15, 16-23, 24-31
+  precise f16vec4 h0 = v2.lo * v2.lo, h1 = v2.hi * v2.hi, h2 = v3.lo * v3.lo, h3 = v3.hi * v3.hi;
+  precise vec4 s0 = vec4(v0.lo) * vec4(v0.lo) + vec4(h0), s1 = vec4(v0.hi) * vec4(v0.hi) + vec4(h1);
+  precise vec4 s2 = vec4(v1.lo) * vec4(v1.lo) + vec4(h2), s3 = vec4(v1.hi) * vec4(v1.hi) + vec4(h3);
+  precise f16vec4 t0 = f16vec4(s0) + f16vec4(s2), t1 = f16vec4(s1) + f16vec4(s3);   // stride 8
+  precise f16vec4 u = t0 + t1;                                                      // stride 4
+  precise f16vec2 p = u.xy + u.zw;                                                  // stride 2
+  precise float16_t total = p.x + p.y;
+  // A zero row would be 0 * inf: it publishes as +0, the reference's NaN rule.
+  return total > float16_t(0.0) ? float16_t(inversesqrt(float(total))) : float16_t(0.0);
+}
+
+void main() {
+  const uint id = gl_GlobalInvocationID.x;
+  const uint token = id >> 5u, head = id & 31u;
+  if (token >= pc.tokens) return;
+  const uint source = token * 384u + head * 12u;   // words: 3072 halves per token, 96 per head
+  Oct q[4], k[4];
+  [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+    q[i] = unpackOct(x8[source + i]);
+    k[i] = unpackOct(x8[source + 4u + i]);
+  }
+  const float16_t qNorm = inverseNorm32(q[0], q[1], q[2], q[3]), kNorm = inverseNorm32(k[0], k[1], k[2], k[3]);
+  const float16_t headScale = float16_t(sqrt(32.0)), learned = w[pc.scaleBase + head];
+  const uint target = token * 128u + head * 4u;    // words: 1024 halves per token, 32 per head
+  [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+    precise f16vec4 l0 = q[i].lo * qNorm, h0 = q[i].hi * qNorm;
+    precise f16vec4 l1 = l0 * headScale, h1 = h0 * headScale;
+    precise f16vec4 l2 = l1 * learned, h2 = h1 * learned;
+    q8[target + i] = packOct(Oct(quantE4(l2), quantE4(h2)));
+    precise f16vec4 kl = k[i].lo * kNorm, kh = k[i].hi * kNorm;
+    k8[target + i] = packOct(Oct(quantE4(kl), quantE4(kh)));
+    const Oct v = quantOct(unpackOct(x8[source + 8u + i]));
+    const uint at = (head * 32u + i * 8u) * pc.padded + token;
+    vt[at] = v.lo.x;                    vt[at + pc.padded] = v.lo.y;
+    vt[at + 2u * pc.padded] = v.lo.z;   vt[at + 3u * pc.padded] = v.lo.w;
+    vt[at + 4u * pc.padded] = v.hi.x;   vt[at + 5u * pc.padded] = v.hi.y;
+    vt[at + 6u * pc.padded] = v.hi.z;   vt[at + 7u * pc.padded] = v.hi.w;
+  }
+}
