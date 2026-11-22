@@ -47,6 +47,7 @@ struct DeviceInfo {
     bool mExternalFd = false; // VK_KHR_external_memory_fd + VK_KHR_external_semaphore_fd
     uint32_t mMinSubgroup = 0, mMaxSubgroup = 0;
     uint64_t mVramBytes = 0;
+    uint32_t mDriverVersion = 0;
     std::string mMissing; // empty when the FP16 path can run; else what is absent
 };
 

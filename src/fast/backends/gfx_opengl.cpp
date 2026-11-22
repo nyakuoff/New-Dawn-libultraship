@@ -1471,8 +1471,10 @@ static int stampSlot = 0;
 
 void GfxRenderingAPIOGL::StartFrame() {
 #ifndef USE_OPENGLES
-    // Whole-frame GPU time for the performance overlay: timestamp pair per frame, read back once available.
-    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Perf.Overlay", 0) != 0) {
+    // Whole-frame GPU time for the performance overlay, and for neural rendering's governor (which paces the network
+    // by it): timestamp pair per frame, read back once available.
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Perf.Overlay", 0) != 0 ||
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gNewDawn.Neural.Enabled", 0) != 0) {
         if (!stamps[0][0]) {
             glGenQueries(8, &stamps[0][0]);
         }

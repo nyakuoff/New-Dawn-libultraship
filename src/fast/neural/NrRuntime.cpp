@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <thread>
 
@@ -11,6 +12,8 @@
 #include "NrNumeric.h"
 #include "NrSpirv.inc"
 #include "NrVk.h"
+
+#include <nlohmann/json.hpp>
 
 namespace Fast::Neural {
 
@@ -138,8 +141,51 @@ void Runtime::Work(const Request& request) {
     m.mBlendScale = model.Halves(model.Get(70, 0, "blend_scale"), 0, 1)[0];
     m.mGraph = std::make_unique<Graph>(context, model, g, true);
     Graph& graph = *m.mGraph;
-    SetStatus("Tuning the kernels for " + context.Info().mName + "...");
-    graph.Tune();
+    // Which kernel variant suits each matrix shape, and what each segment costs, are measured once per GPU, driver
+    // and size, and kept beside the model: measuring takes a second during which the game stutters.
+    const size_t segments = graph.Segments().size();
+    if (2 * segments > Context::kQueries) {
+        throw std::runtime_error("neural rendering: more segments than timestamps");
+    }
+    const std::filesystem::path cachePath = request.mModel / "tune.json";
+    const std::string cacheKey = context.Info().mName + "|" + std::to_string(context.Info().mDriverVersion) + "|" +
+                                 std::to_string(g.mValidWidth) + "x" + std::to_string(g.mValidHeight);
+    nlohmann::json cache = nlohmann::json::object();
+    bool cached = false;
+    try {
+        std::ifstream file(cachePath);
+        if (file) {
+            cache = nlohmann::json::parse(file);
+        }
+    } catch (const std::exception&) {}
+    if (!cache.is_object()) {
+        cache = nlohmann::json::object();
+    }
+    try {
+        const nlohmann::json& entry = cache.at(cacheKey);
+        m.mSegmentMs = entry.at("segmentMs").get<std::vector<double>>();
+        mFullMs = entry.at("fullMs").get<double>();
+        cached = m.mSegmentMs.size() == segments && graph.SetTuning(entry.at("tiles").get<Graph::Tuning>());
+    } catch (const std::exception&) { // no entry for this GPU and size, or one from another version: measure
+    }
+    if (!cached) {
+        SetStatus("Tuning the kernels for " + context.Info().mName + "...");
+        graph.Tune();
+        // The best of a few passes counts: the first wakes the GPU up.
+        m.mSegmentMs.assign(segments, 1e30);
+        mFullMs = 1e30;
+        for (int pass = 0; pass < 4; ++pass) {
+            VkCommandBuffer commands = context.Begin();
+            graph.Record(commands, 0, SIZE_MAX, true);
+            context.Submit(commands, true);
+            for (size_t s = 0; s < segments; ++s) {
+                m.mSegmentMs[s] = std::min(m.mSegmentMs[s], context.ElapsedMs((uint32_t)s, (uint32_t)s + 1));
+            }
+            mFullMs = std::min(mFullMs, context.ElapsedMs(0, (uint32_t)segments));
+        }
+        cache[cacheKey] = { { "tiles", graph.GetTuning() }, { "segmentMs", m.mSegmentMs }, { "fullMs", mFullMs } };
+        std::ofstream(cachePath) << cache.dump(); // best effort: without it the next launch measures again
+    }
 
     const VkDeviceSize imageBytes = (VkDeviceSize)g.mValidWidth * g.mValidHeight * 8;
     m.mProxy = context.CreateSharedBuffer(imageBytes);
@@ -153,23 +199,7 @@ void Runtime::Work(const Request& request) {
     m.mCompositeSet = context.Bind(
         { &graph.Find("head").mBuffer, nullptr, &m.mResidual.mBuffer, &m.mProxy.mBuffer, &m.mHistory.mBuffer });
 
-    // Every segment as its own command buffer, so a run is any split of them over the frames it is given; and what
-    // each costs on this GPU, which decides the split. The best of a few passes counts: the first wakes the GPU up.
-    const size_t segments = graph.Segments().size();
-    if (2 * segments > Context::kQueries) {
-        throw std::runtime_error("neural rendering: more segments than timestamps");
-    }
-    m.mSegmentMs.assign(segments, 1e30);
-    mFullMs = 1e30;
-    for (int pass = 0; pass < 4; ++pass) {
-        VkCommandBuffer commands = context.Begin();
-        graph.Record(commands, 0, SIZE_MAX, true);
-        context.Submit(commands, true);
-        for (size_t s = 0; s < segments; ++s) {
-            m.mSegmentMs[s] = std::min(m.mSegmentMs[s], context.ElapsedMs((uint32_t)s, (uint32_t)s + 1));
-        }
-        mFullMs = std::min(mFullMs, context.ElapsedMs(0, (uint32_t)segments));
-    }
+    // Every segment as its own command buffer, so a run is any split of them over the frames it is given.
     // Each one carries its own two stamps (2s, 2s + 1): a run's time is the sum over its segments, whatever the
     // renderer got to do between them.
     for (size_t s = 0; s < segments; ++s) {
@@ -280,6 +310,12 @@ void Runtime::Advance() {
     m.mContext->SubmitRecorded(m.mParts[m.mNextPart], first && m.mWaitRenderer ? m.mSemaphore : VK_NULL_HANDLE,
                                last ? m.mFence : VK_NULL_HANDLE);
     ++m.mNextPart;
+}
+
+void Runtime::Hurry() {
+    while (mBusy && mImpl->mNextPart < mImpl->mParts.size()) {
+        Advance();
+    }
 }
 
 bool Runtime::Finished() {

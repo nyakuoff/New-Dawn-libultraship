@@ -508,8 +508,9 @@ class PostFxGL {
         bool valid = false;
         float vp[16] = {}, ndcXScale = 1.0f, flipY = 1.0f;
     } mNrCam;
-    Program mNrInput, mNrApply;
-    Target mNrProxy, mNrHistory, mNrResidual, mNrScene, mNrDepth;
+    Program mNrAlign, mNrApply;
+    Target mNrAligned, mNrProxy[3], mNrHistory, mNrResidual, mNrScene, mNrDepth, mNrMean;
+    int mNrProxyGiven = 0; // which of the three proxies the last run was given
 
     static constexpr int kQueryRing = 4;
     static constexpr int kQueryStages = 27;
