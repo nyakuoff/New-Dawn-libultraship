@@ -8,6 +8,7 @@ struct NewDawnNeuralInfo {
     int width, height;   // the image the network sees; 0 when not running
     float runMs;         // GPU time of one network run (Vulkan), smoothed
     float runsPerSecond; // how often a new result lands
+    int interleave;      // a run every this many frames at most: the setting, or what the governor made of it
 };
 
 namespace Fast {

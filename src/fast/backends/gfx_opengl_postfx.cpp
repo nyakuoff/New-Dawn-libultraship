@@ -26,6 +26,7 @@
 #include "ship/Context.h"
 #ifdef NEWDAWN_NEURAL
 #include "NrRuntime.h"
+#include "fast/Fast3dWindow.h"
 #endif
 #include "ship/config/ConsoleVariable.h"
 
@@ -1962,18 +1963,15 @@ void main() {
 
 // New Dawn neural rendering (src/fast/neural): a network re-renders the world image, in Vulkan, from a small display-
 // referred copy of it (the proxy), and returns how that copy should change (the residual, in display code values).
-// A run takes one to a few frames, so the residual on screen belongs to an earlier camera: both passes below fetch it
-// through that camera, per surface point, and drop it where that run saw another surface.
+// A run takes one to a few frames, so the residual on screen was made for an earlier picture. Every frame the align
+// pass brings it onto the current one, at the network's resolution; the apply pass takes it up to the scene's.
 static const char* kNrLib = R"GLSL(
-uniform sampler2D uScene;      // the world, scene-referred
-uniform sampler2D uDepth;      // this frame's depth, at the scene's size
-uniform sampler2D uNrResidual; // rgb: the network's change, a: clip w at its run. Row 0 is the top of the image.
-uniform mat4 uInvViewProj;     // this frame's camera
-uniform mat4 uRunViewProj;     // the camera of the run the residual came from
+uniform sampler2D uScene;  // the world, scene-referred
+uniform sampler2D uDepth;  // this frame's depth, at the scene's size
+uniform mat4 uInvViewProj; // this frame's camera
 uniform vec2 uNdc;
-uniform vec2 uStep;            // one residual texel, in scene uv
-uniform float uExposure;       // scene radiance -> paper-white relative
-uniform int uHaveResidual;
+uniform vec2 uStep;        // one texel of the network's images, in scene uv
+uniform float uExposure;   // scene radiance -> paper-white relative
 
 // The network's images have their top row first. So have this renderer's off-screen targets when it draws the world
 // flipped into them (uNdc.y < 0, the usual case); otherwise the rows are turned over on the way in and out.
@@ -1994,50 +1992,49 @@ vec3 nrDecode(vec3 c) {
 }
 vec4 nrNdc(vec2 uv, float d) { return vec4((uv * 2.0 - 1.0) * uNdc, d * 2.0 - 1.0, 1.0); }
 // Clip w (distance along the view axis) of this frame's surface at uv: unprojection leaves 1 / w in the fourth lane.
+// Capped to what a half float holds, which is where it is stored.
 float nrClipW(vec2 uv) {
     vec4 n = nrNdc(uv, texture(uDepth, uv).r);
-    return 1.0 / dot(vec4(uInvViewProj[0].w, uInvViewProj[1].w, uInvViewProj[2].w, uInvViewProj[3].w), n);
+    return min(1.0 / dot(vec4(uInvViewProj[0].w, uInvViewProj[1].w, uInvViewProj[2].w, uInvViewProj[3].w), n), 60000.0);
 }
-
-// The residual for this frame's surface point at uv. rgb: the change; a: how much of it the run actually saw (0..1).
-// The four texels around the point's position in the run's image, each by its bilinear share, without those that
-// held another surface then: full-resolution edges stay clean, and what moved in front of something loses nothing
-// but the uncovered strip.
-vec4 nrResidual(vec2 uv) {
-    if (uHaveResidual == 0) return vec4(0.0);
-    float d = texture(uDepth, uv).r;
-    vec4 wp = uInvViewProj * nrNdc(uv, d);
-    vec4 pc = uRunViewProj * vec4(wp.xyz / wp.w, 1.0);
-    if (pc.w <= 0.0) return vec4(0.0);
-    vec2 size = vec2(textureSize(uNrResidual, 0));
-    vec2 rUv = clamp((pc.xy / pc.w / uNdc) * 0.5 + 0.5, -0.02, 1.02); // a little past the edge: its last texels
-    vec2 pos = vec2(rUv.x, nrRow(rUv.y)) * size - 0.5;
-    ivec2 base = ivec2(floor(pos));
-    vec2 f = pos - vec2(base);
-    // How far apart two neighbouring residual texels are in depth on this surface, plus a floor
-    float here = 1.0 / wp.w;
+// How much two neighbouring texels of the network's images may differ in depth and still be one surface here
+float nrDepthTolerance(vec2 uv, float here) {
     float slope = max(max(abs(nrClipW(uv + vec2(uStep.x, 0.0)) - here), abs(nrClipW(uv - vec2(uStep.x, 0.0)) - here)),
                       max(abs(nrClipW(uv + vec2(0.0, uStep.y)) - here), abs(nrClipW(uv - vec2(0.0, uStep.y)) - here)));
-    float tol = 0.015 * pc.w + 1.5 * slope + 0.5;
-    vec4 sum = vec4(0.0);
-    for (int j = 0; j < 2; j++) {
-        for (int i = 0; i < 2; i++) {
-            vec4 t = texelFetch(uNrResidual, clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1), 0);
-            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) *
-                      step(abs(t.a - min(pc.w, 60000.0)), tol);
-            sum += vec4(t.rgb, 1.0) * w;
-        }
-    }
-    return sum.a > 0.02 ? vec4(sum.rgb / sum.a, smoothstep(0.02, 0.3, sum.a)) : vec4(0.0);
+    return 0.015 * here + 1.5 * slope + 0.5;
 }
 )GLSL";
 
-// What a run reads, at the network's resolution with the top row first: the proxy (display code, clip w in alpha)
-// and the history: the proxy with the last residual carried onto it (alpha 1 where that residual reached).
-static const char* kNrInputShader = R"GLSL(
+// The last result on this frame's picture, at the network's resolution and with the top row first. Three outputs:
+// the residual for this frame, this frame's proxy, and the history a new run reads.
+//
+// A result belongs to the picture it was made from. The world has no motion vectors and characters animate, so
+// "where this surface point was" (depth and the two cameras) is only right for what stood still. The proxy the
+// result was made from is kept beside it, and every texel of the result is asked two things: was it this surface
+// then (depth), and did it look like this surface does now (proxy colour). Where the four texels around the
+// reprojected point say yes, the result is carried over as it is. Where they do not (a limb moved, a character
+// walked on, a shadow slid, an edge came into view), the residual is what the run made of things of this colour
+// around there, read from the mips of both images: the right tone for the material, without the detail. A stale
+// residual on the wrong surface is what shows as ghosting; its low-pass on the right one does not show.
+//
+// The history is the network's own last output and is only handed back where it was carried over as it is: a run
+// then blends with its past on what is unchanged and starts afresh on everything else, so nothing trails.
+static const char* kNrAlignShader = R"GLSL(
 in vec2 vUv;
-layout(location = 0) out vec4 oProxy;
-layout(location = 1) out vec4 oHistory;
+layout(location = 0) out vec4 oResidual; // rgb: the change for this frame, a: this frame's clip w
+layout(location = 1) out vec4 oProxy;    // rgb: display code, a: clip w
+layout(location = 2) out vec4 oHistory;  // rgb: proxy + the last result where it still holds (a = 1)
+uniform sampler2D uNrResidual; // the last result: rgb, a = the clip w of its run. Mipmapped.
+uniform sampler2D uNrRunProxy; // the proxy it was made from. Mipmapped.
+uniform mat4 uRunViewProj;     // the camera of that run
+uniform int uHaveResidual;
+uniform float uMatch;          // how far apart two proxy colours of one surface may be (a sigma, in code values)
+
+float same(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    return exp(-dot(d, d) / (2.0 * uMatch * uMatch));
+}
+
 void main() {
     vec2 uv = vec2(vUv.x, nrRow(vUv.y));
     // The scene averaged over this pixel's footprint, in display light (four bilinear taps)
@@ -2046,28 +2043,141 @@ void main() {
              nrProxy(textureLod(uScene, uv + uStep * vec2(-0.25, 0.25), 0.0).rgb) +
              nrProxy(textureLod(uScene, uv + uStep * vec2(0.25, 0.25), 0.0).rgb);
     vec3 code = nrEncode(v * 0.25);
-    vec4 r = nrResidual(uv);
-    oProxy = vec4(code, min(nrClipW(uv), 60000.0)); // a half holds it
-    oHistory = vec4(clamp(code + r.rgb, 0.0, 1.0), step(0.5, r.a));
+    float here = nrClipW(uv);
+    vec3 residual = vec3(0.0), kept = vec3(0.0);
+    float sharp = 0.0;
+    if (uHaveResidual != 0) {
+        residual = textureLod(uNrResidual, vec2(0.5), 16.0).rgb; // the mean, when nothing better is found
+        vec4 wp = uInvViewProj * nrNdc(uv, texture(uDepth, uv).r);
+        vec4 pc = uRunViewProj * vec4(wp.xyz / wp.w, 1.0);
+        if (pc.w > 0.0) {
+            vec2 size = vec2(textureSize(uNrResidual, 0));
+            vec2 rUv = (pc.xy / pc.w / uNdc) * 0.5 + 0.5;
+            vec2 at = vec2(rUv.x, nrRow(rUv.y));
+            // A little past the edge the last texels still stand for the surface; further out the run saw nothing.
+            if (all(greaterThan(rUv, vec2(-0.02))) && all(lessThan(rUv, vec2(1.02)))) {
+                vec2 pos = at * size - 0.5;
+                ivec2 base = ivec2(floor(pos));
+                vec2 f = pos - vec2(base);
+                float tol = nrDepthTolerance(uv, here);
+                vec4 sum = vec4(0.0);
+                for (int j = 0; j < 2; j++) {
+                    for (int i = 0; i < 2; i++) {
+                        ivec2 q = clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1);
+                        vec4 t = texelFetch(uNrResidual, q, 0);
+                        float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) *
+                                  step(abs(t.a - min(pc.w, 60000.0)), tol) * same(texelFetch(uNrRunProxy, q, 0).rgb, code);
+                        sum += vec4(t.rgb, 1.0) * w;
+                    }
+                }
+                if (sum.a > 0.02) {
+                    kept = sum.rgb / sum.a;
+                    sharp = smoothstep(0.05, 0.4, sum.a);
+                }
+            }
+            // Around there, coarser and wider: 4 and then 16 texels apart, each tap by how alike the colours are
+            vec2 centre = clamp(at, 0.0, 1.0);
+            vec4 near = vec4(0.0);
+            for (int ring = 0; ring < 2; ring++) {
+                float lod = ring == 0 ? 2.0 : 4.0, share = ring == 0 ? 1.0 : 0.25;
+                for (int j = -1; j <= 1; j++) {
+                    for (int i = -1; i <= 1; i++) {
+                        vec2 q = centre + vec2(i, j) * exp2(lod) / size;
+                        float w = share * same(textureLod(uNrRunProxy, q, lod).rgb, code);
+                        near += vec4(textureLod(uNrResidual, q, lod).rgb, 1.0) * w;
+                    }
+                }
+            }
+            residual = mix(residual, near.rgb / max(near.a, 1e-4), smoothstep(0.02, 0.25, near.a));
+            residual = mix(residual, kept, sharp);
+        }
+    }
+    oResidual = vec4(residual, here);
+    oProxy = vec4(code, here);
+    oHistory = vec4(clamp(code + kept, 0.0, 1.0), step(0.5, sharp));
 }
 )GLSL";
 
 // The residual onto this frame's scene. It is a change of display code values; the scene is scene-referred light:
 // each channel goes to the proxy's code, takes the change, and comes back as a ratio on the scene value, which keeps
-// whatever the proxy's shoulder had compressed.
+// whatever the proxy's shoulder had compressed. The residual comes up from the network's resolution through the
+// four texels around, without those that belong to another surface (depth), so full-resolution edges stay clean.
+// The style presets are the operator OpenDLSS-NR's composite applies after the network (exposure, a contrast blend
+// and saturation in HSL, scaled by the tone setting); strength blends from the untouched picture (0) through the
+// network's (1) and on past it (up to 2).
 static const char* kNrApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
+uniform sampler2D uNrAligned; // this frame's residual (the align pass): rgb, a = clip w. Top row first.
+uniform sampler2D uNrMean;    // 1x1: the mean residual of the picture before the last cut
+uniform float uFade;          // 0: that mean alone, 1: the current residual
 uniform float uStrength;
+uniform float uStyle;         // 0 none, 1 natural, 2 cinematic
+uniform float uTone;
 uniform int uDebug;
+
+vec3 nrHsl(vec3 rgb) {
+    float high = max(max(rgb.r, rgb.g), rgb.b), low = min(min(rgb.r, rgb.g), rgb.b);
+    float sum = high + low, light = sum * 0.5, hue = 0.0, saturation = 0.0;
+    if (high > low) {
+        float delta = high - low;
+        saturation = light > 0.5 ? delta / ((2.0 - high) - low) : delta / sum;
+        if (high == rgb.r) hue = ((rgb.g - rgb.b) / delta + (rgb.g < rgb.b ? 6.0 : 0.0)) / 6.0;
+        else if (high == rgb.g) hue = ((rgb.b - rgb.r) / delta + 2.0) / 6.0;
+        else hue = ((rgb.r - rgb.g) / delta + 4.0) / 6.0;
+    }
+    return vec3(hue, saturation, light);
+}
+float nrHue(float p, float q, float h) {
+    if (h < 0.0) h += 1.0;
+    if (h > 1.0) h -= 1.0;
+    if (h < 1.0 / 6.0) return p + (q - p) * 6.0 * h;
+    if (h < 0.5) return q;
+    if (h < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - h) * 6.0;
+    return p;
+}
+vec3 nrRgb(vec3 hsl) {
+    if (hsl.y <= 0.0) return vec3(hsl.z);
+    float q = hsl.z < 0.5 ? hsl.z * (hsl.y + 1.0) : hsl.z + hsl.y - hsl.z * hsl.y;
+    float p = 2.0 * hsl.z - q;
+    return vec3(nrHue(p, q, hsl.x + 1.0 / 3.0), nrHue(p, q, hsl.x), nrHue(p, q, hsl.x - 1.0 / 3.0));
+}
+vec3 nrStyle(vec3 code) {
+    float tone = clamp(uTone, 0.0, 1.0);
+    float exposure = uStyle < 1.5 ? -0.1 * tone : 0.0, contrast = uStyle < 1.5 ? -0.25 * tone : 0.0;
+    float saturation = uStyle < 1.5 ? -0.1 * tone : -0.15 * tone;
+    vec3 c = clamp(clamp(code, 0.0, 1.0) * exp2(exposure), 0.0, 1.0);
+    c = clamp(c + contrast * (c * c * (3.0 - 2.0 * c) - c), 0.0, 1.0);
+    vec3 hsl = nrHsl(c);
+    return clamp(nrRgb(vec3(hsl.x, clamp(hsl.y * (saturation + 1.0), 0.0, 1.0), hsl.z)), 0.0, 1.0);
+}
+
 void main() {
     vec4 scene = texelFetch(uScene, ivec2(gl_FragCoord.xy), 0);
-    vec4 r = nrResidual(vUv);
+    vec2 size = vec2(textureSize(uNrAligned, 0));
+    vec2 pos = vec2(vUv.x, nrRow(vUv.y)) * size - 0.5;
+    ivec2 base = ivec2(floor(pos));
+    vec2 f = pos - vec2(base);
+    float here = nrClipW(vUv), tol = nrDepthTolerance(vUv, here);
+    vec4 matched = vec4(0.0), plain = vec4(0.0);
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            vec4 t = texelFetch(uNrAligned, clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1), 0);
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            plain += vec4(t.rgb, 1.0) * w;
+            matched += vec4(t.rgb, 1.0) * w * step(abs(t.a - here), tol);
+        }
+    }
+    vec3 delta = matched.a > 0.02 ? matched.rgb / matched.a : plain.rgb / plain.a;
+    delta = mix(texelFetch(uNrMean, ivec2(0), 0).rgb, delta, uFade);
     vec3 v = nrProxy(scene.rgb);
-    vec3 v2 = nrDecode(nrEncode(v) + r.rgb * (r.a * uStrength));
+    vec3 code = nrEncode(v);
+    vec3 neural = clamp(code + delta, 0.0, 1.0);
+    if (uStyle > 0.5) neural = nrStyle(neural);
+    vec3 v2 = nrDecode(code + uStrength * (neural - code));
     vec3 c = mix(v2 / uExposure, max(scene.rgb, vec3(0.0)) * (v2 / max(v, vec3(1e-4))), step(vec3(1e-3), v));
-    if (uDebug == 1) c = (0.5 + 2.0 * r.rgb * r.a) / uExposure * 0.5; // the residual itself
-    else if (uDebug == 2) c = vec3(r.a, 0.25 * r.a, 1.0 - r.a) / uExposure * 0.5; // where it reached
+    if (uDebug == 1) c = (0.5 + 2.0 * delta) / uExposure * 0.5; // the residual itself
+    else if (uDebug == 2) c = vec3(matched.a, 0.25 * matched.a, 1.0 - matched.a) / uExposure * 0.5; // its depth match
     oColor = vec4(c, scene.a);
 }
 )GLSL";
@@ -4194,6 +4304,9 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uTaaHistory", 10 },
                           { "uTaaMask", 11 },
                           { "uNrResidual", 10 },
+                          { "uNrRunProxy", 11 },
+                          { "uNrAligned", 10 },
+                          { "uNrMean", 11 },
                           { "uRayMask", 8 },
                           { "uRays", 11 },
                           { "uRaySky", 10 },
@@ -4543,9 +4656,9 @@ void main() { oColor = vec4(1.0); }
     const char* taaSharpen[] = { kVersion, kTaaSharpenShader };
     mTaaSharpen.id = BuildProgram("TAA sharpen", taaSharpen, 2, mTaaSharpen.uniforms);
     // Optional as well: a failure leaves neural rendering unavailable. Lanes 8..10, dummies bound above.
-    const char* nrInput[] = { kVersion, kNrLib, kNrInputShader };
+    const char* nrAlign[] = { kVersion, kNrLib, kNrAlignShader };
     const char* nrApply[] = { kVersion, kNrLib, kNrApplyShader };
-    mNrInput.id = BuildProgram("neural rendering input", nrInput, 3, mNrInput.uniforms);
+    mNrAlign.id = BuildProgram("neural rendering align", nrAlign, 3, mNrAlign.uniforms);
     mNrApply.id = BuildProgram("neural rendering apply", nrApply, 3, mNrApply.uniforms);
     const char* comp[] = { kVersion, kCompositeShader };
     const char* compHdr[] = { kVersion, "#define HDR_SCENE\n", kCompositeShader };
@@ -5680,11 +5793,12 @@ void PostFxGL::EndHdr(const FramebufferOGL& fb) {
             glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
             glPixelStorei(GL_PACK_ALIGNMENT, packAlign);
             char name[512];
-            if (mDumpDone == 0 && mNrProxy.tex != 0) { // what the neural network was last given, as it is stored
-                std::vector<uint8_t> proxy((size_t)mNrProxy.w * mNrProxy.h * 3);
-                Bind(0, mNrProxy.tex);
+            if (const Target& given = mNrProxy[mNrProxyGiven]; mDumpDone == 0 && given.tex != 0) {
+                // what the neural network was last given, as it is stored
+                std::vector<uint8_t> proxy((size_t)given.w * given.h * 3);
+                Bind(0, given.tex);
                 glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, proxy.data());
-                snprintf(name, sizeof(name), "%s/nrproxy_%dx%d.rgb", dir, mNrProxy.w, mNrProxy.h);
+                snprintf(name, sizeof(name), "%s/nrproxy_%dx%d.rgb", dir, given.w, given.h);
                 if (FILE* f = fopen(name, "wb")) {
                     fwrite(proxy.data(), 1, proxy.size(), f);
                     fclose(f);
@@ -8835,13 +8949,22 @@ struct PostFxGL::NeuralState {
     bool imported = false, importFailed = false;
     bool haveResidual = false;
     float runVP[16] = {}, residualVP[16] = {}; // the camera of the run in flight, and of the residual on screen
+    // mNrProxy is a ring of three: the one this frame's proxy is drawn into, the one the run in flight was given,
+    // and the one the residual on screen was made from (-1: none)
+    int proxyNow = 0, proxyFlight = -1, proxyShown = -1;
+    int grace = 0; // frames after a reset whose lateness is the reset's own doing
     bool camValid = false;
     float prevEye[3] = {}, prevFwd[3] = {};
     uint32_t frame = 0, runFrame = 0, runs = 0;
     uint32_t epoch = 0, runEpoch = 0; // bumped by every reset: a run from before one is dropped when it lands
     uint32_t freezeEpoch = 0;
-    float fade = 0.0f; // a first result after a reset comes in over a few frames
-    std::chrono::steady_clock::time_point lastResult{};
+    float fade = 0.0f;     // a first result after a reset comes in over a few frames...
+    bool haveMean = false; // ...from the mean residual of the picture before it (mNrMean)
+    bool urgent = false;   // after a reset the next run starts at once and whole
+    // The governor (gNewDawn.Neural.Governor): the cadence it is holding, and what it has seen lately
+    uint32_t interleave = 0;
+    int settle = 0, calm = 0, pressed = 0, late = 0, window = 0, hold = 0;
+    std::chrono::steady_clock::time_point lastResult{}, lastFrame{};
 };
 #else
 struct PostFxGL::NeuralState {};
@@ -8872,12 +8995,13 @@ void PostFxGL::NeuralRelease(bool runtime) {
     n.haveResidual = false;
     n.epoch++;
     if (runtime) {
-        for (Target* t : { &mNrProxy, &mNrHistory, &mNrResidual, &mNrScene, &mNrDepth }) {
+        for (Target* t : { &mNrAligned, &mNrProxy[0], &mNrProxy[1], &mNrProxy[2], &mNrHistory, &mNrResidual, &mNrScene,
+                           &mNrDepth, &mNrMean }) {
             glDeleteTextures(1, &t->tex);
             glDeleteFramebuffers(1, &t->fbo);
             *t = Target{};
         }
-        for (int unit = 0; unit < 3; ++unit) {
+        for (int unit = 0; unit < 4; ++unit) {
             Bind(unit, mFogNeutral); // the lanes keep a complete texture
         }
         mNr.reset(); // waits for a load in progress
@@ -8972,8 +9096,8 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
         }
         return nullptr;
     }
-    if (!mNrInput.id || !mNrApply.id || !sNrGl.Usable()) {
-        NeuralStatus(3, mNrInput.id && mNrApply.id
+    if (!mNrAlign.id || !mNrApply.id || !sNrGl.Usable()) {
+        NeuralStatus(3, mNrAlign.id && mNrApply.id
                             ? "This OpenGL driver cannot share memory with Vulkan (GL_EXT_memory_object_fd)"
                             : "The neural rendering shaders did not compile on this driver (see the log)");
         return nullptr;
@@ -9000,9 +9124,25 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
     reset |= n.freezeEpoch != freezeEpoch;
     n.freezeEpoch = freezeEpoch;
     if (reset) {
+        if (n.haveResidual) {
+            // What the network made of the picture on average is the best guess for the next one, until its own
+            // result lands: the last level of the residual's mips, kept in a texel of its own.
+            EnsureTarget(mNrMean, 1, 1, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
+            if (mUsable) {
+                Bind(0, mNrResidual.tex);
+                Use(mHdrCopy);
+                glUniform1i(Loc("uScene"), kFirstUnit);
+                Draw(mNrMean);
+                n.haveMean = true;
+            }
+        }
         n.haveResidual = false;
         n.fade = 0.0f;
         n.epoch++;
+        n.urgent = true;
+        n.grace = 30;
+        n.proxyShown = -1;
+        n.runtime.Hurry(); // the run in flight is for a picture that is gone: out of the way with it
     }
     n.camValid = haveCamera;
     std::copy(eye, eye + 3, n.prevEye);
@@ -9015,9 +9155,14 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, n.buffer[2]);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nw, nh, GL_RGBA, GL_HALF_FLOAT, nullptr);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glGenerateMipmap(GL_TEXTURE_2D); // the low-pass and the mean the passes fall back on
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             std::copy(n.runVP, n.runVP + 16, n.residualVP);
             n.haveResidual = true;
+            n.proxyShown = n.proxyFlight;
         }
+        n.proxyFlight = -1;
         const auto now = std::chrono::steady_clock::now();
         const float seconds = std::chrono::duration<float>(now - n.lastResult).count();
         n.lastResult = now;
@@ -9041,6 +9186,9 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
 
     // This frame's depth, single sample
     EnsureTarget(mNrDepth, w, h, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, true, false);
+    for (Target* t : { &mNrAligned, &mNrHistory, &mNrProxy[0], &mNrProxy[1], &mNrProxy[2] }) {
+        EnsureTarget(*t, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
+    }
     if (!mUsable) {
         return nullptr;
     }
@@ -9049,37 +9197,96 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
     glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
     auto uniforms = [&] {
         glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, invVP);
-        glUniformMatrix4fv(Loc("uRunViewProj"), 1, GL_FALSE, n.residualVP);
         glUniform2f(Loc("uNdc"), mNrCam.ndcXScale, mNrCam.flipY);
         glUniform2f(Loc("uStep"), 1.0f / nw, 1.0f / nh);
         glUniform1f(Loc("uExposure"), std::exp2(std::clamp(LookCv(NEWDAWN_LOOK_EXPOSURE, -0.2f), -8.0f, 8.0f)));
-        glUniform1i(Loc("uHaveResidual"), n.haveResidual ? 1 : 0);
     };
+
+    // The align pass, every frame: the last result onto this frame's picture, this frame's proxy, and the history
+    // a new run would read.
+    const bool shown = n.haveResidual && n.proxyShown >= 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, mNrAligned.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mNrProxy[n.proxyNow].tex, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, mNrHistory.tex, 0);
+    const GLenum three[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+    glDrawBuffers(3, three);
     Bind(0, scene.tex);
     Bind(1, mNrDepth.tex);
-    Bind(2, n.haveResidual ? mNrResidual.tex : mFogNeutral);
+    Bind(2, shown ? mNrResidual.tex : mFogNeutral);
+    Bind(3, shown ? mNrProxy[n.proxyShown].tex : mFogNeutral);
+    Use(mNrAlign);
+    uniforms();
+    glUniformMatrix4fv(Loc("uRunViewProj"), 1, GL_FALSE, n.residualVP);
+    glUniform1i(Loc("uHaveResidual"), shown ? 1 : 0);
+    glUniform1f(Loc("uMatch"), std::clamp(CvFloat("gNewDawn.Neural.Match", 0.08f), 0.01f, 1.0f));
+    Draw(mNrAligned);
+    CheckError("neural rendering align");
 
     // A new run every `interleave` frames, once the last one has landed; its work is spread over those frames.
-    const uint32_t interleave = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.Interleave", 2), 1, 8);
-    if (!n.runtime.Busy() && n.frame - n.runFrame >= interleave) {
-        EnsureTarget(mNrProxy, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
-        EnsureTarget(mNrHistory, nw, nh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, false, false);
-        if (!mUsable) {
-            return nullptr;
+    // The setting is the fastest cadence. The governor slows it when the frame would not fit: it knows what a run
+    // costs (measured at load) and what the whole frame takes on the GPU (the overlay's timestamps), so the game's
+    // own share is the difference, and the cadence is the fastest one that leaves an eighth of the frame spare. It
+    // slows down as soon as that has been asked for a third of a second, and speeds up one step a second. Frames
+    // that arrive late anyway (the estimate is off, or something else took the GPU) push it one step further for
+    // ten seconds; the frames right after a cut are not counted, the cut's own run makes them late.
+    const uint32_t fastest = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.Interleave", 2), 1, 8);
+    uint32_t interleave = fastest;
+    const auto frameTime = std::chrono::steady_clock::now();
+    const float frameMs = std::chrono::duration<float, std::milli>(frameTime - n.lastFrame).count();
+    n.lastFrame = frameTime;
+    if (CvInt("gNewDawn.Neural.Governor", 1) != 0) {
+        auto window = std::dynamic_pointer_cast<Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
+        const float target = 1000.0f / (float)std::clamp(window ? window->GetTargetFps() : 60, 20, 360);
+        const float cost = (float)n.runtime.FullMs();
+        const uint32_t before = n.interleave;
+        n.interleave = std::clamp(n.interleave, fastest, 8u);
+        if (n.grace > 0) {
+            n.grace--;
+        } else {
+            n.late += frameMs > 1.25f * target && frameMs < 4.0f * target; // longer is a load, not the GPU
         }
-        Bind(2, n.haveResidual ? mNrResidual.tex : mFogNeutral); // EnsureTarget binds on its own lane
-        glBindFramebuffer(GL_FRAMEBUFFER, mNrProxy.fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, mNrHistory.tex, 0);
-        const GLenum both[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-        glDrawBuffers(2, both);
-        Bind(0, scene.tex);
-        Use(mNrInput);
-        uniforms();
-        Draw(mNrProxy);
-        // Into the buffers Vulkan reads; the semaphore tells it when they are written.
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, mNrProxy.fbo);
+        if (++n.window >= 60) {
+            n.window = n.late = 0;
+        }
+        n.hold = std::max(n.hold - 1, 0);
+        if (n.settle > 0) {
+            n.settle--; // the frame time is an average: let it catch up with the last change
+        } else {
+            const float game = std::max(gNewDawnGpuFrameMs - cost / (float)n.interleave, 0.0f);
+            uint32_t wanted = fastest;
+            while (wanted < 8 && game + cost / (float)wanted > 0.875f * target) {
+                wanted++;
+            }
+            n.pressed = wanted > n.interleave ? n.pressed + 1 : 0;
+            n.calm = wanted < n.interleave && n.hold == 0 ? n.calm + 1 : 0;
+            if (n.late >= 3 && n.interleave < 8) {
+                n.interleave++;
+                n.hold = 600;
+            } else if (n.pressed >= 20) {
+                n.interleave = wanted;
+            } else if (n.calm >= 60) {
+                n.interleave--;
+            }
+            if (n.interleave != before) {
+                n.settle = 30;
+                n.window = n.late = n.pressed = n.calm = 0;
+                if (before != 0 && mStats) {
+                    SPDLOG_INFO("NewDawnPostFx: neural rendering: every {} frame(s) now, was {} (frame {:.1f} ms on "
+                                "the GPU of {:.1f} ms, a run {:.1f} ms)",
+                                n.interleave, before, gNewDawnGpuFrameMs, target, cost);
+                }
+            }
+        }
+        interleave = n.interleave;
+    } else {
+        n.interleave = 0;
+    }
+    sNeural.interleave = (int)interleave;
+    if (!n.runtime.Busy() && (n.urgent || n.frame - n.runFrame >= interleave)) {
+        // Proxy and history into the buffers Vulkan reads; the semaphore tells it when they are written.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, mNrAligned.fbo);
         for (int i = 0; i < 2; i++) {
-            glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
+            glReadBuffer(GL_COLOR_ATTACHMENT1 + i);
             glBindBuffer(GL_PIXEL_PACK_BUFFER, n.buffer[i]);
             glReadPixels(0, 0, nw, nh, GL_RGBA, GL_HALF_FLOAT, nullptr);
         }
@@ -9092,37 +9299,56 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
         run.mStyle = (float)std::clamp(CvInt("gNewDawn.Neural.Style", 0), 0, 2);
         run.mTone = std::clamp(CvFloat("gNewDawn.Neural.Tone", 1.0f), 0.0f, 1.0f);
         run.mStructure = std::clamp(CvFloat("gNewDawn.Neural.Structure", 1.0f), 0.0f, 1.0f);
-        run.mHistory = n.haveResidual;
+        run.mHistory = shown;
         // Experimental, off by default: the global-attention blocks see the whole image at 1/64 scale, and a run can
         // reuse the last one's result instead of computing them (every `refresh`-th run and every first run after a
         // reset does compute). Measured on a still frame: reused once (refresh 2) the picture holds; reused three
         // times running (refresh 4) the temporal loop swings its brightness by a third, every ten runs.
         const uint32_t refresh = (uint32_t)std::clamp(CvInt("gNewDawn.Neural.VitRefresh", 2), 1, 64);
-        run.mReuseVit = CvInt("gNewDawn.Neural.VitReuse", 0) != 0 && n.haveResidual && n.runs % refresh != 0;
-        run.mSpread = interleave;
+        run.mReuseVit = CvInt("gNewDawn.Neural.VitReuse", 0) != 0 && shown && n.runs % refresh != 0;
+        run.mSpread = n.urgent ? 1 : interleave;
+        n.urgent = false;
         n.runtime.Start(run);
         n.runs++;
         n.runFrame = n.frame;
         n.runEpoch = n.epoch;
         std::copy(mNrCam.vp, mNrCam.vp + 16, n.runVP);
+        // This frame's proxy is the run's from here on: it stays, with its mips, for as long as the run's result
+        // is on screen, and the next frame draws its proxy into the one of the three that is free.
+        Bind(3, mNrProxy[n.proxyNow].tex);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        n.proxyFlight = mNrProxyGiven = n.proxyNow;
+        for (int i = 0; i < 3; i++) {
+            if (i != n.proxyFlight && i != n.proxyShown) {
+                n.proxyNow = i;
+                break;
+            }
+        }
         CheckError("neural rendering input");
     } else {
         n.runtime.Advance();
     }
-    if (!n.haveResidual) {
+    if (!shown && !n.haveMean) {
         return nullptr;
     }
-
-    n.fade = std::min(1.0f, n.fade + 0.125f);
+    if (shown) {
+        n.fade = std::min(1.0f, n.fade + 0.125f);
+    }
     EnsureTarget(mNrScene, w, h, GL_RGBA16F, GL_RGBA, GL_FLOAT, false, true);
     if (!mUsable) {
         return nullptr;
     }
     Bind(0, scene.tex);
-    Bind(2, mNrResidual.tex);
+    Bind(2, mNrAligned.tex);
+    Bind(3, n.haveMean ? mNrMean.tex : mFogNeutral);
     Use(mNrApply);
     uniforms();
-    glUniform1f(Loc("uStrength"), std::clamp(CvFloat("gNewDawn.Neural.Strength", 1.0f), 0.0f, 1.0f) * n.fade);
+    glUniform1f(Loc("uFade"), n.fade);
+    glUniform1f(Loc("uStyle"), (float)std::clamp(CvInt("gNewDawn.Neural.Style", 0), 0, 2));
+    glUniform1f(Loc("uTone"), std::clamp(CvFloat("gNewDawn.Neural.Tone", 1.0f), 0.0f, 1.0f));
+    glUniform1f(Loc("uStrength"), std::clamp(CvFloat("gNewDawn.Neural.Strength", 1.0f), 0.0f, 2.0f));
     glUniform1i(Loc("uDebug"), CvInt("gNewDawn.Neural.Debug", 0));
     Draw(mNrScene);
     CheckError("neural rendering apply");
