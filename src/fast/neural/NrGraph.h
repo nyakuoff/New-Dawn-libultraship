@@ -5,6 +5,7 @@
 // which tensors are materialized, how the weights are laid out for the loads RADV generates.
 #pragma once
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -78,6 +79,11 @@ class Graph {
 
     // The column-tile count of each GEMM shape, chosen by timing it on this GPU (a few hundred milliseconds).
     void Tune();
+    // That choice as data, to keep between launches: {rows, K, N, flags, batches, tiles} per shape. SetTuning takes
+    // it only whole: false (and nothing changed) unless it has a valid entry for every shape of this graph.
+    using Tuning = std::vector<std::array<uint32_t, 6>>;
+    Tuning GetTuning() const;
+    bool SetTuning(const Tuning& tuning);
 
     // Tensors in row-major token order, as the reference holds them.
     std::vector<float> Read(const Activation& activation);

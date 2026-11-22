@@ -66,6 +66,7 @@ class Runtime {
     }
     void Start(const Run& run); // records the run and submits its first part
     void Advance();             // submits the next part, if one is left
+    void Hurry();               // submits every part that is left (a run nobody is waiting for any more)
     bool Finished();            // true once per run, when the residual buffer holds its result
     void Wait();                // blocks until the run in flight has finished (tools, shutdown)
     double LastMs() const {     // GPU time of the last finished run, without what ran between its parts

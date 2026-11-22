@@ -805,6 +805,33 @@ void Graph::Tune() {
     }
 }
 
+Graph::Tuning Graph::GetTuning() const {
+    Tuning tuning;
+    for (const auto& [key, tiles] : mTiles) {
+        tuning.push_back(
+            { std::get<0>(key), std::get<1>(key), std::get<2>(key), std::get<3>(key), std::get<4>(key), tiles });
+    }
+    return tuning;
+}
+
+bool Graph::SetTuning(const Tuning& tuning) {
+    std::map<GemmKey, uint32_t> tiles;
+    for (const auto& entry : tuning) {
+        const bool valid = entry[5] == 1 || entry[5] == 2 || entry[5] == 4 || entry[5] == 8;
+        if (!valid || (entry[2] / 16) % entry[5]) {
+            return false;
+        }
+        tiles[GemmKey{ entry[0], entry[1], entry[2], entry[3], entry[4] }] = entry[5];
+    }
+    for (const Op& op : mOps) {
+        if (op.mKind == Op::Kind::Gemm && !tiles.count(GemmKey{ op.mRows, op.mK, op.mN, op.mSpec, op.mGroups[2] })) {
+            return false;
+        }
+    }
+    mTiles = std::move(tiles);
+    return true;
+}
+
 void Graph::SetFeatures(const std::vector<float>& features) {
     if (features.size() != (size_t)mGeometry.FieldTokens() * 16) {
         throw std::runtime_error("neural rendering: features must be [field][16]");

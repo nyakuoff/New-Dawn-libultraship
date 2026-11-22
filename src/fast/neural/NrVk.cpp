@@ -51,6 +51,7 @@ DeviceInfo Context::Describe(VkInstance instance, VkPhysicalDevice device) {
     VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup };
     vkGetPhysicalDeviceProperties2(device, &properties);
     info.mName = properties.properties.deviceName;
+    info.mDriverVersion = properties.properties.driverVersion;
     info.mVendor = properties.properties.vendorID;
     info.mDevice = properties.properties.deviceID;
     memcpy(info.mUuid, id.deviceUUID, VK_UUID_SIZE);
