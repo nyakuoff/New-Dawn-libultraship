@@ -1972,6 +1972,8 @@ uniform mat4 uInvViewProj; // this frame's camera
 uniform vec2 uNdc;
 uniform vec2 uStep;        // one texel of the network's images, in scene uv
 uniform float uExposure;   // scene radiance -> paper-white relative
+uniform sampler2D uNrActor; // 1 where this frame's pixel is a character (stencil 1 of the world pass), scene size
+uniform float uMatch;       // how far apart two proxy colours of one surface may be (see nrSame)
 
 // The network's images have their top row first. So have this renderer's off-screen targets when it draws the world
 // flipped into them (uNdc.y < 0, the usual case); otherwise the rows are turned over on the way in and out.
@@ -1997,6 +1999,19 @@ float nrClipW(vec2 uv) {
     vec4 n = nrNdc(uv, texture(uDepth, uv).r);
     return min(1.0 / dot(vec4(uInvViewProj[0].w, uInvViewProj[1].w, uInvViewProj[2].w, uInvViewProj[3].w), n), 60000.0);
 }
+// Three things tell surfaces apart: depth, being a character or not, and colour. Clip w is stored negative for
+// characters, so one number carries the first two.
+float nrActor(vec2 uv) { return step(0.5, texture(uNrActor, uv).r); }
+float nrSigned(float w, float actor) { return actor > 0.5 ? -w : w; }
+bool nrSameKind(float storedW, float actor) { return (storedW < 0.0) == (actor > 0.5); }
+// Colour: a Gaussian on the distance of two proxy colours, with a tolerance that shrinks with their brightness. At
+// night everything is within a few code values of everything else, and a fixed tolerance takes a dark floor for dark
+// cloth.
+float nrSame(vec3 a, vec3 b) {
+    vec3 d = a - b;
+    float sigma = uMatch * (0.25 + max(max(a.r, max(a.g, a.b)), max(b.r, max(b.g, b.b))));
+    return exp(-dot(d, d) / (2.0 * sigma * sigma));
+}
 // How much two neighbouring texels of the network's images may differ in depth and still be one surface here
 float nrDepthTolerance(vec2 uv, float here) {
     float slope = max(max(abs(nrClipW(uv + vec2(uStep.x, 0.0)) - here), abs(nrClipW(uv - vec2(uStep.x, 0.0)) - here)),
@@ -2010,30 +2025,26 @@ float nrDepthTolerance(vec2 uv, float here) {
 //
 // A result belongs to the picture it was made from. The world has no motion vectors and characters animate, so
 // "where this surface point was" (depth and the two cameras) is only right for what stood still. The proxy the
-// result was made from is kept beside it, and every texel of the result is asked two things: was it this surface
-// then (depth), and did it look like this surface does now (proxy colour). Where the four texels around the
-// reprojected point say yes, the result is carried over as it is. Where they do not (a limb moved, a character
-// walked on, a shadow slid, an edge came into view), the residual is what the run made of things of this colour
-// around there, read from the mips of both images: the right tone for the material, without the detail. A stale
-// residual on the wrong surface is what shows as ghosting; its low-pass on the right one does not show.
+// result was made from is kept beside it, and every texel of the result is asked three things: was it this surface
+// then (depth), was it a character or the world as this pixel is (the stencil), and did it look like this surface
+// does now (proxy colour). Where the four texels around the reprojected point say yes, the result is carried over
+// as it is. Where they do not (a limb moved, a character walked on, a shadow slid, an edge came into view), the
+// pixel is filled from single texels of the run around there that do answer yes: the right tone for the material,
+// without the detail. Never from averages of the run's images: an average across a character's outline is neither
+// the character nor the floor behind it, and filling with it left the character's residual as a smear on the floor
+// it had just walked off. Where nothing around answers yes, the pixel takes the run's mean.
 //
 // The history is the network's own last output and is only handed back where it was carried over as it is: a run
 // then blends with its past on what is unchanged and starts afresh on everything else, so nothing trails.
 static const char* kNrAlignShader = R"GLSL(
 in vec2 vUv;
-layout(location = 0) out vec4 oResidual; // rgb: the change for this frame, a: this frame's clip w
-layout(location = 1) out vec4 oProxy;    // rgb: display code, a: clip w
+layout(location = 0) out vec4 oResidual; // rgb: the change for this frame, a: this frame's clip w (signed)
+layout(location = 1) out vec4 oProxy;    // rgb: display code, a: clip w (signed)
 layout(location = 2) out vec4 oHistory;  // rgb: proxy + the last result where it still holds (a = 1)
-uniform sampler2D uNrResidual; // the last result: rgb, a = the clip w of its run. Mipmapped.
-uniform sampler2D uNrRunProxy; // the proxy it was made from. Mipmapped.
+uniform sampler2D uNrResidual; // the last result: rgb, a = the signed clip w of its run. Its last mip is its mean.
+uniform sampler2D uNrRunProxy; // the proxy it was made from
 uniform mat4 uRunViewProj;     // the camera of that run
 uniform int uHaveResidual;
-uniform float uMatch;          // how far apart two proxy colours of one surface may be (a sigma, in code values)
-
-float same(vec3 a, vec3 b) {
-    vec3 d = a - b;
-    return exp(-dot(d, d) / (2.0 * uMatch * uMatch));
-}
 
 void main() {
     vec2 uv = vec2(vUv.x, nrRow(vUv.y));
@@ -2043,7 +2054,13 @@ void main() {
              nrProxy(textureLod(uScene, uv + uStep * vec2(-0.25, 0.25), 0.0).rgb) +
              nrProxy(textureLod(uScene, uv + uStep * vec2(0.25, 0.25), 0.0).rgb);
     vec3 code = nrEncode(v * 0.25);
-    float here = nrClipW(uv);
+    // Character or world, over the same footprint. A texel that straddles a character's outline is neither: its
+    // colour and what the network makes of it are a blend of both, so it must never be the source of anything later
+    // (clip w 0 in the proxy says so: no depth matches it). It still gets a residual itself, as its larger half.
+    float cover = 0.25 * (nrActor(uv + uStep * vec2(-0.25, -0.25)) + nrActor(uv + uStep * vec2(0.25, -0.25)) +
+                          nrActor(uv + uStep * vec2(-0.25, 0.25)) + nrActor(uv + uStep * vec2(0.25, 0.25)));
+    float here = nrClipW(uv), actor = step(0.5, cover);
+    bool whole = cover < 0.01 || cover > 0.99;
     vec3 residual = vec3(0.0), kept = vec3(0.0);
     float sharp = 0.0;
     if (uHaveResidual != 0) {
@@ -2051,49 +2068,54 @@ void main() {
         vec4 wp = uInvViewProj * nrNdc(uv, texture(uDepth, uv).r);
         vec4 pc = uRunViewProj * vec4(wp.xyz / wp.w, 1.0);
         if (pc.w > 0.0) {
-            vec2 size = vec2(textureSize(uNrResidual, 0));
+            ivec2 size = textureSize(uNrResidual, 0);
             vec2 rUv = (pc.xy / pc.w / uNdc) * 0.5 + 0.5;
-            vec2 at = vec2(rUv.x, nrRow(rUv.y));
+            vec2 pos = vec2(rUv.x, nrRow(rUv.y)) * vec2(size) - 0.5;
+            float was = min(pc.w, 60000.0), tol = nrDepthTolerance(uv, here);
             // A little past the edge the last texels still stand for the surface; further out the run saw nothing.
             if (all(greaterThan(rUv, vec2(-0.02))) && all(lessThan(rUv, vec2(1.02)))) {
-                vec2 pos = at * size - 0.5;
                 ivec2 base = ivec2(floor(pos));
                 vec2 f = pos - vec2(base);
-                float tol = nrDepthTolerance(uv, here);
                 vec4 sum = vec4(0.0);
                 for (int j = 0; j < 2; j++) {
                     for (int i = 0; i < 2; i++) {
-                        ivec2 q = clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1);
+                        ivec2 q = clamp(base + ivec2(i, j), ivec2(0), size - 1);
                         vec4 t = texelFetch(uNrResidual, q, 0);
                         float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) *
-                                  step(abs(t.a - min(pc.w, 60000.0)), tol) * same(texelFetch(uNrRunProxy, q, 0).rgb, code);
+                                  step(abs(abs(t.a) - was), tol) * float(nrSameKind(t.a, actor)) *
+                                  nrSame(texelFetch(uNrRunProxy, q, 0).rgb, code);
                         sum += vec4(t.rgb, 1.0) * w;
                     }
                 }
+                // At least a quarter of the four must agree: one texel that half agrees is not the surface
                 if (sum.a > 0.02) {
                     kept = sum.rgb / sum.a;
-                    sharp = smoothstep(0.05, 0.4, sum.a);
+                    sharp = smoothstep(0.25, 0.6, sum.a);
                 }
             }
-            // Around there, coarser and wider: 4 and then 16 texels apart, each tap by how alike the colours are
-            vec2 centre = clamp(at, 0.0, 1.0);
-            vec4 near = vec4(0.0);
-            for (int ring = 0; ring < 2; ring++) {
-                float lod = ring == 0 ? 2.0 : 4.0, share = ring == 0 ? 1.0 : 0.25;
-                for (int j = -1; j <= 1; j++) {
-                    for (int i = -1; i <= 1; i++) {
-                        vec2 q = centre + vec2(i, j) * exp2(lod) / size;
-                        float w = share * same(textureLod(uNrRunProxy, q, lod).rgb, code);
-                        near += vec4(textureLod(uNrResidual, q, lod).rgb, 1.0) * w;
-                    }
+            if (sharp < 1.0) {
+                // The fill: 64 single texels spread evenly over a disc of 24 texels (how far a running character
+                // gets in the frames a result takes: far enough to find where its own parts were, and the floor
+                // beyond what it has just uncovered). Depth is asked loosely here (a surface's depth changes over
+                // that distance); kind and colour are asked as strictly as above, and nearer texels count more.
+                vec2 centre = clamp(pos + 0.5, vec2(0.0), vec2(size) - 1.0);
+                vec4 near = vec4(0.0);
+                for (int k = 0; k < 64; k++) {
+                    float radius = 24.0 * sqrt((float(k) + 0.5) / 64.0), angle = 2.39996 * float(k);
+                    ivec2 q = clamp(ivec2(centre + radius * vec2(cos(angle), sin(angle))), ivec2(0), size - 1);
+                    vec4 t = texelFetch(uNrResidual, q, 0);
+                    float depth = (abs(t.a) - was) / (0.1 * was + tol);
+                    float w = float(nrSameKind(t.a, actor)) * exp(-depth * depth - radius * radius / 288.0) *
+                              nrSame(texelFetch(uNrRunProxy, q, 0).rgb, code);
+                    near += vec4(t.rgb, 1.0) * w;
                 }
+                residual = mix(residual, near.rgb / max(near.a, 1e-4), smoothstep(0.1, 0.6, near.a));
             }
-            residual = mix(residual, near.rgb / max(near.a, 1e-4), smoothstep(0.02, 0.25, near.a));
             residual = mix(residual, kept, sharp);
         }
     }
-    oResidual = vec4(residual, here);
-    oProxy = vec4(code, here);
+    oResidual = vec4(residual, nrSigned(here, actor));
+    oProxy = vec4(code, whole ? nrSigned(here, actor) : 0.0);
     oHistory = vec4(clamp(code + kept, 0.0, 1.0), step(0.5, sharp));
 }
 )GLSL";
@@ -2101,14 +2123,15 @@ void main() {
 // The residual onto this frame's scene. It is a change of display code values; the scene is scene-referred light:
 // each channel goes to the proxy's code, takes the change, and comes back as a ratio on the scene value, which keeps
 // whatever the proxy's shoulder had compressed. The residual comes up from the network's resolution through the
-// four texels around, without those that belong to another surface (depth), so full-resolution edges stay clean.
+// four texels around, without those that belong to another surface (depth, character or world), so full-resolution
+// edges stay clean.
 // The style presets are the operator OpenDLSS-NR's composite applies after the network (exposure, a contrast blend
 // and saturation in HSL, scaled by the tone setting); strength blends from the untouched picture (0) through the
 // network's (1) and on past it (up to 2).
 static const char* kNrApplyShader = R"GLSL(
 in vec2 vUv;
 out vec4 oColor;
-uniform sampler2D uNrAligned; // this frame's residual (the align pass): rgb, a = clip w. Top row first.
+uniform sampler2D uNrAligned; // this frame's residual (the align pass): rgb, a = signed clip w. Top row first.
 uniform sampler2D uNrMean;    // 1x1: the mean residual of the picture before the last cut
 uniform float uFade;          // 0: that mean alone, 1: the current residual
 uniform float uStrength;
@@ -2158,17 +2181,20 @@ void main() {
     vec2 pos = vec2(vUv.x, nrRow(vUv.y)) * size - 0.5;
     ivec2 base = ivec2(floor(pos));
     vec2 f = pos - vec2(base);
-    float here = nrClipW(vUv), tol = nrDepthTolerance(vUv, here);
-    vec4 matched = vec4(0.0), plain = vec4(0.0);
+    float here = nrClipW(vUv), tol = nrDepthTolerance(vUv, here), actor = nrActor(vUv);
+    vec4 matched = vec4(0.0), kind = vec4(0.0), plain = vec4(0.0);
     for (int j = 0; j < 2; j++) {
         for (int i = 0; i < 2; i++) {
             vec4 t = texelFetch(uNrAligned, clamp(base + ivec2(i, j), ivec2(0), ivec2(size) - 1), 0);
             float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
             plain += vec4(t.rgb, 1.0) * w;
-            matched += vec4(t.rgb, 1.0) * w * step(abs(t.a - here), tol);
+            w *= float(nrSameKind(t.a, actor));
+            kind += vec4(t.rgb, 1.0) * w;
+            matched += vec4(t.rgb, 1.0) * w * step(abs(abs(t.a) - here), tol);
         }
     }
-    vec3 delta = matched.a > 0.02 ? matched.rgb / matched.a : plain.rgb / plain.a;
+    // A pixel thinner than the network's texels may find none of its surface: then its kind's, then any
+    vec3 delta = matched.a > 0.02 ? matched.rgb / matched.a : kind.a > 0.02 ? kind.rgb / kind.a : plain.rgb / plain.a;
     delta = mix(texelFetch(uNrMean, ivec2(0), 0).rgb, delta, uFade);
     vec3 v = nrProxy(scene.rgb);
     vec3 code = nrEncode(v);
@@ -2178,6 +2204,7 @@ void main() {
     vec3 c = mix(v2 / uExposure, max(scene.rgb, vec3(0.0)) * (v2 / max(v, vec3(1e-4))), step(vec3(1e-3), v));
     if (uDebug == 1) c = (0.5 + 2.0 * delta) / uExposure * 0.5; // the residual itself
     else if (uDebug == 2) c = vec3(matched.a, 0.25 * matched.a, 1.0 - matched.a) / uExposure * 0.5; // its depth match
+    else if (uDebug == 3) c = vec3(actor, kind.a, 0.25) / uExposure * 0.5; // the character mask, and how much agrees
     oColor = vec4(c, scene.a);
 }
 )GLSL";
@@ -4306,6 +4333,7 @@ static GLuint BuildProgramWithVertex(const char* name, const char* const* vsPart
                           { "uNrResidual", 10 },
                           { "uNrRunProxy", 11 },
                           { "uNrAligned", 10 },
+                          { "uNrActor", PostFxGL::kNeuralActorUnit },
                           { "uNrMean", 11 },
                           { "uRayMask", 8 },
                           { "uRays", 11 },
@@ -4656,6 +4684,8 @@ void main() { oColor = vec4(1.0); }
     const char* taaSharpen[] = { kVersion, kTaaSharpenShader };
     mTaaSharpen.id = BuildProgram("TAA sharpen", taaSharpen, 2, mTaaSharpen.uniforms);
     // Optional as well: a failure leaves neural rendering unavailable. Lanes 8..10, dummies bound above.
+    glActiveTexture(GL_TEXTURE0 + kNeuralActorUnit); // its own lane, with a complete texture from here on
+    glBindTexture(GL_TEXTURE_2D, mFogNeutral);
     const char* nrAlign[] = { kVersion, kNrLib, kNrAlignShader };
     const char* nrApply[] = { kVersion, kNrLib, kNrApplyShader };
     mNrAlign.id = BuildProgram("neural rendering align", nrAlign, 3, mNrAlign.uniforms);
@@ -8995,8 +9025,10 @@ void PostFxGL::NeuralRelease(bool runtime) {
     n.haveResidual = false;
     n.epoch++;
     if (runtime) {
+        glActiveTexture(GL_TEXTURE0 + kNeuralActorUnit);
+        glBindTexture(GL_TEXTURE_2D, mFogNeutral);
         for (Target* t : { &mNrAligned, &mNrProxy[0], &mNrProxy[1], &mNrProxy[2], &mNrHistory, &mNrResidual, &mNrScene,
-                           &mNrDepth, &mNrMean }) {
+                           &mNrDepth, &mNrMean, &mNrActor }) {
             glDeleteTextures(1, &t->tex);
             glDeleteFramebuffers(1, &t->fbo);
             *t = Target{};
@@ -9192,14 +9224,40 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
     if (!mUsable) {
         return nullptr;
     }
+    // The characters of this frame (stencil 1, while the local-light pass marks them) as a mask: a character's
+    // residual is never the world's and the other way round, whatever their depths and colours.
+    const bool marked = mLocalMarking && mTaaMaskFill.id;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mNrDepth.fbo);
-    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT | (marked ? GL_STENCIL_BUFFER_BIT : 0), GL_NEAREST);
+    if (marked) {
+        EnsureTarget(mNrActor, w, h, GL_R8, GL_RED, GL_UNSIGNED_BYTE, false, false);
+        if (!mUsable) {
+            return nullptr;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, mNrActor.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, mNrDepth.tex, 0);
+        glViewport(0, 0, w, h);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
+        Use(mTaaMaskFill);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glStencilFunc(GL_ALWAYS, 0, 0xFF);
+    }
+    glActiveTexture(GL_TEXTURE0 + kNeuralActorUnit);
+    glBindTexture(GL_TEXTURE_2D, marked ? mNrActor.tex : mFogNeutral);
     auto uniforms = [&] {
         glUniformMatrix4fv(Loc("uInvViewProj"), 1, GL_FALSE, invVP);
         glUniform2f(Loc("uNdc"), mNrCam.ndcXScale, mNrCam.flipY);
         glUniform2f(Loc("uStep"), 1.0f / nw, 1.0f / nh);
         glUniform1f(Loc("uExposure"), std::exp2(std::clamp(LookCv(NEWDAWN_LOOK_EXPOSURE, -0.2f), -8.0f, 8.0f)));
+        glUniform1f(Loc("uMatch"), std::clamp(CvFloat("gNewDawn.Neural.Match", 0.08f), 0.01f, 1.0f));
     };
 
     // The align pass, every frame: the last result onto this frame's picture, this frame's proxy, and the history
@@ -9218,7 +9276,6 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
     uniforms();
     glUniformMatrix4fv(Loc("uRunViewProj"), 1, GL_FALSE, n.residualVP);
     glUniform1i(Loc("uHaveResidual"), shown ? 1 : 0);
-    glUniform1f(Loc("uMatch"), std::clamp(CvFloat("gNewDawn.Neural.Match", 0.08f), 0.01f, 1.0f));
     Draw(mNrAligned);
     CheckError("neural rendering align");
 
@@ -9313,12 +9370,8 @@ const PostFxGL::Target* PostFxGL::RunNeural(const FramebufferOGL& fb, const Targ
         n.runFrame = n.frame;
         n.runEpoch = n.epoch;
         std::copy(mNrCam.vp, mNrCam.vp + 16, n.runVP);
-        // This frame's proxy is the run's from here on: it stays, with its mips, for as long as the run's result
-        // is on screen, and the next frame draws its proxy into the one of the three that is free.
-        Bind(3, mNrProxy[n.proxyNow].tex);
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // This frame's proxy is the run's from here on: it stays for as long as the run's result is on screen, and
+        // the next frame draws its proxy into the one of the three that is free.
         n.proxyFlight = mNrProxyGiven = n.proxyNow;
         for (int i = 0; i < 3; i++) {
             if (i != n.proxyFlight && i != n.proxyShown) {

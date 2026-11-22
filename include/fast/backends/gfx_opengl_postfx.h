@@ -168,6 +168,7 @@ class PostFxGL {
     static constexpr int kRiverSpriteUnit = 38;
     static constexpr int kFoamTexUnit = 39; // shoreline foam texture
     static constexpr float kWaveBaseAmp = 13.0f; // swell amplitude (world units) at waterWaves = 1
+    static constexpr int kNeuralActorUnit = 22;  // neural rendering's character mask (20, 22 and 23 were free)
     static constexpr int kMilkyWayUnit = 21; // night sky panorama (free: atmos/vfx/grass/caustics use others)
     bool SkyReflectionsActive() const {
         return mHdrActive && mSkyReflectionsReady;
@@ -509,7 +510,7 @@ class PostFxGL {
         float vp[16] = {}, ndcXScale = 1.0f, flipY = 1.0f;
     } mNrCam;
     Program mNrAlign, mNrApply;
-    Target mNrAligned, mNrProxy[3], mNrHistory, mNrResidual, mNrScene, mNrDepth, mNrMean;
+    Target mNrAligned, mNrProxy[3], mNrHistory, mNrResidual, mNrScene, mNrDepth, mNrMean, mNrActor;
     int mNrProxyGiven = 0; // which of the three proxies the last run was given
 
     static constexpr int kQueryRing = 4;
